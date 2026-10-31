@@ -81,6 +81,8 @@ pub struct Preferences {
     pub export_open_folder: bool,
     // AI agents
     pub mcp_on_start: bool,
+    /// Show the welcome window when the app starts.
+    pub show_welcome: bool,
     pub mcp_port: u16,
     // Performance
     pub gpu: Gpu,
@@ -120,6 +122,7 @@ impl Default for Preferences {
             export_open_folder: false,
             // The agent server is opt-in: it accepts local connections.
             mcp_on_start: false,
+            show_welcome: true,
             mcp_port: crate::mcp::DEFAULT_PORT,
             gpu: Gpu::Auto,
         }
@@ -175,6 +178,7 @@ impl Preferences {
             "export_padding": self.export_padding.key(),
             "export_open_folder": self.export_open_folder,
             "mcp_on_start": self.mcp_on_start,
+            "show_welcome": self.show_welcome,
             "mcp_port": self.mcp_port,
             "gpu": self.gpu.key(),
         })
@@ -223,6 +227,7 @@ impl Preferences {
             export_padding: v["export_padding"].as_str().and_then(Padding::from_key).unwrap_or(d.export_padding),
             export_open_folder: b("export_open_folder", d.export_open_folder),
             mcp_on_start: b("mcp_on_start", d.mcp_on_start),
+            show_welcome: b("show_welcome", d.show_welcome),
             mcp_port: u("mcp_port", d.mcp_port as u64, 1024, 65000) as u16,
             gpu: v["gpu"].as_str().and_then(|k| Gpu::ALL.into_iter().find(|g| g.key() == k)).unwrap_or(d.gpu),
         }
@@ -496,6 +501,7 @@ impl PainterApp {
     /// Startup: preferences that only take effect on a fresh app.
     pub(super) fn apply_startup_preferences(&mut self, ctx: &egui::Context) {
         let p = self.prefs.clone();
+        self.show_welcome = p.show_welcome;
         ctx.set_zoom_factor(p.ui_scale);
         self.shelf.icon_size = p.shelf_icon_size;
         self.cam.fov_y = p.fov_deg.to_radians();

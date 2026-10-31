@@ -31,6 +31,7 @@ mod dock;
 mod gallery;
 mod graph_ui;
 mod shader_ui;
+mod welcome;
 mod mcp_tools;
 pub(crate) mod prefs;
 mod project_io;
@@ -415,6 +416,9 @@ pub struct PainterApp {
     status: String,
     show_help: bool,
     show_about: bool,
+    /// The welcome window (startup, or Help → Welcome).
+    show_welcome: bool,
+    welcome_tex: Option<egui::TextureHandle>,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
@@ -879,6 +883,12 @@ impl PainterApp {
         self.view.show_seams_3d = true;
     }
 
+    /// Closes the welcome window (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_close_welcome(&mut self) {
+        self.show_welcome = false;
+    }
+
     /// Opens the export window (offscreen UI tests).
     #[cfg(test)]
     pub(crate) fn test_open_export(&mut self) {
@@ -999,6 +1009,8 @@ impl PainterApp {
             status: "Ready. Paint with LMB, orbit with Alt+LMB or RMB, pan with MMB.".into(),
             show_help: false,
             show_about: false,
+            show_welcome: false,
+            welcome_tex: None,
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
@@ -1756,6 +1768,10 @@ impl PainterApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Welcome screen").clicked() {
+                    self.show_welcome = true;
+                    ui.close();
+                }
                 if ui.button("About Material Painter").clicked() {
                     self.show_about = true;
                     ui.close();
@@ -4519,6 +4535,7 @@ impl eframe::App for PainterApp {
         self.help_window(&ctx);
         self.about_window(&ctx);
         self.crash_window(&ctx);
+        self.welcome_window(&ctx);
         // Settings changed in the bake window show on the next frame.
         self.update_cage_preview(&ctx);
 

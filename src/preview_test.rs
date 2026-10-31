@@ -612,6 +612,10 @@ fn ui_screenshots() {
     harness.run_steps(8);
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
     std::fs::create_dir_all(&dir).unwrap();
+    // The welcome window opens at startup.
+    harness.render().expect("renders").save(dir.join("welcome.png")).unwrap();
+    harness.state_mut().test_close_welcome();
+    harness.run_steps(2);
     harness.state_mut().test_show_seams();
     harness.run_steps(3);
     harness.render().expect("renders").save(dir.join("seams.png")).unwrap();
