@@ -9,7 +9,7 @@ use egui::{Color32, Rect, Sense, pos2, vec2};
 
 /// Community links. Empty ones show as "coming soon".
 pub(crate) const DISCORD_URL: &str = "https://discord.gg/TqKD5xKp7Y";
-pub(crate) const DONATE_URL: &str = "";
+pub(crate) const DONATE_URL: &str = "https://ko-fi.com/allaeddinerakik";
 
 /// Banner rendered with the app itself (smart materials on the material ball).
 const BANNER: &[u8] = include_bytes!("../../assets/ui/welcome.jpg");
