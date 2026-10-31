@@ -908,7 +908,7 @@ impl PainterApp {
         theme::apply(&cc.egui_ctx);
 
         let prefs = Preferences::load();
-        let mesh = Primitive::RoundedCube.build();
+        let mesh = Primitive::MaterialBall.build();
         let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
         let bvh = Bvh::from_mesh(&mesh);
         let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), prefs.default_resolution);
@@ -997,7 +997,7 @@ impl PainterApp {
             show_bake: false,
             shelf: Shelf { cat: ShelfCat::SmartMaterials, search: String::new(), icon_size: 72.0, smart, materials, generators, brushes, textures },
             shelf_previews: Some(shelf_previews),
-            export: ExportDialog::new("RoundedCube".into()),
+            export: ExportDialog::new("MaterialBall".into()),
             prefs_applied: prefs.clone(),
             prefs,
             prefs_ui: PrefsUi { open: false, page: prefs::Page::General },
