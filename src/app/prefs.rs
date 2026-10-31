@@ -118,7 +118,8 @@ impl Default for Preferences {
             export_size: None,
             export_padding: Padding::Infinite,
             export_open_folder: false,
-            mcp_on_start: true,
+            // The agent server is opt-in: it accepts local connections.
+            mcp_on_start: false,
             mcp_port: crate::mcp::DEFAULT_PORT,
             gpu: Gpu::Auto,
         }

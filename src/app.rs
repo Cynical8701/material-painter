@@ -414,6 +414,9 @@ pub struct PainterApp {
     pending: Vec<Action>,
     status: String,
     show_help: bool,
+    show_about: bool,
+    /// A crash report the last run left, shown once.
+    crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
     ppp: f32,
     mcp: Option<crate::mcp::McpServer>,
@@ -451,6 +454,8 @@ pub struct PainterApp {
 }
 
 const RESOLUTIONS: [u32; 4] = [512, 1024, 2048, 4096];
+/// Where the source and releases live.
+pub(crate) const REPO_URL: &str = "https://github.com/alla2001/material-painter";
 /// `selected` when no layer is selected.
 const NO_LAYER: usize = usize::MAX;
 
@@ -656,6 +661,14 @@ pub(crate) fn stroke_region(
         }
     });
     acc
+}
+
+/// The third-party license notices shipped next to the executable (or in
+/// the source tree when run from it).
+fn notices_path() -> Option<std::path::PathBuf> {
+    let name = "THIRD_PARTY_NOTICES.html";
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    exe_dir.into_iter().chain(std::env::current_dir().ok()).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// HDRI preview pictures: width, height.
@@ -880,6 +893,8 @@ impl PainterApp {
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
         let rs = cc.wgpu_render_state.clone().ok_or("Material Painter requires the wgpu renderer")?;
+        let gpu = rs.adapter.get_info();
+        crate::crash::set_context(format!("{} ({:?}, driver {} {})", gpu.name, gpu.backend, gpu.driver, gpu.driver_info));
         theme::apply(&cc.egui_ctx);
 
         let prefs = Preferences::load();
@@ -983,6 +998,8 @@ impl PainterApp {
             pending: Vec::new(),
             status: "Ready. Paint with LMB, orbit with Alt+LMB or RMB, pan with MMB.".into(),
             show_help: false,
+            show_about: false,
+            crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
             mcp: None,
@@ -1726,6 +1743,21 @@ impl PainterApp {
             ui.menu_button("Help", |ui| {
                 if ui.button(theme::with_icon(icons::INFO, "Controls")).clicked() {
                     self.show_help = true;
+                    ui.close();
+                }
+                if ui.button("Source code and releases").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
+                    ui.close();
+                }
+                if ui.button("Open crash reports folder").clicked() {
+                    if let Some(dir) = project_io::data_dir() {
+                        open_in_file_browser(&dir);
+                    }
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("About Material Painter").clicked() {
+                    self.show_about = true;
                     ui.close();
                 }
             });
@@ -4299,6 +4331,66 @@ impl PainterApp {
 
     // ------------------------------------------------------------------ windows
 
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        egui::Window::new("About").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(egui::RichText::new("Material Painter").heading().color(Color32::WHITE));
+            ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT_DIM));
+            ui.add_space(8.0);
+            ui.label("A PBR texture painter: layers, smart materials and masks, mesh map baking, material graphs and custom node shaders.");
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Free software under the GNU General Public License, version 3 or later. It comes with no warranty.")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+            ui.label(
+                egui::RichText::new("Bundled HDRIs and textures: Poly Haven (CC0). Icons: Phosphor (MIT).").small().color(theme::TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Source code").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
+                }
+                if ui.button("Third-party licenses").clicked() {
+                    match notices_path() {
+                        Some(p) => ui.ctx().open_url(egui::OpenUrl::new_tab(format!("file:///{}", p.display().to_string().replace('\\', "/")))),
+                        None => ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{REPO_URL}/blob/master/THIRD_PARTY_NOTICES.html"))),
+                    }
+                }
+            });
+        });
+        self.show_about = open;
+    }
+
+    /// Tells about a crash in the last run, once, with its report.
+    fn crash_window(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.crash_report.clone() else { return };
+        let mut close = false;
+        egui::Window::new("Material Painter closed unexpectedly").collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label("Last time, the app stopped because of an error. A report was saved; sending it helps fix the problem.");
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(path.display().to_string()).small().monospace().color(theme::TEXT_DIM));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open the report").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("file:///{}", path.display().to_string().replace('\\', "/"))));
+                }
+                if ui.button("Report the problem").on_hover_text("Opens a new issue on the project page; attach the report").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{REPO_URL}/issues/new")));
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.crash_report = None;
+        }
+    }
+
     fn help_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_help;
         egui::Window::new("Controls").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
@@ -4425,6 +4517,8 @@ impl eframe::App for PainterApp {
         self.apply_preferences(&ctx);
         self.bake_window(&ctx);
         self.help_window(&ctx);
+        self.about_window(&ctx);
+        self.crash_window(&ctx);
         // Settings changed in the bake window show on the next frame.
         self.update_cage_preview(&ctx);
 

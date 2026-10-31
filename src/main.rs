@@ -1,8 +1,12 @@
+// Release builds open without a console window (crashes go to the crash log).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod bake;
 mod brushes;
 mod bvh;
 mod cage;
+mod crash;
 mod engine;
 mod environment;
 mod export;
@@ -28,6 +32,7 @@ use eframe::{egui_wgpu, wgpu};
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    crash::install();
     let mut options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Material Painter")

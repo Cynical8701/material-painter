@@ -1,0 +1,20 @@
+# Licenses third-party code may use (all compatible with GPL-3.0-or-later).
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+# Only what ships in the executable.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# This project itself is covered by LICENSE.
+private = { ignore = true }

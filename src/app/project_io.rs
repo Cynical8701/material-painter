@@ -24,15 +24,7 @@ const MAGIC: &[u8; 8] = b"MPPROJ\x00\x01";
 
 /// Per-user app data: recent projects and the autosave.
 pub(super) fn data_dir() -> Option<PathBuf> {
-    // Tests never touch the user's settings, recovery files or nodes.
-    if cfg!(test) {
-        return Some(std::env::temp_dir().join("MaterialPainterTest"));
-    }
-    let base = std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("MaterialPainter"))
+    crate::crash::data_dir()
 }
 
 /// This instance's recovery copy of unsaved work, written every few edits.

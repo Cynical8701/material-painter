@@ -2,6 +2,11 @@
 name = "material_painter"
 version = "0.1.0"
 edition = "2024"
+description = "A PBR texture painter: layers, smart materials, mesh map baking, material graphs and custom node shaders"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/alla2001/material-painter"
+readme = "README.md"
+publish = false
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }

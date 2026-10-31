@@ -1,0 +1,22 @@
+# Every push and pull request: a warning-free build and the unit tests on
+# Windows. (The GPU tests are #[ignore]d: CI machines have no GPU.)
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+        env:
+          RUSTFLAGS: -D warnings
+      - name: Unit tests
+        run: cargo test --locked
