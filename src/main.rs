@@ -38,7 +38,9 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Material Painter")
             .with_inner_size([1600.0, 960.0])
-            .with_min_inner_size([1100.0, 680.0]),
+            .with_min_inner_size([1100.0, 680.0])
+            .with_app_id("material-painter")
+            .with_icon(app_icon()),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -57,4 +59,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::PainterApp::new(cc)?))),
     )
+}
+
+/// The window and taskbar icon (the copper material ball).
+fn app_icon() -> eframe::egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/ui/icon.png")).expect("bundled icon decodes").into_rgba8();
+    eframe::egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
 }

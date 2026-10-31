@@ -34,17 +34,62 @@ pub fn heading_family() -> egui::FontFamily {
     egui::FontFamily::Name("heading".into())
 }
 
-/// A system font file, if this machine has it.
-fn system_font(name: &str) -> Option<Vec<u8>> {
-    let dir = std::env::var_os("WINDIR").map_or_else(|| std::path::PathBuf::from("C:/Windows"), std::path::PathBuf::from);
-    std::fs::read(dir.join("Fonts").join(name)).ok()
+/// Font folders of this OS, searched for [`system_font`].
+fn font_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if cfg!(windows) {
+        let win = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from("C:/Windows"), PathBuf::from);
+        return vec![win.join("Fonts")];
+    }
+    let mut dirs = vec![PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local/share/fonts"));
+        dirs.push(home.join(".fonts"));
+    }
+    if cfg!(target_os = "macos") {
+        dirs.extend([PathBuf::from("/System/Library/Fonts"), PathBuf::from("/Library/Fonts")]);
+    }
+    dirs
+}
+
+/// Every font file under the font folders, by file name (Linux keeps fonts
+/// in per-family subfolders, so they are searched a few levels deep).
+fn font_index() -> std::collections::HashMap<String, std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut std::collections::HashMap<String, std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if depth > 0 {
+                    walk(&path, depth - 1, out);
+                }
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                out.entry(name.to_ascii_lowercase()).or_insert(path);
+            }
+        }
+    }
+    let mut index = std::collections::HashMap::new();
+    for dir in font_dirs() {
+        walk(&dir, 4, &mut index);
+    }
+    index
+}
+
+/// The first of `names` (font file names, best first) this machine has:
+/// Segoe UI on Windows, the common open fonts elsewhere.
+fn system_font(index: &std::collections::HashMap<String, std::path::PathBuf>, names: &[&str]) -> Option<Vec<u8>> {
+    names.iter().find_map(|n| index.get(&n.to_ascii_lowercase())).and_then(|p| std::fs::read(p).ok())
 }
 
 pub fn apply(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert("phosphor".into(), egui::FontData::from_static(icons::FONT).into());
-    let body = system_font("segoeui.ttf");
-    let semibold = system_font("seguisb.ttf");
+    let index = font_index();
+    let body = system_font(&index, &["segoeui.ttf", "NotoSans-Regular.ttf", "Inter-Regular.ttf", "Ubuntu-R.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"]);
+    let semibold = system_font(
+        &index,
+        &["seguisb.ttf", "NotoSans-SemiBold.ttf", "Inter-SemiBold.ttf", "Ubuntu-M.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"],
+    );
     if let Some(b) = body {
         fonts.font_data.insert("ui".into(), egui::FontData::from_owned(b).into());
         if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
@@ -59,8 +104,9 @@ pub fn apply(ctx: &egui::Context) {
     // Headings fall back to the body fonts (and icons).
     heading.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
     fonts.families.insert(heading_family(), heading);
-    // Symbols (box lines, shapes, check marks, dice) from Segoe UI Symbol.
-    let symbols = system_font("seguisym.ttf").map(|b| fonts.font_data.insert("symbols".into(), egui::FontData::from_owned(b).into())).is_some();
+    // Symbols (box lines, shapes, check marks, dice): Segoe UI Symbol, or
+    // DejaVu Sans, which covers them on Linux.
+    let symbols = system_font(&index, &["seguisym.ttf", "DejaVuSans.ttf", "NotoSansSymbols2-Regular.ttf"]).map(|b| fonts.font_data.insert("symbols".into(), egui::FontData::from_owned(b).into())).is_some();
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace, heading_family()] {
         if let Some(list) = fonts.families.get_mut(&family) {
             if !list.iter().any(|f| f == "phosphor") {

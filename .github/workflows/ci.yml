@@ -1,5 +1,5 @@
 # Every push and pull request: a warning-free build and the unit tests on
-# Windows. (The GPU tests are #[ignore]d: CI machines have no GPU.)
+# Windows and Linux. (The GPU tests are #[ignore]d: CI machines have no GPU.)
 name: CI
 
 on:
@@ -9,9 +9,18 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build

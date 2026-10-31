@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Material Painter
+Comment=Paint, bake and design PBR materials
+Exec=material-painter
+Icon=material-painter
+Terminal=false
+Categories=Graphics;3DGraphics;
