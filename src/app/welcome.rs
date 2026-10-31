@@ -114,13 +114,8 @@ impl PainterApp {
                         url_button(ui, icons::BOOK_OPEN, "Read the guide", &format!("{REPO_URL}#readme"));
                         url_button(ui, icons::BUG, "Report a problem", &format!("{REPO_URL}/issues/new"));
                         ui.add_space(8.0);
-                        let donate = egui::Button::new(egui::RichText::new(theme::with_icon(icons::HEART, "Support development")).color(Color32::WHITE))
-                            .fill(Color32::from_rgb(0x8a, 0x2d, 0x3b))
-                            .min_size(vec2(ui.available_width(), 30.0));
-                        let resp = ui.add_enabled(!DONATE_URL.is_empty(), donate);
-                        if DONATE_URL.is_empty() {
-                            resp.on_disabled_hover_text("Coming soon");
-                        } else if resp.on_hover_text("Material Painter is free; donations keep it going").clicked() {
+                        let resp = theme::donate_button(ui, "Support on Ko-fi", vec2(ui.available_width(), 38.0));
+                        if resp.on_hover_text("Material Painter is free; donations keep it going").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(DONATE_URL));
                         }
                     });

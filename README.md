@@ -1,5 +1,17 @@
 # Material Painter
 
+![Smart materials painted in Material Painter](assets/ui/welcome.jpg)
+
+<p align="center">
+  <a href="https://ko-fi.com/allaeddinerakik"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support Material Painter on Ko-fi" height="44"></a>
+  &nbsp;
+  <a href="https://github.com/alla2001/material-painter/releases/latest"><img src="https://img.shields.io/github/v/release/alla2001/material-painter?label=Download&style=for-the-badge&color=3d8eff" alt="Download" height="36"></a>
+  &nbsp;
+  <a href="https://discord.gg/TqKD5xKp7Y"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="36"></a>
+</p>
+
+<p align="center"><b>Material Painter is free and open source. If it saves you time, <a href="https://ko-fi.com/allaeddinerakik">buy me a coffee on Ko-fi</a> to keep it going.</b></p>
+
 A fast, lightweight PBR texture painter for game and film assets: paint
 materials onto 3D models with layers, smart materials and masks, bake mesh
 maps, build materials in a node graph and write your own node shaders.
@@ -40,8 +52,9 @@ maps, build materials in a node graph and write your own node shaders.
 
 ## Download
 
-Ready-to-run builds are on the [releases page](https://github.com/alla2001/material-painter/releases).
-Buying a build supports development; the source is and stays free.
+Ready-to-run builds are on the [releases page](https://github.com/alla2001/material-painter/releases/latest):
+the installer, or a zip to unpack and run. Both are free; donations on
+[Ko-fi](https://ko-fi.com/allaeddinerakik) fund development.
 
 **Requirements**: Windows 10 or 11, 64-bit, and a GPU with DirectX 12 or
 Vulkan support (most cards from 2016 on). 8 GB of video memory is
@@ -69,7 +82,9 @@ cargo test --bin material_painter -- --ignored --test-threads 1
 Questions, renders and shared materials: join the [Discord](https://discord.gg/TqKD5xKp7Y).
 Bugs and feature requests are welcome there or as [GitHub issues](https://github.com/alla2001/material-painter/issues).
 
-Material Painter is free. If it's useful to you, you can [support development on Ko-fi](https://ko-fi.com/allaeddinerakik).
+If Material Painter is useful to you, a donation keeps development going:
+
+<a href="https://ko-fi.com/allaeddinerakik"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support Material Painter on Ko-fi" height="44"></a>
 
 ## License
 

@@ -1789,6 +1789,10 @@ impl PainterApp {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
                     ui.close();
                 }
+                if ui.button(egui::RichText::new(theme::with_icon(icons::HEART, "Support development on Ko-fi")).color(theme::DONATE)).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(welcome::DONATE_URL));
+                    ui.close();
+                }
                 if ui.button("Open crash reports folder").clicked() {
                     if let Some(dir) = project_io::data_dir() {
                         open_in_file_browser(&dir);
@@ -1814,6 +1818,12 @@ impl PainterApp {
                     self.workspace = ws;
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let resp = theme::donate_button(ui, "Support", vec2(0.0, 22.0));
+                if resp.on_hover_text("Material Painter is free; donations on Ko-fi keep it going").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(welcome::DONATE_URL));
+                }
+            });
         });
     }
 

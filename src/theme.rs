@@ -199,6 +199,25 @@ pub fn selectable<'a>(selected: bool, text: impl Into<egui::WidgetText>) -> egui
 }
 
 /// Icon followed by text, for buttons and tabs.
+/// Ko-fi-like coral: the one saturated warm color in the UI, so the donate
+/// button stands out against the greys and the blue accent.
+pub const DONATE: Color32 = Color32::from_rgb(0xe8, 0x45, 0x4a);
+const DONATE_HOVER: Color32 = Color32::from_rgb(0xff, 0x5e, 0x5b);
+
+/// The donate button: coral fill, bold white text, a brighter fill on hover.
+pub fn donate_button(ui: &mut egui::Ui, text: &str, min_size: egui::Vec2) -> egui::Response {
+    // Hover state from last frame's response of this same widget.
+    let id = ui.next_auto_id();
+    let hot = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+    let label = egui::RichText::new(with_icon(crate::icons::HEART, text)).strong().color(Color32::WHITE);
+    ui.add(
+        egui::Button::new(label)
+            .fill(if hot { DONATE_HOVER } else { DONATE })
+            .stroke(egui::Stroke::NONE)
+            .min_size(min_size),
+    )
+}
+
 pub fn with_icon(icon: &str, text: &str) -> String {
     format!("{icon}  {text}")
 }
