@@ -14,6 +14,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("levels", include_str!("nodes/levels.wgsl")),
     ("invert", include_str!("nodes/invert.wgsl")),
     ("hsl", include_str!("nodes/hsl.wgsl")),
+    ("posterize", include_str!("nodes/posterize.wgsl")),
     ("gradient_map", include_str!("nodes/gradient_map.wgsl")),
     ("histogram_scan", include_str!("nodes/histogram_scan.wgsl")),
     ("grayscale", include_str!("nodes/grayscale.wgsl")),
