@@ -59,7 +59,7 @@ pub enum IdSource {
     VertexColors,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BakeSettings {
     pub quality: Quality,
     pub high_poly: Option<PathBuf>,
@@ -836,6 +836,8 @@ pub struct BakeReport {
     /// Low/high-poly part names paired by match-by-name (0 = not matching).
     pub matched_names: usize,
     pub used_cage: bool,
+    /// Loaded from the bake cache instead of baked.
+    pub from_cache: bool,
     started: Instant,
     gpu_seconds: AtomicU32,
     finished: AtomicBool,
@@ -856,6 +858,62 @@ impl BakeReport {
     }
     pub fn seconds(&self) -> Option<f32> {
         self.finished().then(|| f32::from_bits(self.gpu_seconds.load(Ordering::Relaxed)))
+    }
+
+    /// The finished report, as stored with a cached bake.
+    pub fn cache_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "source": self.source,
+            "triangles": self.triangles,
+            "parts": self.parts,
+            "hard_edges": self.hard_edges,
+            "resolution": self.resolution,
+            "rays_per_texel": self.rays_per_texel,
+            "prep_seconds": self.prep_seconds,
+            "edge_max_distance": self.edge_max_distance,
+            "id_regions": self.id_regions.iter().map(|r| serde_json::json!({
+                "color": r.color, "triangles": r.triangles, "min": r.min, "max": r.max,
+            })).collect::<Vec<_>>(),
+            "matched_names": self.matched_names,
+            "used_cage": self.used_cage,
+            "gpu_seconds": self.seconds().unwrap_or(0.0),
+            "valid_texels": self.valid_texels.load(Ordering::Relaxed),
+            "missed_texels": self.missed_texels.load(Ordering::Relaxed),
+        })
+    }
+
+    /// A finished report restored from [`Self::cache_json`].
+    pub fn from_cache_json(v: &serde_json::Value) -> Option<Self> {
+        let u = |k: &str| v[k].as_u64();
+        let f = |k: &str| v[k].as_f64().map(|x| x as f32);
+        let f3 = |r: &serde_json::Value, k: &str| -> Option<[f32; 3]> {
+            let a = r[k].as_array()?;
+            Some([a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32, a.get(2)?.as_f64()? as f32])
+        };
+        let id_regions = v["id_regions"]
+            .as_array()?
+            .iter()
+            .map(|r| Some(IdRegion { color: f3(r, "color")?, triangles: r["triangles"].as_u64()? as usize, min: f3(r, "min")?, max: f3(r, "max")? }))
+            .collect::<Option<Vec<_>>>()?;
+        Some(BakeReport {
+            source: v["source"].as_str()?.to_string(),
+            triangles: u("triangles")? as usize,
+            parts: u("parts")? as usize,
+            hard_edges: u("hard_edges")? as usize,
+            resolution: u("resolution")? as u32,
+            rays_per_texel: u("rays_per_texel")? as u32,
+            prep_seconds: f("prep_seconds")?,
+            edge_max_distance: f("edge_max_distance")?,
+            id_regions,
+            matched_names: u("matched_names")? as usize,
+            used_cage: v["used_cage"].as_bool()?,
+            from_cache: true,
+            started: Instant::now(),
+            gpu_seconds: AtomicU32::new(f("gpu_seconds")?.to_bits()),
+            finished: AtomicBool::new(true),
+            valid_texels: AtomicU32::new(u("valid_texels")? as u32),
+            missed_texels: AtomicU32::new(u("missed_texels")? as u32),
+        })
     }
 }
 
@@ -1356,6 +1414,7 @@ impl GpuBaker {
             id_regions: scene.id_regions.clone(),
             matched_names: scene.matched_names,
             used_cage: scene.cage.is_some(),
+            from_cache: false,
             started: Instant::now(),
             gpu_seconds: AtomicU32::new(0),
             finished: AtomicBool::new(false),
@@ -1822,7 +1881,7 @@ pub(crate) mod tests {
         (instance, adapter, device, queue)
     }
 
-    fn gpu() -> (wgpu::Device, wgpu::Queue) {
+    pub(crate) fn gpu() -> (wgpu::Device, wgpu::Queue) {
         let (_, _, device, queue) = gpu_with_adapter();
         (device, queue)
     }

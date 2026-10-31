@@ -3,6 +3,7 @@
 
 mod app;
 mod bake;
+mod bake_cache;
 mod brushes;
 mod bvh;
 mod cage;

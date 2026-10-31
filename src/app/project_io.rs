@@ -1,7 +1,7 @@
 //! Project files (.mpp): a JSON manifest plus LZ4-compressed binary blobs
 //! (the mesh, painted channels, masks and bake fixes). Baked mesh maps aren't
-//! stored; opening a project re-bakes them with the saved settings, which
-//! keeps files small.
+//! stored, which keeps files small; opening a project bakes them with the
+//! saved settings, or loads them from the bake cache (`bake_cache`).
 //!
 //! Layout: magic `MPPROJ\0` + format version byte, u64 manifest length,
 //! manifest (UTF-8 JSON), u64 blob count, then per blob a u64 length and the

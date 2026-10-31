@@ -2,6 +2,7 @@
 //! the per-frame GPU flow (stamps -> composite -> viewport render).
 
 use crate::bake::{self, BakeRun, BakeSettings, GpuBaker, IdSource, PreparedScene, Quality};
+use crate::bake_cache;
 use crate::bvh::Bvh;
 use crate::cage::{CageProbe, CageStats, ProbeKey};
 use crate::environment::{self, EnvBaker, EnvImage, EnvSource, Environment};
@@ -285,10 +286,16 @@ struct LineAnchor {
 }
 
 enum BakeJob {
-    /// Worker thread is loading the source and building the BVH.
-    Preparing(mpsc::Receiver<Result<PreparedScene, String>>),
-    /// GPU passes in progress.
-    Running(BakeRun),
+    /// Worker thread is looking the bake up in the cache, or else loading the
+    /// source and building the BVH.
+    Preparing(mpsc::Receiver<Result<Prepared, String>>),
+    /// GPU passes in progress; the result is cached under the key.
+    Running(BakeRun, bake_cache::Key),
+}
+
+enum Prepared {
+    Scene(PreparedScene, bake_cache::Key),
+    Cached(bake_cache::Entry),
 }
 
 struct Shelf {
@@ -1059,10 +1066,16 @@ impl PainterApp {
     fn start_bake(&mut self, ctx: &egui::Context) {
         let mesh = self.mesh.clone();
         let settings = self.bake_settings.clone();
+        let res = self.engine.res.min(bake::MAX_BAKE_RES);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(bake::prepare(&mesh, &settings));
+            let key = bake_cache::key(&mesh, &settings, res);
+            let prepared = match bake_cache::load(&key) {
+                Some(entry) => Ok(Prepared::Cached(entry)),
+                None => bake::prepare(&mesh, &settings).map(|scene| Prepared::Scene(scene, key)),
+            };
+            let _ = tx.send(prepared);
             ctx.request_repaint();
         });
         // A newer job replaces any running one; its results are dropped.
@@ -1074,11 +1087,25 @@ impl PainterApp {
         match &mut self.bake_job {
             None => {}
             Some(BakeJob::Preparing(rx)) => match rx.try_recv() {
-                Ok(Ok(scene)) => {
+                Ok(Ok(Prepared::Cached(entry))) => {
+                    let rs = &self.rs;
+                    match out_of_memory_guard(&rs.device, || entry.upload(&rs.device, &rs.queue)) {
+                        Ok((maps, report)) => {
+                            self.status = format!("Loaded {} cached mesh maps ({}², from {}).", MAPS.len(), report.resolution, report.source);
+                            self.engine.set_maps(maps, Arc::new(report));
+                        }
+                        Err(e) => {
+                            self.fail_mcp_bake(&e);
+                            self.status = e;
+                        }
+                    }
+                    self.bake_job = None;
+                }
+                Ok(Ok(Prepared::Scene(scene, key))) => {
                     let (baker, rs, mesh, settings, res) = (&self.baker, &self.rs, &self.gpu_mesh, &self.bake_settings, self.engine.res);
                     match out_of_memory_guard(&rs.device, || baker.start(&rs.device, &rs.queue, mesh, scene, settings, res)) {
                         Ok(run) => {
-                            self.bake_job = Some(BakeJob::Running(run));
+                            self.bake_job = Some(BakeJob::Running(run, key));
                             ctx.request_repaint();
                         }
                         Err(e) => {
@@ -1099,7 +1126,7 @@ impl PainterApp {
                     self.bake_job = None;
                 }
             },
-            Some(BakeJob::Running(run)) => {
+            Some(BakeJob::Running(run, key)) => {
                 let (baker, rs) = (&self.baker, &self.rs);
                 let pumped = match out_of_memory_guard(&rs.device, || baker.pump(run, &rs.device, &rs.queue, ctx)) {
                     Ok(maps) => maps,
@@ -1130,6 +1157,7 @@ impl PainterApp {
                         if report.used_cage { ", cage" } else { "" },
                         report.resolution
                     );
+                    bake_cache::store(key.clone(), &maps, report.clone(), &self.rs.device, &self.rs.queue);
                     self.engine.set_maps(maps, report);
                     self.bake_job = None;
                 }
@@ -1141,7 +1169,7 @@ impl PainterApp {
         match &self.bake_job {
             None => None,
             Some(BakeJob::Preparing(_)) => Some((0.0, "Preparing")),
-            Some(BakeJob::Running(run)) => Some((run.progress(), "Baking")),
+            Some(BakeJob::Running(run, _)) => Some((run.progress(), "Baking")),
         }
     }
 
@@ -2532,7 +2560,11 @@ impl PainterApp {
             }
         });
         if let Some(r) = &self.engine.bake_report {
-            let time = r.seconds().map_or("…".to_string(), |s| format!("{:.2}s GPU + {:.2}s prep", s, r.prep_seconds));
+            let time = if r.from_cache {
+                "loaded from the bake cache".to_string()
+            } else {
+                r.seconds().map_or("…".to_string(), |s| format!("{:.2}s GPU + {:.2}s prep", s, r.prep_seconds))
+            };
             ui.label(
                 egui::RichText::new(format!(
                     "{} · {} tris · {} parts · {} feature edges · {}² · {} rays/texel · {}",

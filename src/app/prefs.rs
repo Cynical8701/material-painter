@@ -363,6 +363,12 @@ impl PainterApp {
                 labeled(ui, "Resolution", |ui| resolution_combo(ui, "pref res", &mut p.default_resolution));
                 hint(ui, "Texture size of new projects. Change the current project's size in the texture set settings.");
                 ui.checkbox(&mut p.bake_on_load, "Bake mesh maps when a mesh is loaded");
+                ui.horizontal(|ui| {
+                    if ui.button("Clear bake cache").clicked() {
+                        crate::bake_cache::clear();
+                    }
+                    hint(ui, "Baked maps are cached, so reopening a mesh with the same settings is instant.");
+                });
                 labeled(ui, "Recent files", |ui| ui.add(egui::DragValue::new(&mut p.recent_count).range(1..=30)));
                 section(ui, "Safety");
                 ui.checkbox(&mut p.autosave, "Autosave a recovery copy of unsaved work");

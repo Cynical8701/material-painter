@@ -98,7 +98,7 @@ impl PainterApp {
                         for path in self.recent.iter().take(7) {
                             let name = path.file_stem().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
                             let folder = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-                            let resp = ui.add(egui::Button::new(egui::RichText::new(&name).color(Color32::WHITE)).frame(false)).on_hover_text(path.display().to_string());
+                            let resp = ui.add(row_button(ui, egui::RichText::new(&name).color(Color32::WHITE))).on_hover_text(path.display().to_string());
                             ui.add(egui::Label::new(egui::RichText::new(folder).small().color(theme::TEXT_DIM)).truncate());
                             if resp.clicked() {
                                 self.pending.push(Action::OpenProject(Some(path.clone())));
@@ -147,13 +147,22 @@ fn heading(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
 }
 
+/// A full-width, left-aligned button whose frame appears on hover, so it
+/// reads as a list entry until the pointer is over it.
+fn row_button<'a>(ui: &egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Button<'a> {
+    egui::Button::new((text.into(), egui::Atom::grow()))
+        .frame(true)
+        .frame_when_inactive(false)
+        .min_size(vec2(ui.available_width(), 24.0))
+}
+
 fn link_button(ui: &mut egui::Ui, icon: &str, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(theme::with_icon(icon, text)).frame(false))
+    ui.add(row_button(ui, theme::with_icon(icon, text)))
 }
 
 /// A link; empty URLs show disabled ("coming soon").
 fn url_button(ui: &mut egui::Ui, icon: &str, text: &str, url: &str) {
-    let resp = ui.add_enabled(!url.is_empty(), egui::Button::new(theme::with_icon(icon, text)).frame(false));
+    let resp = ui.add_enabled(!url.is_empty(), row_button(ui, theme::with_icon(icon, text)));
     if url.is_empty() {
         resp.on_disabled_hover_text("Coming soon");
     } else if resp.on_hover_text(url).clicked() {

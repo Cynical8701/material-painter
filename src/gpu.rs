@@ -297,35 +297,42 @@ impl GpuMesh {
 
 /// Blocking texture readback, used for export (an explicit user action).
 pub fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Tex) -> Vec<u8> {
-    let bpp = bytes_per_texel(tex.format);
-    let row = tex.width * bpp;
+    read_wgpu_texture(device, queue, &tex.texture)
+}
+
+/// Blocking readback of a 2D texture's first mip, tightly packed. Waits for
+/// all submitted GPU work, so off the UI thread it suits background saves.
+pub fn read_wgpu_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> Vec<u8> {
+    let (width, height) = (tex.width(), tex.height());
+    let bpp = bytes_per_texel(tex.format());
+    let row = width * bpp;
     let padded = row.div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: (padded * tex.height) as u64,
+        size: (padded * height) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&Default::default());
     encoder.copy_texture_to_buffer(
-        tex.copy_info(),
+        tex.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
             buffer: &buffer,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
-                rows_per_image: Some(tex.height),
+                rows_per_image: Some(height),
             },
         },
-        tex.extent(),
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
     );
     queue.submit([encoder.finish()]);
     let slice = buffer.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let data = slice.get_mapped_range().expect("readback buffer is mapped");
-    let mut out = Vec::with_capacity((row * tex.height) as usize);
-    for y in 0..tex.height as usize {
+    let mut out = Vec::with_capacity((row * height) as usize);
+    for y in 0..height as usize {
         let start = y * padded as usize;
         out.extend_from_slice(&data[start..start + row as usize]);
     }

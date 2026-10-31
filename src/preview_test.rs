@@ -595,6 +595,7 @@ fn graph_presets_render() {
 #[ignore]
 fn ui_screenshots() {
     use crate::app::{PainterApp, Workspace};
+    use egui_kittest::kittest::Queryable;
     // The same device request as the app: the adapter's full limits.
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
@@ -614,6 +615,10 @@ fn ui_screenshots() {
     std::fs::create_dir_all(&dir).unwrap();
     // The welcome window opens at startup.
     harness.render().expect("renders").save(dir.join("welcome.png")).unwrap();
+    // Its entries light up under the pointer.
+    harness.get_by_label_contains("Open project").hover();
+    harness.run_steps(2);
+    harness.render().expect("renders").save(dir.join("welcome_hover.png")).unwrap();
     harness.state_mut().test_close_welcome();
     harness.run_steps(2);
     harness.state_mut().test_show_seams();
