@@ -1,0 +1,332 @@
+//! Undo/redo for every document edit.
+//!
+//! Strokes store before/after states of the painted textures, read back
+//! asynchronously, LZ4-compressed on a worker thread and kept in system RAM,
+//! so stroke history costs almost no VRAM. Structural edits (layers, masks,
+//! clears) are swaps that keep the removed data; property edits store the
+//! previous non-pixel state.
+
+use crate::engine::{Blend, Content, FillParams, Generator, Layer, Levels, Mask};
+use crate::gpu::{Tex, bytes_per_texel};
+use eframe::wgpu;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+
+#[derive(Clone, Copy)]
+pub struct TexInfo {
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u32,
+}
+
+enum SnapState {
+    Mapping { buffers: Vec<wgpu::Buffer>, remaining: Arc<AtomicUsize> },
+    Compressing(mpsc::Receiver<Vec<Vec<u8>>>),
+    Ready(Vec<Vec<u8>>),
+}
+
+pub struct Snapshot {
+    infos: Vec<TexInfo>,
+    state: SnapState,
+}
+
+impl Snapshot {
+    /// Encodes copies of `textures` into fresh staging buffers. Call
+    /// [`Snapshot::request_map`] after the encoder has been submitted.
+    pub fn encode(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, textures: &[&Tex]) -> Snapshot {
+        let mut infos = Vec::new();
+        let mut buffers = Vec::new();
+        for tex in textures {
+            let bpp = bytes_per_texel(tex.format);
+            let row = tex.width * bpp;
+            debug_assert!(row % 256 == 0, "texture rows must be 256-byte aligned for readback");
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("undo staging"),
+                size: (row * tex.height) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                tex.copy_info(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(tex.height),
+                    },
+                },
+                tex.extent(),
+            );
+            infos.push(TexInfo { width: tex.width, height: tex.height, bpp });
+            buffers.push(buffer);
+        }
+        let remaining = Arc::new(AtomicUsize::new(buffers.len()));
+        Snapshot { infos, state: SnapState::Mapping { buffers, remaining } }
+    }
+
+    pub fn request_map(&self) {
+        if let SnapState::Mapping { buffers, remaining } = &self.state {
+            for b in buffers {
+                let remaining = remaining.clone();
+                b.slice(..).map_async(wgpu::MapMode::Read, move |_| {
+                    remaining.fetch_sub(1, Ordering::AcqRel);
+                });
+            }
+        }
+    }
+
+    /// Advances the state machine without blocking.
+    pub fn update(&mut self) {
+        match &mut self.state {
+            SnapState::Mapping { buffers, remaining } => {
+                if remaining.load(Ordering::Acquire) != 0 {
+                    return;
+                }
+                let raw: Vec<Vec<u8>> = buffers
+                    .iter()
+                    .map(|b| {
+                        let data = b.slice(..).get_mapped_range().expect("staging buffer is mapped").to_vec();
+                        b.unmap();
+                        data
+                    })
+                    .collect();
+                let (tx, rx) = mpsc::channel();
+                rayon::spawn(move || {
+                    let packed = raw.iter().map(|d| lz4_flex::compress_prepend_size(d)).collect();
+                    let _ = tx.send(packed);
+                });
+                self.state = SnapState::Compressing(rx);
+            }
+            SnapState::Compressing(rx) => {
+                if let Ok(data) = rx.try_recv() {
+                    self.state = SnapState::Ready(data);
+                }
+            }
+            SnapState::Ready(_) => {}
+        }
+    }
+
+    /// Blocks until the data is available. Used when the user undoes a stroke
+    /// whose readback is still in flight.
+    pub fn wait(&mut self, device: &wgpu::Device) {
+        loop {
+            match &mut self.state {
+                SnapState::Mapping { remaining, .. } => {
+                    if remaining.load(Ordering::Acquire) != 0 {
+                        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                    }
+                    self.update();
+                }
+                SnapState::Compressing(rx) => {
+                    let data = rx.recv().unwrap_or_default();
+                    self.state = SnapState::Ready(data);
+                }
+                SnapState::Ready(_) => return,
+            }
+        }
+    }
+
+    pub fn compressed_bytes(&self) -> usize {
+        match &self.state {
+            SnapState::Ready(d) => d.iter().map(|v| v.len()).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Uploads the snapshot into `textures` (same order and sizes as captured).
+    pub fn restore(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, textures: &[&Tex]) {
+        self.wait(device);
+        let SnapState::Ready(data) = &self.state else { return };
+        for ((tex, packed), info) in textures.iter().zip(data).zip(&self.infos) {
+            if tex.width != info.width || tex.height != info.height {
+                continue;
+            }
+            let Ok(raw) = lz4_flex::decompress_size_prepended(packed) else { continue };
+            queue.write_texture(
+                tex.copy_info(),
+                &raw,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(info.width * info.bpp),
+                    rows_per_image: Some(info.height),
+                },
+                tex.extent(),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrokeTarget {
+    /// Layer content; the channels painted are listed in the entry.
+    Content,
+    Mask,
+    /// A painted correction on baked mesh map `n` (see `engine::MAPS`).
+    BakeFix(usize),
+}
+
+/// One painted stroke: before/after snapshots of the textures it touched.
+pub struct UndoEntry {
+    pub layer_id: u64,
+    pub target: StrokeTarget,
+    pub channels: Vec<usize>,
+    pub before: Snapshot,
+    pub after: Snapshot,
+}
+
+impl UndoEntry {
+    fn bytes(&self) -> usize {
+        self.before.compressed_bytes() + self.after.compressed_bytes()
+    }
+}
+
+/// Non-pixel state of one layer: everything the properties panel edits.
+#[derive(Clone, PartialEq)]
+pub struct LayerProps {
+    pub name: String,
+    pub visible: bool,
+    pub opacity: f32,
+    pub blend: Blend,
+    pub fill: Option<FillParams>,
+    pub generator: Option<Generator>,
+    pub mask_filters: Vec<crate::engine::MaskFilter>,
+    pub mask_layers: Vec<crate::engine::MaskLayer>,
+}
+
+/// Non-pixel document state, diffed to record property edits.
+#[derive(Clone, PartialEq, Default)]
+pub struct DocProps {
+    pub layers: Vec<(u64, LayerProps)>,
+    pub levels: Vec<Levels>,
+}
+
+/// A reversible edit. Every variant except `Stroke` is a swap: applying it
+/// exchanges the stored state with the engine's, so the same operation both
+/// undoes and redoes it (see `Engine::apply_edit`).
+pub enum Edit {
+    Stroke(UndoEntry),
+    /// `Some(layer)` is inserted at `index`; `None` removes layer `id` and stores it.
+    Layer { index: usize, id: u64, layer: Option<Layer> },
+    /// Layer order, by id.
+    Order(Vec<u64>),
+    Content { id: u64, content: Content },
+    /// The folder a layer is in.
+    Parent { id: u64, parent: Option<u64> },
+    /// A fill layer's channel images.
+    Images { id: u64, images: [Option<crate::engine::FillImage>; 4] },
+    Mask { id: u64, mask: Option<Mask> },
+    Props(DocProps),
+    /// Painted correction texture of a baked map.
+    Fix { map: usize, tex: Option<Tex> },
+    /// Several edits as one step: applied in order to redo, reversed to undo.
+    Group(Vec<Edit>),
+}
+
+impl Edit {
+    fn for_each_stroke(&mut self, f: &mut impl FnMut(&mut UndoEntry)) {
+        match self {
+            Edit::Stroke(e) => f(e),
+            Edit::Group(edits) => edits.iter_mut().for_each(|e| e.for_each_stroke(f)),
+            _ => {}
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Edit::Stroke(e) => e.bytes(),
+            Edit::Group(edits) => edits.iter().map(|e| e.bytes()).sum(),
+            _ => 0,
+        }
+    }
+}
+
+pub struct Entry {
+    pub label: String,
+    pub edit: Edit,
+    /// Unique per recorded step; the top serial identifies the document
+    /// state, so "unsaved changes" survives undo and redo correctly.
+    pub serial: u64,
+}
+
+/// Linear history. Removed layers, masks and cleared paint live here (still
+/// on the GPU) until their entry falls off the end.
+pub struct UndoStack {
+    pub undo: Vec<Entry>,
+    pub redo: Vec<Entry>,
+    group: Option<Entry>,
+    /// Nesting of begin_group calls; the group is pushed when it returns to 0.
+    group_depth: usize,
+    next_serial: u64,
+    /// Steps kept; older ones are dropped (Preferences > General).
+    pub max_entries: usize,
+}
+
+impl Default for UndoStack {
+    fn default() -> Self {
+        Self { undo: Vec::new(), redo: Vec::new(), group: None, group_depth: 0, next_serial: 0, max_entries: 64 }
+    }
+}
+
+impl UndoStack {
+    pub fn push(&mut self, label: impl Into<String>, edit: Edit) {
+        if let Some(Entry { edit: Edit::Group(edits), .. }) = &mut self.group {
+            edits.push(edit);
+            return;
+        }
+        self.redo.clear();
+        self.next_serial += 1;
+        self.undo.push(Entry { label: label.into(), edit, serial: self.next_serial });
+        if self.undo.len() > self.max_entries.max(1) {
+            let excess = self.undo.len() - self.max_entries.max(1);
+            self.undo.drain(..excess);
+        }
+    }
+
+    /// Collects every push until [`UndoStack::end_group`] into one step.
+    /// Starts collecting edits into one step. Nested calls join the outer
+    /// group, so composite operations can be built from smaller ones.
+    pub fn begin_group(&mut self, label: impl Into<String>) {
+        if self.group_depth == 0 {
+            self.group = Some(Entry { label: label.into(), edit: Edit::Group(Vec::new()), serial: 0 });
+        }
+        self.group_depth += 1;
+    }
+
+    pub fn end_group(&mut self) {
+        self.group_depth = self.group_depth.saturating_sub(1);
+        if self.group_depth > 0 {
+            return;
+        }
+        if let Some(entry) = self.group.take() {
+            if matches!(&entry.edit, Edit::Group(e) if !e.is_empty()) {
+                self.push(entry.label, entry.edit);
+            }
+        }
+    }
+
+    pub fn update(&mut self) {
+        for e in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            e.edit.for_each_stroke(&mut |s| {
+                s.before.update();
+                s.after.update();
+            });
+        }
+    }
+
+    /// Identifies the current document state (0 = nothing recorded).
+    pub fn state_serial(&self) -> u64 {
+        self.undo.last().map_or(0, |e| e.serial)
+    }
+
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.group = None;
+    }
+
+    pub fn ram_bytes(&self) -> usize {
+        self.undo.iter().chain(self.redo.iter()).map(|e| e.edit.bytes()).sum()
+    }
+}

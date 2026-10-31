@@ -1,0 +1,34 @@
+[package]
+name = "material_painter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+eframe = "0.37.0"
+egui_tiles = { version = "0.18", features = ["serde"] }
+glam = { version = "0.34.1", features = ["bytemuck"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "bmp", "tiff", "hdr", "exr"] }
+lz4_flex = "0.14.0"
+mikktspace = { version = "0.3.0", default-features = false, features = ["glam"] }
+notify = "8"
+rayon = "1.12.0"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tobj = "4.0.5"
+ufbx = "0.11.5"
+
+# Dependencies are always optimized so debug builds stay interactive.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "eframe", "snapshot"] }
