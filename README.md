@@ -64,6 +64,11 @@ and write images to `target/bake_test/`:
 cargo test --bin material_painter -- --ignored --test-threads 1
 ```
 
+## Community
+
+Questions, renders and shared materials: join the [Discord](https://discord.gg/TqKD5xKp7Y).
+Bugs and feature requests are welcome there or as [GitHub issues](https://github.com/alla2001/material-painter/issues).
+
 ## License
 
 Material Painter is free software under the
