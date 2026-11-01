@@ -32,6 +32,7 @@ mod dock;
 mod gallery;
 mod graph_ui;
 mod shader_ui;
+mod library_ui;
 mod welcome;
 mod mcp_tools;
 pub(crate) mod prefs;
@@ -147,6 +148,8 @@ enum ShelfCat {
     Brushes,
     Textures,
     Graphs,
+    /// Materials downloaded from the asset library.
+    Downloaded,
 }
 
 struct Brush {
@@ -426,6 +429,7 @@ pub struct PainterApp {
     /// The welcome window (startup, or Help → Welcome).
     show_welcome: bool,
     welcome_tex: Option<egui::TextureHandle>,
+    library: library_ui::LibraryUi,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
@@ -859,6 +863,8 @@ enum ShelfItem {
     Texture(usize),
     /// A saved material graph (`GraphStore::shelf`).
     Graph(usize),
+    /// A downloaded material (`LibraryUi::local`).
+    Library(usize),
 }
 
 /// A layer being dragged in the layer stack.
@@ -896,6 +902,24 @@ impl PainterApp {
     #[cfg(test)]
     pub(crate) fn test_close_welcome(&mut self) {
         self.show_welcome = false;
+    }
+
+    /// Opens the asset library and shows the Downloaded shelf (offscreen UI
+    /// tests); true once the open tab's catalog has arrived.
+    #[cfg(test)]
+    pub(crate) fn test_open_library(&mut self) -> bool {
+        self.export.open = false;
+        self.library.open = true;
+        self.shelf.cat = ShelfCat::Downloaded;
+        self.library.test_ready()
+    }
+
+    /// Closes the library and adds the first downloaded material as a layer
+    /// (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_add_downloaded(&mut self) {
+        self.library.open = false;
+        self.pending.push(Action::AddOnTop(ShelfItem::Library(0)));
     }
 
     /// Opens the export window (offscreen UI tests).
@@ -1020,6 +1044,7 @@ impl PainterApp {
             show_about: false,
             show_welcome: false,
             welcome_tex: None,
+            library: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
@@ -1326,6 +1351,7 @@ impl PainterApp {
                             self.add_shelf_graph(&path, at, parent);
                         }
                     }
+                    ShelfItem::Library(i) => self.add_library_material(i, at, parent),
                 },
                 Action::AddGraphLayer => self.add_graph_layer(None, at, parent),
                 Action::AddGraphPreset(i) => {
@@ -3376,6 +3402,7 @@ impl PainterApp {
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("SHELF").small().color(theme::TEXT_DIM));
                 ui.spacing_mut().item_spacing.y = 2.0;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (cat, icon, name, count) in [
                     (ShelfCat::SmartMaterials, icons::SPARKLE, "Smart materials", presets::SMART_MATERIALS.len()),
                     (ShelfCat::Materials, icons::SPHERE, "Materials", presets::MATERIALS.len()),
@@ -3383,6 +3410,7 @@ impl PainterApp {
                     (ShelfCat::Brushes, icons::PAINT_BRUSH, "Brushes", crate::brushes::BRUSH_ALPHAS.len()),
                     (ShelfCat::Textures, icons::IMAGES, "Textures", crate::textures::TEXTURES.len()),
                     (ShelfCat::Graphs, icons::SPARKLE, "Graphs", self.graphs.shelf.len()),
+                    (ShelfCat::Downloaded, icons::DOWNLOAD_SIMPLE, "Downloaded", self.library.local.len()),
                 ] {
                     let on = self.shelf.cat == cat;
                     let text = egui::RichText::new(format!("{}  {name}", icon)).color(if on { Color32::WHITE } else { theme::TEXT });
@@ -3398,19 +3426,26 @@ impl PainterApp {
                         self.shelf.cat = cat;
                     }
                 }
+                });
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6, 4)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.shelf.search).hint_text("Search…").desired_width(220.0));
+                    let browse = egui::Button::new(egui::RichText::new(theme::with_icon(icons::GLOBE, "Get more assets")).color(Color32::WHITE))
+                        .fill(theme::ACCENT.gamma_multiply(0.55));
+                    if ui.add(browse).on_hover_text("Thousands of free materials from Poly Haven and ambientCG, and graphs shared by the community").clicked() {
+                        self.library.open = true;
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.shelf.search).hint_text("Search…").desired_width(200.0));
                     let hint = match self.shelf.cat {
                         ShelfCat::SmartMaterials => "Double-click or drag onto a view to add a smart material (a folder of layers).",
                         ShelfCat::Materials => "Double-click or drag onto a view to add as a fill layer. Right-click for more.",
                         ShelfCat::Generators => "Double-click or drag onto a view to mask the selected layer.",
                         ShelfCat::Brushes => "Double-click or drag onto a view to paint with this brush tip.",
                         ShelfCat::Textures => "Double-click or drag to add as a height fill layer. Right-click to put it on the selected fill layer.",
-                        ShelfCat::Graphs => "Material graphs you saved. Double-click or drag onto a view to add as a graph fill layer.",
+                        ShelfCat::Graphs => "Material graphs you saved or downloaded. Double-click or drag onto a view to add as a graph fill layer. Right-click to share.",
+                        ShelfCat::Downloaded => "Free materials from the asset library. Double-click or drag onto a view to add as a fill layer.",
                     };
                     ui.label(egui::RichText::new(hint).small().color(theme::TEXT_DIM));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3428,6 +3463,7 @@ impl PainterApp {
                 }
                 let icon = self.shelf.icon_size;
                 let search = self.shelf.search.to_lowercase();
+                let mut share = None;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -3450,6 +3486,36 @@ impl PainterApp {
                                     if resp.double_clicked() {
                                         self.pending.push(Action::AddOnTop(ShelfItem::Graph(i)));
                                     }
+                                    resp.context_menu(|ui| {
+                                        if ui.button(theme::with_icon(icons::SHARE_NETWORK, "Share to community…")).clicked() {
+                                            share = Some(i);
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                            }
+                            ShelfCat::Downloaded => {
+                                self.library.ensure_local(ui.ctx());
+                                if self.library.local.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Nothing downloaded yet. Click Get more assets above for thousands of free materials.")
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
+                                let fallback = self.shelf.materials.first().map(|t| t.id());
+                                for i in 0..self.library.local.len() {
+                                    let m = &self.library.local[i];
+                                    if !m.name.to_lowercase().contains(&search) {
+                                        continue;
+                                    }
+                                    let thumb = self.library.local_thumbs.get(i).and_then(|t| t.as_ref()).map(|t| t.id());
+                                    let Some(tex) = thumb.or(fallback) else { continue };
+                                    let resp = Self::swatch(ui, tex, &m.name.clone(), icon).on_hover_text(format!("{}, from {}", m.name, m.source));
+                                    resp.dnd_set_drag_payload(ShelfItem::Library(i));
+                                    if resp.double_clicked() {
+                                        self.pending.push(Action::AddOnTop(ShelfItem::Library(i)));
+                                    }
+                                    resp.context_menu(|ui| self.library_material_menu(ui, i));
                                 }
                             }
                             ShelfCat::SmartMaterials => {
@@ -3556,6 +3622,9 @@ impl PainterApp {
                         }
                     });
                 });
+                if let Some(i) = share {
+                    self.share_graph(ui.ctx(), i);
+                }
             });
     }
 
@@ -4505,6 +4574,7 @@ impl eframe::App for PainterApp {
         self.poll_bake(&ctx);
         self.poll_env();
         self.poll_hdri_thumbs(&ctx);
+        self.poll_library(&ctx);
         // Closing the window with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.is_modified() {
@@ -4584,6 +4654,7 @@ impl eframe::App for PainterApp {
         self.about_window(&ctx);
         self.crash_window(&ctx);
         self.welcome_window(&ctx);
+        self.library_window(&ctx);
         // Settings changed in the bake window show on the next frame.
         self.update_cage_preview(&ctx);
 

@@ -15,6 +15,7 @@ mod gpu;
 mod graph;
 mod icons;
 mod import;
+mod library;
 mod mcp;
 mod mesh;
 mod polyfill;

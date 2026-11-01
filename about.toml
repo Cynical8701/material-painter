@@ -12,6 +12,8 @@ accepted = [
     "MPL-2.0",
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # Mozilla's root certificate list (webpki-roots), for HTTPS in the asset library.
+    "CDLA-Permissive-2.0",
 ]
 # Only what ships in the executable.
 ignore-build-dependencies = true

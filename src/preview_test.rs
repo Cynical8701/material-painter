@@ -646,6 +646,22 @@ fn ui_screenshots() {
     harness.state_mut().test_show_hdris(&ctx);
     harness.run_steps(4);
     harness.render().expect("renders").save(dir.join("hdri.png")).unwrap();
+    // The asset library (network: waits for the catalog, then thumbnails).
+    let start = std::time::Instant::now();
+    while !harness.state_mut().test_open_library() && start.elapsed().as_secs() < 60 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < 8 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    harness.render().expect("renders").save(dir.join("library.png")).unwrap();
+    // A downloaded material dropped on the mesh.
+    harness.state_mut().test_add_downloaded();
+    harness.run_steps(10);
+    harness.render().expect("renders").save(dir.join("library_layer.png")).unwrap();
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer

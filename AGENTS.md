@@ -38,6 +38,7 @@ offscreen with egui_kittest into `target/bake_test/ui/`.
 | `src/shaders/*.wgsl` | Engine shaders (compositing, painting stamps, baking, views) |
 | `src/presets.rs` | Smart materials, materials and mask generators on the shelf |
 | `src/mesh.rs`, `src/import.rs` | Meshes, procedural primitives, OBJ/FBX import, MikkTSpace tangents |
+| `src/library.rs`, `src/app/library_ui.rs` | Asset library: Poly Haven / ambientCG catalogs and downloads, the community library (`alla2001/material-painter-community`), sharing graphs; network work on worker threads |
 | `src/export.rs` | Texture export templates (engine presets) and file writing |
 | `src/undo.rs` | Undo/redo of every document edit |
 | `src/mcp.rs`, `src/app/mcp_tools.rs` | Optional MCP server so AI agents can drive the app (off by default) |

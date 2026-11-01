@@ -44,4 +44,7 @@ pub const BUG: &str = "\u{E5F4}";
 pub const BOOK_OPEN: &str = "\u{E0E6}";
 pub const FILE_PLUS: &str = "\u{E236}";
 pub const DOWNLOAD_SIMPLE: &str = "\u{E20C}";
+pub const GLOBE: &str = "\u{E288}";
+pub const SHARE_NETWORK: &str = "\u{E408}";
+pub const USERS_THREE: &str = "\u{E68E}";
 pub const X: &str = "\u{E4F6}";

@@ -41,6 +41,10 @@ maps, build materials in a node graph and write your own node shaders.
 - **Export**: presets for Unreal, Unity (URP, HDRP, Built-in), Godot, glTF,
   Roblox and Blender, or your own channel packing; PNG, TIFF, TGA, JPEG and
   EXR at 8, 16 or 32 bits.
+- **Asset library**: about 2,900 free CC0 materials from Poly Haven and
+  ambientCG, one click from the shelf, plus a community library of material
+  graphs and nodes that users share from inside the app. Downloads are plain
+  image files with a `meta.json`, so nothing is locked into Material Painter.
 - **Docking workspaces**, path-traced preview, HDRI lighting, and an MCP
   server so AI agents can drive the app (off by default).
 
