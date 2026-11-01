@@ -5,7 +5,8 @@
 pub mod builtin;
 pub mod def;
 pub mod presets;
-mod runtime;
+pub(crate) mod runtime;
+pub mod shading;
 
 pub use def::{Kind, NodeDef, ParamKind, Value};
 pub use runtime::Runtime;

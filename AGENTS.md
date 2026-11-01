@@ -38,6 +38,8 @@ offscreen with egui_kittest into `target/bake_test/ui/`.
 | `src/shaders/*.wgsl` | Engine shaders (compositing, painting stamps, baking, views) |
 | `src/presets.rs` | Smart materials, materials and mask generators on the shelf |
 | `src/mesh.rs`, `src/import.rs` | Meshes, procedural primitives, OBJ/FBX import, MikkTSpace tangents |
+| `src/graph/shading.rs`, `src/graph/nodes/shading/`, `src/app/preview_shader.rs` | Preview shaders: shading graphs compiled into one `custom_shade(c: Shade)` for the 3D view (`Shade` and the hook are in `view.wgsl`); parameters are a uniform array |
+| `src/app/path_tool.rs` | Path tool: editable curves on the surface or UV map, stamped through the normal stroke pipeline |
 | `src/library.rs`, `src/app/library_ui.rs` | Asset library: Poly Haven / ambientCG catalogs and downloads, the community library (`alla2001/material-painter-community`), sharing graphs; network work on worker threads |
 | `src/export.rs` | Texture export templates (engine presets) and file writing |
 | `src/undo.rs` | Undo/redo of every document edit |

@@ -34,6 +34,7 @@ mod graph_ui;
 mod shader_ui;
 mod library_ui;
 mod path_tool;
+mod preview_shader;
 mod smart_io;
 mod welcome;
 mod mcp_tools;
@@ -438,6 +439,7 @@ pub struct PainterApp {
     library: library_ui::LibraryUi,
     user_smarts: Vec<smart_io::UserSmart>,
     path: path_tool::PathTool,
+    preview: preview_shader::PreviewShader,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
@@ -958,6 +960,12 @@ impl PainterApp {
         [before, summary(&self.engine, self.selected)]
     }
 
+    /// Opens a graph in the Material Designer (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_open_graph(&mut self, id: u64) {
+        self.open_graph(id);
+    }
+
     /// Path tool on a new paint layer with the Stitch tip: a path across the
     /// ball in the 3D view or a curve on the UV map (offscreen UI tests).
     #[cfg(test)]
@@ -1125,6 +1133,7 @@ impl PainterApp {
             library: Default::default(),
             user_smarts: smart_io::list(&cc.egui_ctx),
             path: Default::default(),
+            preview: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
@@ -2526,12 +2535,15 @@ impl PainterApp {
 
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let v = &mut self.view;
             section(ui, "Camera");
             let mut fov = self.cam.fov_y.to_degrees();
             if slider(ui, "Field of view", &mut fov, 10.0..=90.0) {
                 self.cam.fov_y = fov.to_radians();
             }
+
+            section(ui, "Shader");
+            self.preview_shader_section(ui);
+            let v = &mut self.view;
 
             section(ui, "Environment");
             let current = self.env_load.as_ref().map_or_else(|| self.env.source.name(), |_| "Loading…".to_string());
@@ -4756,6 +4768,7 @@ impl eframe::App for PainterApp {
         self.sync_brush_tip();
         self.sync_brush_grain();
         self.update_graphs();
+        self.update_preview_shader();
         self.update_cage_preview(&ctx);
         match self.workspace {
             Workspace::Paint => {

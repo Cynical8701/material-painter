@@ -38,6 +38,8 @@ struct Globals {
 @group(0) @binding(16) var shadow_map: texture_depth_2d;
 @group(0) @binding(17) var shadow_samp: sampler_comparison;
 @group(0) @binding(15) var<uniform> env_sh: array<vec4<f32>, 9>;
+// Parameters of a custom preview shader (a shading graph), 4 floats each.
+@group(0) @binding(18) var<uniform> cp: array<vec4<f32>, 128>;
 
 const PI: f32 = 3.14159265;
 
@@ -218,7 +220,11 @@ fn shade(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
         }
         default: {}
     }
+    return shade_pbr(s, n, v, shadow);
+}
 
+// The built-in physically based look: image-based light plus the key light.
+fn shade_pbr(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
     let rough = clamp(s.rough, 0.03, 1.0);
     let a = rough * rough;
     let f0 = mix(vec3<f32>(0.04), s.albedo, s.metal);
@@ -279,26 +285,53 @@ fn vs_mesh(v: VIn) -> MeshOut {
     return out;
 }
 
-@fragment
-fn fs_mesh(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let s = sample_surface(in.uv);
+// Everything a shader sees at one point of the mesh; custom preview shaders
+// (shading graphs) read their inputs from it.
+struct Shade {
+    s: Surface,
+    // Shading normal (baked normal and painted height applied), the
+    // geometric normal, and the direction toward the camera.
+    n: vec3<f32>,
+    gn: vec3<f32>,
+    v: vec3<f32>,
+    // Toward the key light, and its color times intensity (zero when off).
+    l: vec3<f32>,
+    light: vec3<f32>,
+    shadow: f32,
+    uv: vec2<f32>,
+    wpos: vec3<f32>,
+};
+
+fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
+    var c: Shade;
+    c.s = sample_surface(in.uv);
     var rn = in.n;
     if (!front) {
         rn = -rn;
     }
-    let n = normalize(rn);
+    c.gn = normalize(rn);
     // MikkTSpace decoding: the interpolated normal and tangent as they are
     // (not normalized or made orthogonal), the bitangent from their cross
     // product, normalized only after combining. The baker inverts exactly
     // this, and so do Unity, Unreal, Godot and Blender.
     let b_up = -cross(rn, in.t.xyz) * in.t.w;
-    let pn = normalize(in.t.xyz * s.ts.x + b_up * s.ts.y + rn * s.ts.z);
-    let v = normalize(g.cam_pos.xyz - in.wpos);
-    var shadow = 1.0;
+    c.n = normalize(in.t.xyz * c.s.ts.x + b_up * c.s.ts.y + rn * c.s.ts.z);
+    c.v = normalize(g.cam_pos.xyz - in.wpos);
+    c.l = normalize(g.sun.xyz);
+    c.light = g.sun_c.rgb * g.sun.w * g.sun_c.w;
+    c.shadow = 1.0;
     if (g.sun_c.w > 0.5) {
-        shadow = key_shadow(in.wpos, n);
+        c.shadow = key_shadow(in.wpos, c.gn);
     }
-    return vec4<f32>(shade(s, pn, v, shadow), 1.0);
+    c.uv = in.uv;
+    c.wpos = in.wpos;
+    return c;
+}
+
+@fragment
+fn fs_mesh(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let c = mesh_shade_inputs(in, front);
+    return vec4<f32>(shade(c.s, c.n, c.v, c.shadow), 1.0);
 }
 
 // ---------------------------------------------------------------- 2D view

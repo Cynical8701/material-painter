@@ -23,6 +23,8 @@ pub(super) struct GraphDoc {
     /// Its layers need the outputs again (new layer, new texture set).
     push: bool,
     maps_seen: u64,
+    /// A preview shader's graph (shading nodes), not a texture graph.
+    pub shading: bool,
 }
 
 /// The floating add-node menu: where it opened (canvas units and screen)
@@ -184,7 +186,8 @@ impl GraphStore {
         let id = id.unwrap_or(self.next_id);
         self.next_id = self.next_id.max(id + 1);
         let rt = Runtime::new(&rs.device, &rs.queue);
-        self.docs.push(GraphDoc { id, graph, rt, dirty: true, push: true, maps_seen: u64::MAX, });
+        let shading = graph::shading::is_shading(&graph, &self.lib);
+        self.docs.push(GraphDoc { id, graph, rt, dirty: true, push: true, maps_seen: u64::MAX, shading });
         id
     }
 
@@ -305,7 +308,7 @@ pub(super) fn unique_stem(lib: &Library, base: &str) -> String {
 }
 
 /// Draws the add-node menu if open; returns the node definition picked.
-fn add_menu(ui: &egui::Ui, lib: &Library, e: &mut GraphEditor) -> Option<String> {
+fn add_menu(ui: &egui::Ui, lib: &Library, e: &mut GraphEditor, shading: bool) -> Option<String> {
     let menu = e.menu.as_mut()?;
     let mut picked = None;
     let mut close = false;
@@ -324,6 +327,7 @@ fn add_menu(ui: &egui::Ui, lib: &Library, e: &mut GraphEditor) -> Option<String>
                     let defs: Vec<_> = ids
                         .iter()
                         .filter_map(|id| lib.find(id))
+                        .filter(|d| d.shading == shading)
                         .filter(|d| q.is_empty() || d.name.to_lowercase().contains(&q) || d.category.to_lowercase().contains(&q))
                         .collect();
                     if defs.is_empty() {
@@ -388,8 +392,11 @@ const HEADER: f32 = 22.0;
 const ROW: f32 = 18.0;
 const PREVIEW: f32 = 126.0;
 
-fn node_size(inputs: usize) -> egui::Vec2 {
-    vec2(NODE_W, HEADER + inputs as f32 * ROW + PREVIEW + 12.0)
+/// A node's box: header, an input row each, and a preview picture (shading
+/// nodes make no picture, so they're compact).
+fn node_size(inputs: usize, picture: bool) -> egui::Vec2 {
+    let preview = if picture { PREVIEW + 12.0 } else { 8.0 };
+    vec2(NODE_W, HEADER + inputs as f32 * ROW + preview)
 }
 
 fn category_color(cat: &str) -> Color32 {
@@ -430,6 +437,9 @@ impl PainterApp {
                 continue;
             }
             let d = &mut self.graphs.docs[i];
+            if d.shading {
+                continue;
+            }
             if d.dirty || d.maps_seen != maps_version {
                 let engine = &self.engine;
                 let maps = |t: usize| engine.map_tex(t);
@@ -519,6 +529,7 @@ impl PainterApp {
             }
             ids.extend(l.mask.as_ref().and_then(|m| m.graph));
         }
+        ids.extend(self.preview.graph);
         ids
     }
 
@@ -529,7 +540,7 @@ impl PainterApp {
         }
     }
 
-    fn open_graph(&mut self, id: u64) {
+    pub(super) fn open_graph(&mut self, id: u64) {
         self.workspace = super::Workspace::Designer;
         let e = &mut self.graphs.editor;
         e.start_page = false;
@@ -736,6 +747,15 @@ impl PainterApp {
             if let Some(id) = self.graphs.editor.doc {
                 if let Some(d) = self.graphs.doc_mut(id) {
                     ui.add(egui::TextEdit::singleline(&mut d.graph.name).desired_width(140.0));
+                }
+            }
+            let shading = self.graphs.editor.doc.and_then(|id| self.graphs.doc(id)).is_some_and(|d| d.shading);
+            if shading {
+                ui.separator();
+                ui.label(egui::RichText::new("Preview shader: the 3D view uses it while you texture").color(theme::TEXT_DIM));
+            }
+            if let Some(id) = self.graphs.editor.doc.filter(|_| !shading) {
+                if let Some(d) = self.graphs.doc_mut(id) {
                     ui.label(egui::RichText::new("Size").color(theme::TEXT_DIM));
                     let before = d.graph.res;
                     egui::ComboBox::from_id_salt("graph res").selected_text(format!("{}", d.graph.res)).width(70.0).show_ui(ui, |ui| {
@@ -845,7 +865,7 @@ impl PainterApp {
         let d = self.graphs.docs.iter_mut().find(|d| d.id == doc).expect("doc exists");
         let e = &mut self.graphs.editor;
         e.multi.retain(|id| d.graph.node(*id).is_some());
-        let size_of = |n: &graph::Node| node_size(lib.find(&n.def).map_or(0, |def| def.inputs.len()));
+        let size_of = |n: &graph::Node| lib.find(&n.def).map_or(node_size(0, true), |def| node_size(def.inputs.len(), !def.shading));
 
         // F frames the selection, or everything; a graph just opened is framed.
         let frame_key = over && !typing && ui.input(|i| i.key_pressed(egui::Key::F));
@@ -920,7 +940,8 @@ impl PainterApp {
             let n = &d.graph.nodes[ni];
             let def = lib.find(&n.def);
             let ins = def.map_or(0, |def| def.inputs.len());
-            let r = Rect::from_min_size(to_screen(pos2(n.pos[0], n.pos[1])), node_size(ins) * zoom);
+            let picture = !def.is_some_and(|def| def.shading);
+            let r = Rect::from_min_size(to_screen(pos2(n.pos[0], n.pos[1])), node_size(ins, picture) * zoom);
             let id = n.id;
             let resp = ui.interact(r, ui.scope_id().with(("graph node", doc, id)), Sense::click_and_drag());
             if resp.drag_started_by(egui::PointerButton::Primary) && !e.multi.contains(&id) {
@@ -995,6 +1016,7 @@ impl PainterApp {
                 vec2(PREVIEW, PREVIEW) * zoom,
             );
             match e.thumbs.get(&(doc, id)) {
+                _ if !picture => {}
                 Some((tex, _)) if error.is_none() => {
                     painter.image(*tex, img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
@@ -1100,7 +1122,7 @@ impl PainterApp {
                 e.search.clear();
             }
         }
-        if let Some(def) = add_menu(ui, lib, e) {
+        if let Some(def) = add_menu(ui, lib, e, d.shading) {
             let menu = e.menu.take().expect("menu was open");
             let id = d.graph.add(&def, [menu.at.x, menu.at.y]);
             // Dropped from a link: wire it to the new node's first input.

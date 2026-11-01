@@ -419,6 +419,7 @@ impl PainterApp {
             EnvSource::File(path) => json!({"file": path.display().to_string()}),
         };
         let view = json!({
+            "preview_shader": self.preview.graph,
             "environment": env,
             "exposure": v.exposure, "env_rotation": v.env_rotation, "env_intensity": v.env_intensity,
             "background": format!("{:?}", v.background), "bg_blur": v.bg_blur, "bg_intensity": v.bg_intensity,
@@ -661,6 +662,7 @@ impl PainterApp {
         vs.height_strength = f(v, "height_strength", d.height_strength);
         vs.show_wire = b(v, "show_wire", d.show_wire);
         vs.use_baked_normal = b(v, "use_baked_normal", d.use_baked_normal);
+        self.preview.graph = v["preview_shader"].as_u64().filter(|id| self.graphs.doc(*id).is_some_and(|d| d.shading));
         let k = &v["key_light"];
         // Projects saved before the key light existed open as they looked.
         vs.key = if k.is_null() {

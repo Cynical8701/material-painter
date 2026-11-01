@@ -481,8 +481,9 @@ fn graph_nodes_render() {
         let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
         if s == 1 { -v } else { v }
     };
-    let mut sheet = image::RgbaImage::new(128 * 6, 128 * lib.defs.len().div_ceil(6) as u32);
-    for (k, def) in lib.defs.iter().enumerate() {
+    let texture_defs: Vec<_> = lib.defs.iter().filter(|d| !d.shading).collect();
+    let mut sheet = image::RgbaImage::new(128 * 6, 128 * texture_defs.len().div_ceil(6) as u32);
+    for (k, def) in texture_defs.into_iter().enumerate() {
         let mut g = Graph::new(&def.name);
         g.res = 128;
         let noise = g.add("noise", [0.0; 2]);
@@ -680,6 +681,15 @@ fn ui_screenshots() {
         harness.run_steps(6);
         harness.render().expect("renders").save(dir.join(format!("{name}.png"))).unwrap();
     }
+    // A preview shader: Toon on the 3D view, and its graph in the Material Designer.
+    harness.state_mut().set_workspace(Workspace::Paint);
+    let toon = harness.state_mut().test_preview_preset(0);
+    harness.run_steps(6);
+    assert_eq!(harness.state_mut().test_preview_error(), None, "the Toon preview shader compiles in the app");
+    harness.render().expect("renders").save(dir.join("preview_shader.png")).unwrap();
+    harness.state_mut().test_open_graph(toon);
+    harness.run_steps(8);
+    harness.render().expect("renders").save(dir.join("preview_shader_graph.png")).unwrap();
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer
@@ -748,4 +758,64 @@ fn mask_filters_apply() {
     stack(&mut engine, vec![off]);
     assert!(red(&mut engine) > 0.95, "a switched-off mask layer does nothing");
     println!("  mask layers: clouds over black covers {clouds:.2}");
+}
+
+/// Every built-in shading node compiles into a preview shader on the GPU
+/// (one small graph each), and every preset renders: images in
+/// `target/bake_test/shading/`.
+#[test]
+#[ignore]
+fn preview_shaders_compile_and_render() {
+    use crate::graph::{Graph, Library, shading};
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 1024;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &BakeSettings::default(), res);
+    engine.set_maps(maps, report);
+    let smart = presets::SMART_MATERIALS.iter().find(|s| s.name == "Painted Steel Worn").expect("smart material");
+    crate::app::add_smart_material(&mut engine, &mut crate::undo::UndoStack::default(), smart, 0, None);
+    engine.composite();
+    let lib = Library::load(None);
+    let mut views = ViewRenderer::new(&rs);
+
+    // Each node alone, its output into the Shader Output.
+    let mut failures = Vec::new();
+    for def in lib.defs.iter().filter(|d| d.shading && d.id != shading::OUTPUT) {
+        let mut g = Graph::new(&def.name);
+        let n = g.add(&def.id, [0.0, 0.0]);
+        let o = g.add(shading::OUTPUT, [200.0, 0.0]);
+        g.connect(n, o, "color");
+        let compiled = shading::compile(&g, &lib).unwrap_or_else(|e| panic!("{}: {e}", def.name));
+        if let Err(e) = views.set_custom_shader(&rs.device, Some(&compiled.code)) {
+            failures.push(format!("{}: {e}", def.name));
+        }
+    }
+    assert!(failures.is_empty(), "shading nodes that don't compile:\n{}", failures.join("\n"));
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/shading");
+    std::fs::create_dir_all(&dir).unwrap();
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let cam = OrbitCam { dist: 3.2, yaw: 0.5, pitch: 0.3, ..Default::default() };
+    let settings = ViewSettings::default();
+    let mut shots: Vec<(String, Option<Graph>)> = vec![("Default".into(), None)];
+    shots.extend(shading::presets().into_iter().map(|g| (g.name.clone(), Some(g))));
+    for (name, graph) in &shots {
+        match graph {
+            Some(g) => {
+                let compiled = shading::compile(g, &lib).unwrap();
+                views.set_custom_shader(&rs.device, Some(&compiled.code)).unwrap_or_else(|e| panic!("{name}: {e}"));
+                views.set_custom_params(&rs.queue, &shading::param_values(&compiled, g, &lib));
+            }
+            None => views.set_custom_shader(&rs.device, None).unwrap(),
+        }
+        views.render_3d(&rs, [640, 640], &engine, &env, &gpu_mesh, &cam, &settings, None);
+        let img = views.view3d.image();
+        let bytes = read_texture(&rs.device, &rs.queue, img);
+        let file = dir.join(format!("{}.png", name.replace(' ', "_").replace('+', "and")));
+        image::save_buffer(&file, &bytes, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+        println!("  {name} -> {}", file.display());
+    }
 }

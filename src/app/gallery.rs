@@ -49,7 +49,8 @@ impl PainterApp {
         let gal = &mut self.graphs.gallery;
         let rebuild = gal.graph.is_none() || gal.stamp != stamp;
         if rebuild {
-            let mut defs = lib.defs.clone();
+            // Shading nodes shade the 3D view; they make no texture to show.
+            let mut defs: Vec<_> = lib.defs.iter().filter(|d| !d.shading).cloned().collect();
             for (stem, _, src) in super::shader_ui::TEMPLATES {
                 if let Ok(d) = graph::def::parse(&format!("template/{stem}"), src) {
                     defs.push(d);

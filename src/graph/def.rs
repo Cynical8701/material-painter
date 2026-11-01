@@ -20,6 +20,13 @@
 //!
 //! In the body, inputs read as `in_a(uv)` (vec4 for color, f32 for gray),
 //! parameters as `params.opacity`, and `res()` is the output size in texels.
+//!
+//! A `// @shading` line makes a *shading* node instead: a step of a preview
+//! shader (see `graph::shading`), evaluated per pixel of the 3D view rather
+//! than rendered to a texture. Its body is `fn node(c: Shade) -> vec4<f32>`;
+//! `c` holds the painted surface, the baked maps, the normal, view and light
+//! directions (see `Shade` in view.wgsl); inputs read as `in_a(c)` and
+//! `has_a()` tells whether input `a` is connected.
 
 /// Value kinds of inputs and outputs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +88,8 @@ pub struct NodeDef {
     pub body: String,
     /// Full source, for change detection and the code editor.
     pub source: String,
+    /// A step of a preview shader rather than a texture node (`@shading`).
+    pub shading: bool,
 }
 
 pub const MAX_INPUTS: usize = 8;
@@ -200,6 +209,7 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
         params: Vec::new(),
         body: String::new(),
         source: source.to_string(),
+        shading: false,
     };
     let mut body_start = 0;
     for (n, line) in source.lines().enumerate() {
@@ -223,6 +233,7 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
             "output" => def.output = kind(value).map_err(at)?,
             "input" => def.inputs.push(input(value).map_err(at)?),
             "param" => def.params.push(param(value).map_err(at)?),
+            "shading" => def.shading = true,
             k => return Err(at(format!("unknown tag '@{k}'"))),
         }
     }
@@ -243,7 +254,14 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
         return Err(format!("'{}' is declared twice", w[0]));
     }
     if !def.body.contains("fn node(") {
-        return Err("the node needs a 'fn node(uv: vec2<f32>) -> vec4<f32>'".into());
+        return Err(if def.shading {
+            "the node needs a 'fn node(c: Shade) -> vec4<f32>'".into()
+        } else {
+            "the node needs a 'fn node(uv: vec2<f32>) -> vec4<f32>'".into()
+        });
+    }
+    if def.shading && images > 0 {
+        return Err("shading nodes read the surface from `c` and can't take image or mesh map parameters".into());
     }
     Ok(def)
 }

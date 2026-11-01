@@ -309,6 +309,12 @@ impl PainterApp {
                 return;
             }
         };
+        // A shading node makes no texture: it shows in the 3D view as part of
+        // a preview shader (Preview panel → Shader).
+        if def.shading {
+            sm.error = Some("This is a shading node (@shading): use it in a preview shader graph to see it in the 3D view.".into());
+            return;
+        }
         // Inputs get a built-in pattern, so filters have something to work on.
         let src_id = PREVIEW_INPUTS[sm.input_src.min(PREVIEW_INPUTS.len() - 1)].0;
         let src_def = self.graphs.lib.find(src_id).cloned().expect("built-in preview input");
@@ -391,7 +397,7 @@ impl PainterApp {
             heading(ui, "Learn from the built-in nodes", "They are written the same way. Open one to read it, then make an editable copy.");
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-                for d in lib.defs.iter().filter(|d| !d.id.starts_with("user/")) {
+                for d in lib.defs.iter().filter(|d| !d.id.starts_with("user/") && !d.shading) {
                     if card(ui, self.gallery_thumb(&node_key(&d.id)), &d.name, &d.category, 112.0).on_hover_text(&d.description).clicked() {
                         open = Some(d.id.clone());
                     }

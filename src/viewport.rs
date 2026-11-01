@@ -405,7 +405,14 @@ impl ViewTarget {
     }
 }
 
+/// Parameter slots (vec4 each) of a custom preview shader.
+pub const CUSTOM_PARAMS: usize = 128;
+
 pub struct ViewRenderer {
+    layout: wgpu::PipelineLayout,
+    /// The mesh drawn with a custom preview shader (a compiled shading graph).
+    custom_mesh: Option<wgpu::RenderPipeline>,
+    custom_params: wgpu::Buffer,
     post: PostFx,
     env_sampler: wgpu::Sampler,
     sky: wgpu::RenderPipeline,
@@ -467,6 +474,7 @@ impl ViewRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                gpu::uniform_entry(18, false),
             ],
         });
         let layout = gpu::layout(device, &bgl);
@@ -599,7 +607,16 @@ impl ViewRenderer {
                 mapped_at_creation: false,
             })
         });
+        let custom_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("preview shader params"),
+            size: (CUSTOM_PARAMS * 16) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         ViewRenderer {
+            layout,
+            custom_mesh: None,
+            custom_params,
             post: PostFx::new(rs, COLOR_FORMAT),
             env_sampler: env_sampler(device),
             sky,
@@ -621,6 +638,67 @@ impl ViewRenderer {
             view3d: ViewTarget::new(rs, true),
             view2d: ViewTarget::new(rs, false),
         }
+    }
+
+    /// Uses `code` (a generated `custom_shade(c: Shade) -> vec3<f32>`) to
+    /// shade the mesh in Material mode, or the built-in look when `None`.
+    /// On a compile error the previous shader stays and the error is returned.
+    pub fn set_custom_shader(&mut self, device: &wgpu::Device, code: Option<&str>) -> Result<(), String> {
+        let Some(code) = code else {
+            self.custom_mesh = None;
+            return Ok(());
+        };
+        let src = format!(
+            "{}\n{code}\n@fragment\nfn fs_mesh_custom(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{\n    let c = mesh_shade_inputs(in, front);\n    return vec4<f32>(max(custom_shade(c), vec3<f32>(0.0)), 1.0);\n}}\n",
+            include_str!("shaders/view.wgsl")
+        );
+        let (pipeline, err) = crate::graph::runtime::validation_scope(device, || {
+            let module = gpu::shader(device, "preview shader", &src);
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("mesh (preview shader)"),
+                layout: Some(&self.layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_mesh"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(gpu::vertex_layout())],
+                },
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_mesh_custom"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        self.custom_mesh = Some(pipeline);
+        Ok(())
+    }
+
+    /// The custom preview shader's parameter values (see `CUSTOM_PARAMS`).
+    pub fn set_custom_params(&self, queue: &wgpu::Queue, values: &[[f32; 4]]) {
+        let n = values.len().min(CUSTOM_PARAMS);
+        if n > 0 {
+            queue.write_buffer(&self.custom_params, 0, bytemuck::cast_slice(&values[..n]));
+        }
+    }
+
+    pub fn has_custom_shader(&self) -> bool {
+        self.custom_mesh.is_some()
     }
 
     fn bind_group(&self, device: &wgpu::Device, engine: &Engine, env: &Environment, globals: &wgpu::Buffer) -> wgpu::BindGroup {
@@ -649,6 +727,7 @@ impl ViewRenderer {
                 wgpu::BindGroupEntry { binding: 15, resource: env.sh.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 16, resource: v(&self.shadow_map.view) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
+                wgpu::BindGroupEntry { binding: 18, resource: self.custom_params.as_entire_binding() },
             ],
         })
     }
@@ -774,7 +853,7 @@ impl ViewRenderer {
                 pass.set_pipeline(&self.sky);
                 pass.draw(0..3, 0..1);
             }
-            pass.set_pipeline(&self.mesh);
+            pass.set_pipeline(self.custom_mesh.as_ref().filter(|_| settings.mode == ViewMode::Material).unwrap_or(&self.mesh));
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);

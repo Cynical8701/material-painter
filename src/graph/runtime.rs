@@ -69,7 +69,7 @@ fn hash_of(v: impl Hash) -> u64 {
 }
 
 /// Runs `f` and returns the first validation error it caused, as text.
-fn validation_scope<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> (T, Option<String>) {
+pub(crate) fn validation_scope<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> (T, Option<String>) {
     use std::future::Future;
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let value = f();
