@@ -669,6 +669,17 @@ fn ui_screenshots() {
     assert_eq!(before, after, "the smart material round-trips");
     harness.run_steps(10);
     harness.render().expect("renders").save(dir.join("smart_roundtrip.png")).unwrap();
+    // The path tool: a stitch path in each view, previewed, then applied.
+    for (name, in_3d) in [("path_3d", true), ("path_2d", false)] {
+        harness.state_mut().test_path_setup(in_3d);
+        harness.run_steps(4);
+        harness.render().expect("renders").save(dir.join(format!("{name}_preview.png"))).unwrap();
+        let status = harness.state_mut().test_path_apply();
+        println!("  {name}: {status}");
+        assert!(status.starts_with("Painted"), "{status}");
+        harness.run_steps(6);
+        harness.render().expect("renders").save(dir.join(format!("{name}.png"))).unwrap();
+    }
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer

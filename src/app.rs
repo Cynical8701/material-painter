@@ -33,6 +33,7 @@ mod gallery;
 mod graph_ui;
 mod shader_ui;
 mod library_ui;
+mod path_tool;
 mod smart_io;
 mod welcome;
 mod mcp_tools;
@@ -58,6 +59,8 @@ enum Tool {
     Picker,
     /// Fills whole triangles, quads, mesh parts or UV islands.
     PolyFill,
+    /// Lays the brush along an editable path (stitches, seams, panel lines).
+    Path,
 }
 
 /// Bake cage preview (see `crate::cage`): probe results and what's drawn.
@@ -434,6 +437,7 @@ pub struct PainterApp {
     welcome_tex: Option<egui::TextureHandle>,
     library: library_ui::LibraryUi,
     user_smarts: Vec<smart_io::UserSmart>,
+    path: path_tool::PathTool,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
@@ -954,6 +958,40 @@ impl PainterApp {
         [before, summary(&self.engine, self.selected)]
     }
 
+    /// Path tool on a new paint layer with the Stitch tip: a path across the
+    /// ball in the 3D view or a curve on the UV map (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_path_setup(&mut self, kind_3d: bool) {
+        let at = self.engine.layers.len();
+        self.selected = self.engine.add_paint_layer(at, None, Some("Stitches".into()), &mut self.undo);
+        self.target = StrokeTarget::Content;
+        self.tool = Tool::Path;
+        self.brush.tip = crate::brushes::BRUSH_ALPHAS.iter().position(|b| b.name == "Stitch");
+        self.brush.size = 34.0;
+        self.brush.spacing = 1.25;
+        self.brush.angle = 0.0;
+        self.brush.mat.enabled = [true, true, false, true];
+        self.brush.mat.color = [0.95, 0.85, 0.3];
+        self.brush.mat.height = 1.0;
+        self.path.clear();
+        let (kind, size) = if kind_3d { (ViewKind::V3d, self.views.view3d.size) } else { (ViewKind::V2d, self.views.view2d.size) };
+        let (w, h) = (size[0] as f32, size[1] as f32);
+        let marks: &[(f32, f32)] = if kind_3d { &[(0.25, 0.42), (0.4, 0.34), (0.6, 0.34), (0.75, 0.42)] } else { &[(0.2, 0.7), (0.35, 0.55), (0.55, 0.62), (0.75, 0.5)] };
+        self.path.view = Some(kind);
+        for &(x, y) in marks {
+            if let Some(p) = self.path_from_screen(kind, Vec2::new(x * w, y * h)) {
+                self.path.points.push(p);
+            }
+        }
+    }
+
+    /// Applies the path (offscreen UI tests); returns the status line.
+    #[cfg(test)]
+    pub(crate) fn test_path_apply(&mut self) -> String {
+        self.apply_path();
+        self.status.clone()
+    }
+
     /// Closes the library and adds the first downloaded material as a layer
     /// (offscreen UI tests).
     #[cfg(test)]
@@ -1086,6 +1124,7 @@ impl PainterApp {
             welcome_tex: None,
             library: Default::default(),
             user_smarts: smart_io::list(&cc.egui_ctx),
+            path: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
@@ -1697,6 +1736,9 @@ impl PainterApp {
             if i.key_pressed(Key::Num3) || i.key_pressed(Key::P) {
                 self.tool = Tool::PolyFill;
             }
+            if i.key_pressed(Key::Num4) || i.key_pressed(Key::L) {
+                self.tool = Tool::Path;
+            }
             if i.key_pressed(Key::W) {
                 self.view.show_wire_3d = !self.view.show_wire_3d;
             }
@@ -2005,12 +2047,15 @@ impl PainterApp {
                         (Tool::Picker, _) => "Pick material (click the surface)",
                         (Tool::PolyFill, StrokeTarget::Mask) => "Polygon fill (mask)",
                         (Tool::PolyFill, _) => "Polygon fill",
+                        (Tool::Path, StrokeTarget::Mask) => "Path (mask)",
+                        (Tool::Path, _) => "Path",
                     };
                     let icon = match self.tool {
                         Tool::Paint => icons::PAINT_BRUSH,
                         Tool::Eraser => icons::ERASER,
                         Tool::Picker => icons::EYEDROPPER,
                         Tool::PolyFill => icons::POLYGON,
+                        Tool::Path => icons::PATH,
                     };
                     ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(Color32::WHITE));
                     ui.separator();
@@ -2040,6 +2085,8 @@ impl PainterApp {
                             self.brush.opacity = p / 100.0;
                         }
                         ui.label(egui::RichText::new("Click or drag across faces, Shift+drag a box. Uses the brush material.").small().color(theme::TEXT_DIM));
+                    } else if self.tool == Tool::Path {
+                        self.path_toolbar(ui);
                     } else {
                     let s = |ui: &mut egui::Ui, label: &str, v: &mut f32, r: std::ops::RangeInclusive<f32>, pct: bool| {
                         ui.label(egui::RichText::new(label).color(theme::TEXT_DIM));
@@ -2059,7 +2106,7 @@ impl PainterApp {
                     s(ui, "Flow", &mut self.brush.flow, 0.01..=1.0, true);
                     s(ui, "Stroke opacity", &mut self.brush.opacity, 0.01..=1.0, true);
                     s(ui, "Hardness", &mut self.brush.hardness, 0.0..=0.99, true);
-                    s(ui, "Spacing", &mut self.brush.spacing, 0.02..=1.0, true);
+                    s(ui, "Spacing", &mut self.brush.spacing, 0.02..=3.0, true);
                     ui.label(egui::RichText::new("Symmetry").color(theme::TEXT_DIM));
                     egui::ComboBox::from_id_salt("symmetry")
                         .width(52.0)
@@ -2087,6 +2134,7 @@ impl PainterApp {
             (Tool::Paint, icons::PAINT_BRUSH, "Paint (1)"),
             (Tool::Eraser, icons::ERASER, "Eraser (2)"),
             (Tool::PolyFill, icons::POLYGON, "Polygon fill: triangles, quads, mesh parts or UV islands (3 / P)"),
+            (Tool::Path, icons::PATH, "Path: place points, then paint along them; stitches, seams, panel lines (4 / L)"),
             (Tool::Picker, icons::EYEDROPPER, "Pick material from the surface (I)"),
         ] {
             if theme::icon_button(ui, icon, self.tool == tool, 34.0).on_hover_text(tip).clicked() {
@@ -4344,6 +4392,14 @@ impl PainterApp {
             }
         }
 
+        // The path tool places and drags points instead of painting.
+        if self.tool == Tool::Path {
+            let cursor = hover.filter(|p| rect.contains(*p) && !mods.alt).map(local);
+            let secondary = ui.input(|i| i.pointer.secondary_clicked()) && !mods.any();
+            self.path_input(kind, cursor, pressed && !mods.alt, down && !mods.alt, secondary, resp.hovered());
+            return;
+        }
+
         // Polygon fill picks faces instead of laying down stamps.
         if self.tool == Tool::PolyFill {
             if let Some(mut b) = self.poly.box_drag.filter(|b| b.view == kind) {
@@ -4469,6 +4525,7 @@ impl PainterApp {
             ViewKind::V2d => self.views.view2d.egui_id,
         };
         painter.image(id, rect, uv, Color32::WHITE);
+        self.draw_path(&painter, kind, rect);
         if let Some(b) = self.poly.box_drag.filter(|b| b.view == kind) {
             let color = if b.erase { Color32::from_rgb(255, 90, 80) } else { Color32::from_rgb(80, 160, 255) };
             let r = Rect::from_two_pos(b.start, b.end);
@@ -4673,6 +4730,7 @@ impl eframe::App for PainterApp {
         {
             self.shelf_previews = None;
         }
+        self.path_keys(&ctx);
         self.shortcuts(&ctx);
         self.process_actions(&ctx);
         self.process_mcp(&ctx);

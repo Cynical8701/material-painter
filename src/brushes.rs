@@ -60,6 +60,9 @@ pub const BRUSH_ALPHAS: &[BrushAlpha] = &[
     tip("Slotted Screw", slotted_screw),
     tip("Vent Slot", vent_slot),
     tip("Stitch", stitch),
+    tip("Double Stitch", double_stitch),
+    tip("Cross Stitch", cross_stitch),
+    tip("Slanted Stitch", slanted_stitch),
     tip("Ring", ring),
     tip("Washer", washer),
 ];
@@ -521,6 +524,38 @@ fn stitch(size: u32) -> Vec<f32> {
         let ply = 0.82 + 0.18 * (0.5 + 0.5 * ((x * 1.0 + y * 1.6) * TAU * 6.0).cos());
         dome * ply
     })
+}
+
+/// A raised thread from `a` to `b`: a rounded profile with twisted plies,
+/// like `stitch`.
+fn thread(x: f32, y: f32, a: (f32, f32), b: (f32, f32), r: f32, px: f32) -> f32 {
+    let (d, _) = seg_dist(x, y, a.0, a.1, b.0, b.1);
+    let dome = (1.0 - (d / r).min(1.0).powi(2)).sqrt() * aa(r - d, px);
+    let ply = 0.82 + 0.18 * (0.5 + 0.5 * ((x * 1.0 + y * 1.6) * TAU * 6.0).cos());
+    dome * ply
+}
+
+/// Two parallel stitches: a double row of thread along the path.
+fn double_stitch(size: u32) -> Vec<f32> {
+    pixels(size, |x, y, px| {
+        let a = thread(x, y, (-0.38, -0.24), (0.38, -0.24), 0.1, px);
+        let b = thread(x, y, (-0.38, 0.24), (0.38, 0.24), 0.1, px);
+        a.max(b)
+    })
+}
+
+/// An X of two threads, the upper one over the lower.
+fn cross_stitch(size: u32) -> Vec<f32> {
+    pixels(size, |x, y, px| {
+        let under = thread(x, y, (-0.36, 0.36), (0.36, -0.36), 0.1, px) * 0.85;
+        let over = thread(x, y, (-0.36, -0.36), (0.36, 0.36), 0.1, px);
+        under.max(over)
+    })
+}
+
+/// One diagonal thread: in a row along a path it makes a whip stitch.
+fn slanted_stitch(size: u32) -> Vec<f32> {
+    pixels(size, |x, y, px| thread(x, y, (-0.22, -0.4), (0.22, 0.4), 0.12, px))
 }
 
 fn ring(size: u32) -> Vec<f32> {

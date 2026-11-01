@@ -47,4 +47,6 @@ pub const DOWNLOAD_SIMPLE: &str = "\u{E20C}";
 pub const GLOBE: &str = "\u{E288}";
 pub const SHARE_NETWORK: &str = "\u{E408}";
 pub const USERS_THREE: &str = "\u{E68E}";
+pub const CHECK: &str = "\u{E182}";
+pub const PATH: &str = "\u{E39C}";
 pub const X: &str = "\u{E4F6}";
