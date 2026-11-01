@@ -1428,6 +1428,21 @@ impl Engine {
         }
     }
 
+    /// The baked maps on screen and their report (`None` before the first bake).
+    pub fn current_maps(&self) -> Option<([Tex; MAP_TEXTURES], Arc<BakeReport>)> {
+        let report = self.bake_report.clone().filter(|_| self.has_bake)?;
+        Some((self.maps.clone(), report))
+    }
+
+    /// Back to the neutral maps of a document that was never baked.
+    pub fn clear_maps(&mut self) {
+        self.maps = Self::default_maps(&self.device, &self.queue);
+        self.bake_report = None;
+        self.has_bake = false;
+        self.maps_dirty = true;
+        self.mark_dirty();
+    }
+
     /// Adopts freshly baked maps. Painted fixes and levels are kept, so artists
     /// can re-bake with new settings without losing their corrections.
     pub fn set_maps(&mut self, maps: [Tex; MAP_TEXTURES], report: Arc<BakeReport>) {

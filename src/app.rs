@@ -1,7 +1,7 @@
 //! Application shell: Substance-Painter-style layout, input handling and
 //! the per-frame GPU flow (stamps -> composite -> viewport render).
 
-use crate::bake::{self, BakeRun, BakeSettings, CustomKind, GpuBaker, IdSource, PreparedScene, Quality};
+use crate::bake::{self, BakeRun, BakeSettings, GpuBaker, IdSource, PreparedScene, Quality};
 use crate::bake_cache;
 use crate::bvh::Bvh;
 use crate::cage::{CageProbe, CageStats, ProbeKey};
@@ -34,6 +34,7 @@ mod graph_ui;
 mod shader_ui;
 mod library_ui;
 mod path_tool;
+mod bake_live;
 mod preview_shader;
 mod smart_io;
 mod welcome;
@@ -439,6 +440,8 @@ pub struct PainterApp {
     library: library_ui::LibraryUi,
     user_smarts: Vec<smart_io::UserSmart>,
     path: path_tool::PathTool,
+    bake_preview: bake_live::LivePreview,
+    custom_ui: bake_live::CustomUi,
     preview: preview_shader::PreviewShader,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
@@ -768,71 +771,6 @@ fn projection_combo(ui: &mut egui::Ui, id: &str, p: &mut BrushProjection) {
         .on_hover_text(p.tip());
 }
 
-/// One custom bake map slot in the bake window: its kind and settings.
-fn custom_map_ui(ui: &mut egui::Ui, k: usize, slot: &mut Option<bake::CustomMap>) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("Custom {}", k + 1)).strong());
-        let current = slot.map_or("None", |c| c.kind.name());
-        egui::ComboBox::from_id_salt(("custom map kind", k)).selected_text(current).show_ui(ui, |ui| {
-            if ui.selectable_label(slot.is_none(), "None").clicked() {
-                *slot = None;
-            }
-            for kind in CustomKind::ALL {
-                let on = slot.is_some_and(|c| c.kind == kind);
-                if ui.selectable_label(on, kind.name()).on_hover_text(kind.help()).clicked() && !on {
-                    *slot = Some(kind.default_map());
-                }
-            }
-        });
-    });
-    let Some(c) = slot else { return };
-    ui.indent(("custom map", k), |ui| {
-        ui.label(egui::RichText::new(c.kind.help()).small().color(theme::TEXT_DIM));
-        if c.kind.has_direction() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Comes from").small().color(theme::TEXT_DIM));
-                for (name, az, el) in [("Above", None, 90.0), ("Front", Some(0.0), 0.0), ("Back", Some(180.0), 0.0), ("Right", Some(90.0), 0.0), ("Left", Some(270.0), 0.0), ("Below", None, -90.0)] {
-                    if ui.small_button(name).clicked() {
-                        if let Some(az) = az {
-                            c.azimuth = az;
-                        }
-                        c.elevation = el;
-                    }
-                }
-            });
-            slider(ui, "Compass (°)", &mut c.azimuth, 0.0..=360.0);
-            slider(ui, "Elevation (°)", &mut c.elevation, -90.0..=90.0);
-        }
-        match c.kind {
-            CustomKind::Flow => {
-                slider(ui, "Flow length", &mut c.distance, 0.05..=2.0);
-                slider(ui, "Spread (°)", &mut c.spread, 0.0..=60.0);
-                slider(ui, "Strength", &mut c.strength, 0.5..=12.0);
-                slider(ui, "Wander (°)", &mut c.wander, 0.0..=60.0);
-            }
-            CustomKind::Exposure => {
-                slider(ui, "Spread (°)", &mut c.spread, 0.0..=85.0);
-                slider(ui, "Blocker reach", &mut c.distance, 0.05..=4.0);
-            }
-            CustomKind::Deposit => {
-                slider(ui, "Spread (°)", &mut c.spread, 0.0..=85.0);
-                slider(ui, "Shelter reach", &mut c.distance, 0.02..=2.0);
-            }
-            CustomKind::Contact => {
-                slider(ui, "Reach", &mut c.distance, 0.005..=0.5);
-            }
-            CustomKind::Point => {
-                labeled(ui, "Point", |ui| {
-                    for (axis, v) in ["X", "Y", "Z"].iter().zip(c.point.iter_mut()) {
-                        ui.add(egui::DragValue::new(v).speed(0.01).range(-2.0..=2.0).prefix(format!("{axis} ")));
-                    }
-                });
-                slider(ui, "Radius", &mut c.distance, 0.05..=4.0);
-            }
-        }
-    });
-}
-
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) -> bool {
     labeled(ui, label, |ui| ui.add(egui::Slider::new(v, range).max_decimals(2)).changed())
 }
@@ -1040,8 +978,15 @@ impl PainterApp {
     #[cfg(test)]
     pub(crate) fn test_show_custom(&mut self) {
         self.show_bake = true;
-        self.bake_settings.custom[0] = Some(CustomKind::Flow.default_map());
-        self.bake_settings.custom[1] = Some(CustomKind::Deposit.default_map());
+        self.add_custom_map(0, bake::CustomKind::Flow);
+        self.add_custom_map(1, bake::CustomKind::Deposit);
+        self.select_custom(0);
+    }
+
+    /// Opens or closes the bake window (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_set_bake_window(&mut self, open: bool) {
+        self.show_bake = open;
     }
 
     /// Shows smart materials on the shelf, the bake window, and selects the
@@ -1236,6 +1181,8 @@ impl PainterApp {
             library: Default::default(),
             user_smarts: smart_io::list(&cc.egui_ctx),
             path: Default::default(),
+            bake_preview: Default::default(),
+            custom_ui: Default::default(),
             preview: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
@@ -1283,6 +1230,7 @@ impl PainterApp {
     // ------------------------------------------------------------------ jobs
 
     fn start_bake(&mut self, ctx: &egui::Context) {
+        self.preview_full_bake_started();
         let mesh = self.mesh.clone();
         let settings = self.bake_settings.clone();
         let res = self.engine.res.min(bake::MAX_BAKE_RES);
@@ -1322,7 +1270,7 @@ impl PainterApp {
                 }
                 Ok(Ok(Prepared::Scene(scene, key))) => {
                     let (baker, rs, mesh, settings, res) = (&self.baker, &self.rs, &self.gpu_mesh, &self.bake_settings, self.engine.res);
-                    match out_of_memory_guard(&rs.device, || baker.start(&rs.device, &rs.queue, mesh, scene, settings, res)) {
+                    match out_of_memory_guard(&rs.device, || baker.start(&rs.device, &rs.queue, mesh, &scene, settings, res)) {
                         Ok(run) => {
                             self.bake_job = Some(BakeJob::Running(run, key));
                             ctx.request_repaint();
@@ -2923,7 +2871,17 @@ impl PainterApp {
 
     fn bake_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_bake;
-        egui::Window::new("Bake Mesh Maps").open(&mut open).collapsible(false).resizable(false).default_width(470.0).show(ctx, |ui| {
+        // Against the right edge, so the 3D view (and the gizmos in it) stays visible.
+        let screen = ctx.content_rect();
+        egui::Window::new("Bake Mesh Maps")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(470.0)
+            .max_width(740.0)
+            .default_pos(egui::pos2((screen.max.x - 760.0).max(screen.min.x), screen.min.y + 60.0))
+            .show(ctx, |ui| {
+            self.preview_bar(ui);
             let s = &mut self.bake_settings;
             section(ui, "Source");
             ui.horizontal(|ui| {
@@ -3031,18 +2989,8 @@ impl PainterApp {
                 );
             });
 
-            section(ui, "Custom maps");
-            ui.label(
-                egui::RichText::new(
-                    "Maps of what happens around the model: fluid running off it, wind and sand, drifts, parts touching. \
-                     Masks read them through the Custom Bake Map preset (or the Custom inputs); graphs through Mesh Map nodes.",
-                )
-                .small()
-                .color(theme::TEXT_DIM),
-            );
-            for k in 0..bake::CUSTOM_SLOTS {
-                custom_map_ui(ui, k, &mut s.custom[k]);
-            }
+            self.custom_maps_section(ui);
+            let s = &mut self.bake_settings;
 
             section(ui, "Quality");
             labeled(ui, "Preset", |ui| {
@@ -4169,7 +4117,8 @@ impl PainterApp {
                 Err(mpsc::TryRecvError::Disconnected) => c.job = None,
             }
         }
-        if !(self.show_bake && c.show) {
+        // A cage only exists for high-poly bakes.
+        if !(self.show_bake && c.show && self.bake_settings.high_poly.is_some()) {
             if self.overlays.is_set(OverlaySlot::Cage) {
                 self.overlays.clear(OverlaySlot::Cage);
                 ctx.request_repaint();
@@ -4594,6 +4543,17 @@ impl PainterApp {
             }
         }
 
+        // The bake window's gizmo (direction arrow, point marker) comes first.
+        if kind == ViewKind::V3d {
+            self.custom_ui.view_rect = Some(rect);
+        }
+        if kind == ViewKind::V3d && !mods.alt {
+            let cursor = hover.filter(|p| rect.contains(*p)).map(local);
+            if self.gizmo_input(ui, cursor, pressed, down) {
+                return;
+            }
+        }
+
         // The path tool places and drags points instead of painting.
         if self.tool == Tool::Path {
             let cursor = hover.filter(|p| rect.contains(*p) && !mods.alt).map(local);
@@ -4728,6 +4688,7 @@ impl PainterApp {
         };
         painter.image(id, rect, uv, Color32::WHITE);
         self.draw_path(&painter, kind, rect);
+        self.draw_gizmo(&painter, kind, rect);
         if let Some(b) = self.poly.box_drag.filter(|b| b.view == kind) {
             let color = if b.erase { Color32::from_rgb(255, 90, 80) } else { Color32::from_rgb(80, 160, 255) };
             let r = Rect::from_two_pos(b.start, b.end);
@@ -4903,6 +4864,7 @@ impl eframe::App for PainterApp {
         let _ = self.rs.device.poll(wgpu::PollType::Poll);
         self.undo.update();
         self.poll_bake(&ctx);
+        self.update_preview(&ctx);
         self.poll_env();
         self.poll_hdri_thumbs(&ctx);
         self.poll_library(&ctx);

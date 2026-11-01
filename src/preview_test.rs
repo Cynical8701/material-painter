@@ -596,6 +596,12 @@ fn graph_presets_render() {
 #[ignore]
 fn ui_screenshots() {
     use crate::app::{PainterApp, Workspace};
+    // A hung frame would otherwise leave the test (and its GPU memory) running.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        eprintln!("ui_screenshots: still running after 10 minutes, giving up");
+        std::process::exit(101);
+    });
     use egui_kittest::kittest::Queryable;
     // The same device request as the app: the adapter's full limits.
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
@@ -1087,4 +1093,85 @@ fn custom_maps_bake() {
         }
     }
     println!("  wrote {}", dir.display());
+}
+
+/// The live bake preview: adding custom maps bakes a preview once (no
+/// restarts while nothing changes), a settings change bakes one more, and
+/// closing the bake window ends it. Frames are capped so a regression fails
+/// instead of hanging.
+#[test]
+#[ignore]
+fn live_bake_preview() {
+    use crate::app::PainterApp;
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1300.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_welcome();
+    // A full bake first (leaving AO out), as when tuning an existing bake.
+    let ctx = harness.ctx.clone();
+    let mut frames = 0;
+    while !harness.state_mut().test_bake_without(&ctx, 1) {
+        harness.run_steps(1);
+        frames += 1;
+        assert!(frames < 2000, "the full bake finishes");
+    }
+    println!("  full bake after {frames} frames");
+    harness.state_mut().test_show_custom();
+    let wait = |harness: &mut egui_kittest::Harness<'_, PainterApp>, what: &str| {
+        for frame in 0..600 {
+            if harness.state().test_preview_shown() {
+                println!("  {what}: preview after {frame} frames, {} starts", harness.state().test_preview_starts());
+                return;
+            }
+            harness.run_steps(1);
+            if frame % 50 == 0 {
+                println!("    frame {frame}: {} starts", harness.state().test_preview_starts());
+            }
+        }
+        panic!("{what}: no preview after 600 frames ({} starts)", harness.state().test_preview_starts());
+    };
+    wait(&mut harness, "custom maps added");
+    let starts = harness.state().test_preview_starts();
+    assert!(starts <= 2, "one preparation and one preview bake ({starts} starts)");
+    harness.run_steps(20);
+    assert_eq!(harness.state().test_preview_starts(), starts, "no restarts while nothing changes");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+    harness.render().expect("renders").save(dir.join("bake_live_preview.png")).unwrap();
+
+    // Dragging the gizmo's handle sideways tips the fluid's direction away
+    // from straight above, and the preview follows.
+    let before = harness.state().test_custom(0).unwrap();
+    let from = harness.state().test_gizmo_handle().expect("the flow gizmo is on screen");
+    let to = from + egui::vec2(160.0, 40.0);
+    let pointer = |harness: &mut egui_kittest::Harness<'_, PainterApp>, event: egui::Event| {
+        harness.input_mut().events.push(event);
+        harness.run_steps(1);
+    };
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    pointer(&mut harness, egui::Event::PointerMoved(from));
+    pointer(&mut harness, button(from, true));
+    for i in 1..=8 {
+        pointer(&mut harness, egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+    }
+    pointer(&mut harness, button(to, false));
+    let after = harness.state().test_custom(0).unwrap();
+    println!("  gizmo drag: elevation {:.1} -> {:.1}, compass {:.1} -> {:.1}", before.elevation, after.elevation, before.azimuth, after.azimuth);
+    assert!(after.elevation < before.elevation - 5.0, "dragging the handle tipped the direction");
+    wait(&mut harness, "direction dragged");
+    harness.render().expect("renders").save(dir.join("bake_live_gizmo.png")).unwrap();
+
+    harness.state_mut().test_set_bake_window(false);
+    harness.run_steps(2);
+    assert!(harness.state().test_preview_ended(), "closing the bake window ends the preview");
 }

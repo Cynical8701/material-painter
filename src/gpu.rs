@@ -2,6 +2,8 @@
 
 use eframe::wgpu;
 
+/// A texture and its views. Clones share the GPU texture.
+#[derive(Clone)]
 pub struct Tex {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,

@@ -75,7 +75,7 @@ impl ShelfPreviews {
             Stage::Preparing(rx) => match rx.try_recv() {
                 Ok(Ok(scene)) => {
                     let settings = BakeSettings { quality: Quality::Draft, ..Default::default() };
-                    let run = self.baker.start(&rs.device, &rs.queue, &self.mesh, scene, &settings, RES);
+                    let run = self.baker.start(&rs.device, &rs.queue, &self.mesh, &scene, &settings, RES);
                     self.stage = Stage::Baking(run);
                     ctx.request_repaint();
                     true

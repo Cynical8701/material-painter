@@ -307,6 +307,33 @@ impl BakeSettings {
         self.baked_maps() & (1 << map) != 0
     }
 
+    /// The same bake at preview quality: one projection ray and a few
+    /// occlusion rays a texel, so it finishes in a fraction of a second.
+    pub fn preview(&self) -> BakeSettings {
+        let mut s = self.clone();
+        s.aa = 1;
+        s.ao_rays = s.ao_rays.min(16);
+        s.thickness_rays = s.thickness_rays.min(8);
+        s.sky_rays = s.sky_rays.min(8);
+        s
+    }
+
+    /// Everything [`prepare`] reads: bakes whose keys match can share one
+    /// prepared scene and only redo the GPU passes.
+    pub fn prepare_key(&self) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{}|{}|{}|{}|{}",
+            self.high_poly,
+            self.cage,
+            self.id_source,
+            self.match_by_name,
+            self.edge_auto,
+            self.edge_max_distance,
+            self.curvature_scale,
+            self.hard_edge_angle,
+        )
+    }
+
     pub fn apply_quality(&mut self, q: Quality) {
         self.quality = q;
         let (aa, ao, th, sky) = match q {
@@ -1531,7 +1558,7 @@ impl GpuBaker {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mesh: &GpuMesh,
-        scene: PreparedScene,
+        scene: &PreparedScene,
         settings: &BakeSettings,
         res: u32,
     ) -> BakeRun {
@@ -2241,7 +2268,7 @@ pub(crate) mod tests {
         let scene = prepare(mesh, settings).expect("bake source");
         let baker = GpuBaker::new(device);
         let ctx = egui::Context::default();
-        let mut run = baker.start(device, queue, gpu_mesh, scene, settings, res);
+        let mut run = baker.start(device, queue, gpu_mesh, &scene, settings, res);
         let maps = loop {
             if let Some(maps) = baker.pump(&mut run, device, queue, &ctx) {
                 break maps;
