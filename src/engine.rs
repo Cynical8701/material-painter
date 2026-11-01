@@ -289,7 +289,7 @@ impl GenKind {
 /// A smart mask: a weighted mix of mesh-map inputs, then levels.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Generator {
-    /// Preset this generator started from.
+    /// Preset this generator started from (see `needs_maps` for what it reads).
     pub kind: GenKind,
     pub weights: [f32; GEN_INPUT_COUNT],
     pub level: f32,
@@ -302,6 +302,31 @@ pub struct Generator {
     pub edge_width: f32,
     pub id_color: [f32; 3],
     pub id_tolerance: f32,
+}
+
+impl Generator {
+    /// The baked maps this generator reads (a bit per `MAPS` index).
+    pub fn needs_maps(&self) -> u32 {
+        // Generator input -> the map it comes from.
+        const FROM: [(usize, usize); 10] = [
+            (gin::EDGE, 5),
+            (gin::CONVEX, 1),
+            (gin::CONCAVE, 1),
+            (gin::OCCLUSION, 0),
+            (gin::CAVITY, 2),
+            (gin::SKY, 4),
+            (gin::THIN, 3),
+            (gin::CREASE, 6),
+            (gin::PART_GRADIENT, 8),
+            (gin::PART_RANDOM, 7),
+        ];
+        FROM.iter().filter(|(i, _)| self.weights[*i].abs() > 1e-4).fold(0, |acc, (_, m)| acc | (1 << m))
+    }
+}
+
+/// Names of the maps in a bit set, for messages.
+pub fn map_names(bits: u32) -> String {
+    MAPS.iter().enumerate().filter(|(i, _)| bits & (1 << i) != 0).map(|(_, m)| m.name).collect::<Vec<_>>().join(", ")
 }
 
 // ---------------------------------------------------------------- mesh maps
@@ -1366,6 +1391,15 @@ impl Engine {
             queue.write_texture(t.copy_info(), d, Default::default(), t.extent());
         }
         maps
+    }
+
+    /// Maps the current bake left out (a bit per `MAPS` index); none before
+    /// the first bake, when nothing is baked yet.
+    pub fn missing_maps(&self) -> u32 {
+        match (&self.bake_report, self.has_bake) {
+            (Some(r), true) => crate::bake::ALL_MAPS & !r.baked,
+            _ => 0,
+        }
     }
 
     /// Adopts freshly baked maps. Painted fixes and levels are kept, so artists

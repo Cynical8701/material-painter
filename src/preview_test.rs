@@ -690,6 +690,16 @@ fn ui_screenshots() {
     harness.state_mut().test_open_graph(toon);
     harness.run_steps(8);
     harness.render().expect("renders").save(dir.join("preview_shader_graph.png")).unwrap();
+    // A bake that leaves out AO and edge distance: shelf badges and mask notes.
+    harness.state_mut().set_workspace(Workspace::Paint);
+    let missing = (1 << 0) | (1 << 5);
+    let start = std::time::Instant::now();
+    while !harness.state_mut().test_bake_without(&ctx, missing) && start.elapsed().as_secs() < 120 {
+        harness.run_steps(1);
+    }
+    harness.state_mut().test_show_missing();
+    harness.run_steps(8);
+    harness.render().expect("renders").save(dir.join("missing_maps.png")).unwrap();
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer

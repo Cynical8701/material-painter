@@ -91,7 +91,19 @@ pub struct BakeSettings {
     /// A cage mesh (the low poly with pushed-out vertices, same topology):
     /// rays start on the cage and travel toward the low poly.
     pub cage: Option<PathBuf>,
+    /// Which maps to bake: a bit per `engine::MAPS` index. Maps left out are
+    /// written neutral and their passes skipped where they can be.
+    pub maps: u32,
 }
+
+/// Every map (a bit per `engine::MAPS` index).
+pub const ALL_MAPS: u32 = (1 << 13) - 1;
+/// The maps a bake can leave out (the rest are cheap and always baked):
+/// ambient occlusion, curvature, cavity, thickness, sky exposure, edge and
+/// crease distance.
+pub const OPTIONAL_MAPS: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+/// Map bits always baked.
+const ALWAYS_MAPS: u32 = ALL_MAPS & !0b111_1111;
 
 impl Default for BakeSettings {
     fn default() -> Self {
@@ -117,6 +129,7 @@ impl Default for BakeSettings {
             hard_edge_angle: 35.0,
             match_by_name: true,
             cage: None,
+            maps: ALL_MAPS,
         };
         s.apply_quality(Quality::Standard);
         s
@@ -124,6 +137,15 @@ impl Default for BakeSettings {
 }
 
 impl BakeSettings {
+    /// The maps this bake makes (the chosen ones plus the always-baked).
+    pub fn baked_maps(&self) -> u32 {
+        (self.maps & ALL_MAPS) | ALWAYS_MAPS
+    }
+
+    fn bakes(&self, map: usize) -> bool {
+        self.baked_maps() & (1 << map) != 0
+    }
+
     pub fn apply_quality(&mut self, q: Quality) {
         self.quality = q;
         let (aa, ao, th, sky) = match q {
@@ -892,6 +914,8 @@ pub struct BakeReport {
     /// Low/high-poly part names paired by match-by-name (0 = not matching).
     pub matched_names: usize,
     pub used_cage: bool,
+    /// Which maps were baked (a bit per `engine::MAPS` index).
+    pub baked: u32,
     /// Loaded from the bake cache instead of baked.
     pub from_cache: bool,
     started: Instant,
@@ -932,6 +956,7 @@ impl BakeReport {
             })).collect::<Vec<_>>(),
             "matched_names": self.matched_names,
             "used_cage": self.used_cage,
+            "baked": self.baked,
             "gpu_seconds": self.seconds().unwrap_or(0.0),
             "valid_texels": self.valid_texels.load(Ordering::Relaxed),
             "missed_texels": self.missed_texels.load(Ordering::Relaxed),
@@ -963,6 +988,7 @@ impl BakeReport {
             id_regions,
             matched_names: u("matched_names")? as usize,
             used_cage: v["used_cage"].as_bool()?,
+            baked: v["baked"].as_u64().map_or(ALL_MAPS, |b| b as u32),
             from_cache: true,
             started: Instant::now(),
             gpu_seconds: AtomicU32::new(f("gpu_seconds")?.to_bits()),
@@ -1395,12 +1421,17 @@ impl GpuBaker {
         let s = settings;
         let uniform = BakeUniform {
             a: [res as f32, s.aa as f32, s.front, s.rear],
-            b: [s.ao_rays as f32, s.ao_distance, s.cavity_distance, s.thickness_rays as f32],
-            c: [s.thickness_distance, s.sky_rays as f32, s.sky_cone_deg.to_radians().cos(), s.curvature_radius],
+            b: [
+                if s.bakes(0) || s.bakes(2) { s.ao_rays as f32 } else { 0.0 },
+                s.ao_distance,
+                s.cavity_distance,
+                if s.bakes(3) { s.thickness_rays as f32 } else { 0.0 },
+            ],
+            c: [s.thickness_distance, if s.bakes(4) { s.sky_rays as f32 } else { 0.0 }, s.sky_cone_deg.to_radians().cos(), s.curvature_radius],
             d: [s.edge_threshold, scene.edge_max_distance, scene.curvature_scale, if s.high_poly.is_none() { 1.0 } else { 0.0 }],
             e: [0.0, 0.0, 0.0, 1.0],
             f: [scene.edge_roots[0], scene.edge_roots[1], if cage.is_some() { 1.0 } else { 0.0 }, scene.edge_seed_curvature],
-            g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), 0.0, 0.0, 0.0],
+            g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), s.baked_maps() as f32, 0.0, 0.0],
         };
         let ubuf = Self::uniform_buffer(device, &uniform);
         let nodes = Self::storage(device, "bvh nodes", &scene.nodes);
@@ -1473,6 +1504,7 @@ impl GpuBaker {
             id_regions: scene.id_regions.clone(),
             matched_names: scene.matched_names,
             used_cage: scene.cage.is_some(),
+            baked: settings.baked_maps(),
             from_cache: false,
             started: Instant::now(),
             gpu_seconds: AtomicU32::new(0),
@@ -1578,6 +1610,10 @@ impl GpuBaker {
         ];
         let ubuf = Self::uniform_buffer(device, &run.uniform);
         let mut encoder = device.create_command_encoder(&Default::default());
+        let edges = Tex::new(device, "edge distance", res, res, F::Rgba16Float, usage);
+        // Curvature seeds the edge search, so the three are baked together.
+        let baked = run.uniform.g[1] as u32;
+        if baked & 0b110_0010 != 0 {
         let g = Self::group(
             device,
             &self.curvature.1,
@@ -1629,7 +1665,6 @@ impl GpuBaker {
             src = 1 - src;
             step /= 2;
         }
-        let edges = Tex::new(device, "edge distance", res, res, F::Rgba16Float, usage);
         let g = Self::group(
             device,
             &self.edges.1,
@@ -1644,6 +1679,7 @@ impl GpuBaker {
             ],
         );
         Self::dispatch(&mut encoder, &self.edges.0, &g, res, res);
+        }
 
         // A-trous iterations (spacing 1, 2, 4, 8) ping-pong through a scratch
         // pair, ending back in the maps; the edge-stopping weights keep real
@@ -2110,6 +2146,34 @@ pub(crate) mod tests {
         let settings = BakeSettings { high_poly: Some(high.into()), front: reach, rear: reach, ..Default::default() };
         let baked = bake(&device, &queue, &mesh, &settings, res);
         write_pngs(&baked, "pair");
+    }
+
+    /// Maps left out of the bake come out neutral and are reported missing.
+    #[test]
+    #[ignore]
+    fn bake_skips_maps_left_out() {
+        // Only curvature and AO: thickness, sky, cavity and edges come out
+        // neutral and the report says they weren't baked.
+        let (device, queue) = gpu();
+        let mesh = Primitive::MaterialBall.build();
+        let gpu_mesh = GpuMesh::new(&device, &mesh);
+        let mut s = BakeSettings::default();
+        s.apply_quality(Quality::Draft);
+        s.maps = (1 << 0) | (1 << 1);
+        let (maps, report, _) = run_bake(&device, &queue, &mesh, &gpu_mesh, &s, 128);
+        assert_eq!(report.baked & 0b111_1111, 0b11, "AO and curvature baked");
+        let a = read_texture(&device, &queue, &maps[0]);
+        let b = read_texture(&device, &queue, &maps[1]);
+        let half = |b: &[u8], i: usize, k: usize| f16_to_f32(u16::from_le_bytes([b[i * 8 + k * 2], b[i * 8 + k * 2 + 1]]));
+        let texels = (128 * 128) as usize;
+        let ao_min = (0..texels).map(|i| a[i * 4] as f32 / 255.0).fold(1.0f32, f32::min);
+        assert!(ao_min < 0.6, "AO was baked (darkest {ao_min})");
+        for i in 0..texels {
+            assert_eq!(a[i * 4 + 2], 255, "cavity neutral");
+            assert_eq!(a[i * 4 + 3], 255, "thickness neutral");
+            assert!((half(&b, i, 0) - 1.0).abs() < 1e-3, "sky neutral");
+            assert!((half(&b, i, 1) - 1.0).abs() < 1e-3 && (half(&b, i, 2) - 1.0).abs() < 1e-3, "edges neutral");
+        }
     }
 
     /// Low-poly-only bakes of the built-in meshes plus any in MP_BAKE_TEST.

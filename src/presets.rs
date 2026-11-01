@@ -221,6 +221,11 @@ const fn scan(name: &'static str, material: &'static str, id: &'static str, tili
 }
 
 impl SmartMaterial {
+    /// The baked maps its masks read (a bit per `engine::MAPS` index).
+    pub fn needs_maps(&self) -> u32 {
+        self.layers.iter().filter_map(|l| l.generator()).fold(0, |acc, g| acc | g.needs_maps())
+    }
+
     /// Built on a scanned texture set.
     pub fn is_scanned(&self) -> bool {
         self.layers.iter().any(|l| l.scan.is_some())

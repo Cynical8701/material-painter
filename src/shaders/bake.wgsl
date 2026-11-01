@@ -1154,10 +1154,21 @@ fn cs_pack(@builtin(global_invocation_id) gid: vec3<u32>) {
     let convex = 1.0 - smoothstep(0.0, line, ed.z);
     let concave = 1.0 - smoothstep(0.0, line, ed.w);
     let ks = k * u.d.z;
-    let curv = 0.5 + 0.5 * clamp(max(max(ks, 0.0), convex) - max(max(-ks, 0.0), concave), -1.0, 1.0);
-    let edge = clamp(ed.x / emax, 0.0, 1.0);
-    let crease = clamp(ed.y / emax, 0.0, 1.0);
-    textureStore(map_a_w, c, vec4<f32>(occ.x, curv, occ.y, occ.z));
-    textureStore(map_b_w, c, vec4<f32>(occ.w, edge, crease, sn.w));
+    var curv = 0.5 + 0.5 * clamp(max(max(ks, 0.0), convex) - max(max(-ks, 0.0), concave), -1.0, 1.0);
+    var edge = clamp(ed.x / emax, 0.0, 1.0);
+    var crease = clamp(ed.y / emax, 0.0, 1.0);
+    // Maps left out of the bake are neutral: nothing occluded, flat, far
+    // from any edge.
+    let baked = u32(u.g.y);
+    var o = occ;
+    if ((baked & 1u) == 0u) { o.x = 1.0; }
+    if ((baked & 2u) == 0u) { curv = 0.5; }
+    if ((baked & 4u) == 0u) { o.y = 1.0; }
+    if ((baked & 8u) == 0u) { o.z = 1.0; }
+    if ((baked & 16u) == 0u) { o.w = 1.0; }
+    if ((baked & 32u) == 0u) { edge = 1.0; }
+    if ((baked & 64u) == 0u) { crease = 1.0; }
+    textureStore(map_a_w, c, vec4<f32>(o.x, curv, o.y, o.z));
+    textureStore(map_b_w, c, vec4<f32>(o.w, edge, crease, sn.w));
     textureStore(map_c_w, c, vec4<f32>(bent.xyz, sp.w));
 }

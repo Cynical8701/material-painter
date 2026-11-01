@@ -411,6 +411,7 @@ impl PainterApp {
             "edge_auto": bs.edge_auto, "hard_edge_angle": bs.hard_edge_angle,
             "match_by_name": bs.match_by_name,
             "cage": bs.cage.as_ref().map(|p| p.display().to_string()),
+            "maps": bs.maps,
         });
         let v = &self.view;
         let p = &v.post;
@@ -549,6 +550,8 @@ impl PainterApp {
         bs.hard_edge_angle = f(bv, "hard_edge_angle", bs.hard_edge_angle);
         bs.match_by_name = b(bv, "match_by_name", bs.match_by_name);
         bs.cage = s(bv, "cage").map(PathBuf::from).filter(|p| p.is_file());
+        // Projects from before map selection baked everything.
+        bs.maps = bv["maps"].as_u64().map_or(crate::bake::ALL_MAPS, |m| m as u32);
         bs.id_source = match s(bv, "id_source") {
             Some("Materials") => IdSource::Materials,
             Some("VertexColors") => IdSource::VertexColors,

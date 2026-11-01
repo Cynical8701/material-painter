@@ -960,6 +960,36 @@ impl PainterApp {
         [before, summary(&self.engine, self.selected)]
     }
 
+    /// Bakes again without ambient occlusion and edge distance (offscreen UI
+    /// tests); true once that bake is in.
+    #[cfg(test)]
+    pub(crate) fn test_bake_without(&mut self, ctx: &egui::Context, maps: u32) -> bool {
+        if self.bake_settings.maps != crate::bake::ALL_MAPS & !maps {
+            self.bake_settings.maps = crate::bake::ALL_MAPS & !maps;
+            self.start_bake(ctx);
+        }
+        self.bake_job.is_none() && self.engine.missing_maps() == maps
+    }
+
+    /// Shows smart materials on the shelf, the bake window, and selects the
+    /// top layer of a smart material that uses the edge distance (offscreen
+    /// UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_show_missing(&mut self) {
+        self.shelf.cat = ShelfCat::SmartMaterials;
+        self.show_bake = true;
+        let k = presets::SMART_MATERIALS.iter().position(|s| s.needs_maps() & (1 << 5) != 0).expect("a smart material with edge wear");
+        let at = self.engine.layers.len();
+        let folder = add_smart_material(&mut self.engine, &mut self.undo, &presets::SMART_MATERIALS[k], at, None);
+        // The layer in it whose mask reads the edges.
+        let block = self.engine.block(folder);
+        self.selected = block
+            .clone()
+            .find(|&i| self.engine.layers[i].mask.as_ref().and_then(|m| m.generator).is_some_and(|g| g.needs_maps() & (1 << 5) != 0))
+            .unwrap_or(folder);
+        self.target = StrokeTarget::Mask;
+    }
+
     /// Opens a graph in the Material Designer (offscreen UI tests).
     #[cfg(test)]
     pub(crate) fn test_open_graph(&mut self, id: u64) {
@@ -1207,7 +1237,7 @@ impl PainterApp {
                     let rs = &self.rs;
                     match out_of_memory_guard(&rs.device, || entry.upload(&rs.device, &rs.queue)) {
                         Ok((maps, report)) => {
-                            self.status = format!("Loaded {} cached mesh maps ({}², from {}).", MAPS.len(), report.resolution, report.source);
+                            self.status = format!("Loaded {} cached mesh maps ({}², from {}).", report.baked.count_ones(), report.resolution, report.source);
                             self.engine.set_maps(maps, Arc::new(report));
                         }
                         Err(e) => {
@@ -1266,7 +1296,7 @@ impl PainterApp {
                     };
                     self.status = format!(
                         "Baked {} mesh maps from {} ({} tris, {} parts{matched}{}) at {}²{upscaled}.",
-                        MAPS.len(),
+                        report.baked.count_ones(),
                         report.source,
                         report.triangles,
                         report.parts,
@@ -1998,6 +2028,13 @@ impl PainterApp {
                     labeled(ui, "Bounces", |ui| ui.add(egui::Slider::new(&mut self.rt.bounces, 1..=12)));
                     ui.checkbox(&mut self.rt.ground, "Ground plane with shadows");
                 });
+                if ui
+                    .add(theme::selectable(self.view.show_wire, theme::with_icon(icons::GRID_FOUR, "UV wire")))
+                    .on_hover_text("Show the UV wireframe in the 2D view")
+                    .clicked()
+                {
+                    self.view.show_wire = !self.view.show_wire;
+                }
                 if ui
                     .add(theme::selectable(self.view.show_wire_3d, theme::with_icon(icons::CUBE_TRANSPARENT, "Wireframe")))
                     .on_hover_text("Show the mesh's edges in the 3D view (W)")
@@ -2893,6 +2930,30 @@ impl PainterApp {
                 ui.radio_value(&mut s.id_source, IdSource::VertexColors, "Vertex colors");
             });
 
+            section(ui, "Maps");
+            ui.horizontal_wrapped(|ui| {
+                for &m in crate::bake::OPTIONAL_MAPS.iter() {
+                    let bit = 1u32 << m;
+                    let mut on = s.maps & bit != 0;
+                    if ui.checkbox(&mut on, MAPS[m].name).on_hover_text(MAPS[m].desc).changed() {
+                        s.maps ^= bit;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("All").clicked() {
+                    s.maps = crate::bake::ALL_MAPS;
+                }
+                if ui.small_button("None").clicked() {
+                    s.maps = crate::bake::ALL_MAPS & !crate::bake::OPTIONAL_MAPS.iter().fold(0, |a, m| a | (1 << m));
+                }
+                ui.label(
+                    egui::RichText::new("Maps left out bake faster and stay neutral; masks that read them show a warning. Normal, height, ID and part maps are always baked.")
+                        .small()
+                        .color(theme::TEXT_DIM),
+                );
+            });
+
             section(ui, "Quality");
             labeled(ui, "Preset", |ui| {
                 egui::ComboBox::from_id_salt("bake quality").selected_text(s.quality.name()).show_ui(ui, |ui| {
@@ -3179,9 +3240,46 @@ impl PainterApp {
         });
     }
 
+    /// A warning badge on a shelf swatch that reads maps the bake left out.
+    fn missing_badge(ui: &egui::Ui, resp: &egui::Response, missing: u32) {
+        if missing == 0 {
+            return;
+        }
+        let at = resp.rect.right_top() + vec2(-8.0, 6.0);
+        let r = Rect::from_center_size(at + vec2(-5.0, 6.0), vec2(16.0, 16.0));
+        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(230, 160, 40));
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "!", egui::FontId::proportional(12.0), Color32::BLACK);
+        resp.clone().on_hover_text(format!("Needs maps that weren't baked: {}. Bake them for this to look right.", crate::engine::map_names(missing)));
+    }
+
+    /// A note under a mask that reads maps the bake left out.
+    fn missing_maps_note(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let Some(mask) = self.engine.layers.get(idx).and_then(|l| l.mask.as_ref()) else { return };
+        let mut needs = mask.generator.map_or(0, |g| g.needs_maps());
+        for ml in &mask.layers {
+            if let crate::engine::MaskSource::Generator(g) = &ml.source {
+                needs |= g.needs_maps();
+            }
+        }
+        let missing = needs & self.engine.missing_maps();
+        if missing == 0 {
+            return;
+        }
+        egui::Frame::new().fill(Color32::from_rgb(60, 45, 20)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("This mask reads maps that weren't baked: {}.", crate::engine::map_names(missing)))
+                    .color(Color32::from_rgb(240, 190, 90)),
+            );
+            if ui.button("Open the baker").clicked() {
+                self.show_bake = true;
+            }
+        });
+    }
+
     fn mask_properties(&mut self, ui: &mut egui::Ui, idx: usize) -> bool {
         let mut dirty = false;
         section(ui, "Mask");
+        self.missing_maps_note(ui, idx);
         let Some(mask) = self.engine.layers[idx].mask.as_mut() else {
             ui.label("This layer has no mask.");
             return false;
@@ -3663,6 +3761,7 @@ impl PainterApp {
                                         ui.painter().rect_filled(r, 0.0, theme::ACCENT.gamma_multiply(0.85));
                                         ui.painter().galley(r.min + vec2(3.0, 1.0), g, Color32::WHITE);
                                     }
+                                    Self::missing_badge(ui, &resp, s.needs_maps() & self.engine.missing_maps());
                                     resp.dnd_set_drag_payload(ShelfItem::Smart(i));
                                     if resp.double_clicked() {
                                         self.pending.push(Action::AddOnTop(ShelfItem::Smart(i)));
@@ -3742,6 +3841,7 @@ impl PainterApp {
                                     }
                                     let tex = self.shelf.generators[i].id();
                                     let resp = Self::swatch(ui, tex, g.name(), icon);
+                                    Self::missing_badge(ui, &resp, g.default_generator().needs_maps() & self.engine.missing_maps());
                                     resp.dnd_set_drag_payload(ShelfItem::Generator(*g));
                                     if resp.double_clicked() {
                                         self.pending.push(Action::AddGenerator(*g));
