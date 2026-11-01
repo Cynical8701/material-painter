@@ -33,7 +33,9 @@ maps, build materials in a node graph and write your own node shaders.
   breakup...).
 - **Mesh map baking**: ambient occlusion, curvature, cavity, thickness,
   normal and height from a high poly, position, world normal, ID and more,
-  with cages and match-by-name.
+  with cages and match-by-name. Custom bake maps add what happens around the
+  model: fluid flow from any direction, wind exposure and erosion, sand and
+  snow drifts, contact between parts and distance from a point.
 - **Material Designer**: a node graph of tileable textures that drives fill
   layers and masks, with live previews and a 3D view of the result.
 - **Shader Maker**: write custom nodes in WGSL with syntax highlighting, a

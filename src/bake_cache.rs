@@ -7,7 +7,7 @@
 //! with a changed baker never serves stale maps. Entries are LZ4-compressed;
 //! the least recently used ones are dropped past [`MAX_BYTES`].
 
-use crate::bake::{BakeReport, BakeSettings, MAP_FORMATS};
+use crate::bake::{BakeReport, BakeSettings, MAP_FORMATS, MAP_TEXTURES};
 use crate::gpu::{self, LAYER_USAGE, Tex};
 use crate::mesh::Mesh;
 use eframe::wgpu;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 const MAGIC: &[u8; 4] = b"MPBC";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 /// Total size the cache may grow to before old entries are evicted.
 const MAX_BYTES: u64 = 2 << 30;
 
@@ -28,7 +28,7 @@ pub struct Key(String);
 /// A cached bake: its report and the five packed maps, as uploaded bytes.
 pub struct Entry {
     pub report: BakeReport,
-    maps: [(u32, Vec<u8>); 5],
+    maps: [(u32, Vec<u8>); MAP_TEXTURES],
 }
 
 /// 64-bit FNV-1a over 8-byte words: stable across runs and builds (unlike
@@ -165,7 +165,7 @@ fn decode(mut b: &[u8]) -> Option<Entry> {
     let json_len = u32_(&mut b)? as usize;
     let report: serde_json::Value = serde_json::from_slice(take(&mut b, json_len)?).ok()?;
     let report = BakeReport::from_cache_json(&report)?;
-    let mut maps: [(u32, Vec<u8>); 5] = Default::default();
+    let mut maps: [(u32, Vec<u8>); MAP_TEXTURES] = Default::default();
     for (i, slot) in maps.iter_mut().enumerate() {
         let res = u32_(&mut b)?;
         let len = u32_(&mut b)? as usize;
@@ -181,7 +181,7 @@ fn decode(mut b: &[u8]) -> Option<Entry> {
 
 impl Entry {
     /// Uploads the cached maps as the textures a bake would have produced.
-    pub fn upload(self, device: &wgpu::Device, queue: &wgpu::Queue) -> ([Tex; 5], BakeReport) {
+    pub fn upload(self, device: &wgpu::Device, queue: &wgpu::Queue) -> ([Tex; MAP_TEXTURES], BakeReport) {
         let usage = LAYER_USAGE | wgpu::TextureUsages::STORAGE_BINDING;
         let mut maps = self.maps.into_iter().enumerate().map(|(i, (res, data))| {
             let tex = Tex::new(device, "mesh map", res, res, MAP_FORMATS[i], usage);
@@ -193,7 +193,7 @@ impl Entry {
             queue.write_texture(tex.copy_info(), &data, layout, tex.extent());
             tex
         });
-        let maps = std::array::from_fn(|_| maps.next().expect("five maps"));
+        let maps = std::array::from_fn(|_| maps.next().expect("every map"));
         (maps, self.report)
     }
 }
@@ -201,7 +201,7 @@ impl Entry {
 /// Saves a finished bake in the background: the maps are read back from the
 /// GPU once the bake's work completes, then compressed and written. Failures
 /// only cost the cache entry, so they are ignored.
-pub fn store(key: Key, maps: &[Tex; 5], report: Arc<BakeReport>, device: &wgpu::Device, queue: &wgpu::Queue) {
+pub fn store(key: Key, maps: &[Tex; MAP_TEXTURES], report: Arc<BakeReport>, device: &wgpu::Device, queue: &wgpu::Queue) {
     let Some(path) = path(&key) else { return };
     let textures = maps.each_ref().map(|m| m.texture.clone());
     let (device, queue) = (device.clone(), queue.clone());
@@ -218,7 +218,7 @@ pub fn store(key: Key, maps: &[Tex; 5], report: Arc<BakeReport>, device: &wgpu::
 
 /// Reads the maps back (blocking until the bake's GPU work is done) and
 /// serializes them with the report.
-fn encode(textures: &[wgpu::Texture; 5], report: &BakeReport, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
+fn encode(textures: &[wgpu::Texture; MAP_TEXTURES], report: &BakeReport, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
     // Map by map, so only one uncompressed map is in memory at a time.
     let mut body = Vec::new();
     for tex in textures {

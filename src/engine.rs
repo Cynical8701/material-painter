@@ -7,7 +7,7 @@
 //! * Fill layers and mask generators are procedural: zero texture memory.
 //! * Stroke history lives compressed in system RAM (see `undo.rs`).
 
-use crate::bake::{BakeReport, MAP_FORMATS};
+use crate::bake::{BakeReport, MAP_FORMATS, MAP_TEXTURES};
 use crate::gpu::{self, GpuMesh, LAYER_USAGE, Tex};
 use crate::undo::{DocProps, Edit, LayerProps, Snapshot, StrokeTarget, UndoEntry, UndoStack};
 use eframe::{egui, egui_wgpu, wgpu};
@@ -126,9 +126,13 @@ pub const GEN_INPUTS: [(&str, &str); GEN_INPUT_COUNT] = [
     ("Wood grain", "Rings and fibers running along the planks (the long axis, vertical on end faces)"),
     ("Cells", "Distance to the nearest cell center: pits, hammer dents, leather pebbling, cracks (invert)"),
     ("Scratches", "Fine scratches in random directions"),
+    ("Custom 1", "Custom bake map 1 (set it up in the bake window: flow, exposure, deposits, contact...)"),
+    ("Custom 2", "Custom bake map 2 (set it up in the bake window)"),
+    ("Custom 3", "Custom bake map 3 (set it up in the bake window)"),
+    ("Custom 4", "Custom bake map 4 (set it up in the bake window)"),
 ];
 
-pub const GEN_INPUT_COUNT: usize = 19;
+pub const GEN_INPUT_COUNT: usize = 23;
 
 /// Indices into [`GEN_INPUTS`].
 pub mod gin {
@@ -151,6 +155,8 @@ pub mod gin {
     pub const GRAIN: usize = 16;
     pub const CELLS: usize = 17;
     pub const SCRATCHES: usize = 18;
+    /// The first custom bake map; the four slots follow in order.
+    pub const CUSTOM: usize = 19;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -168,10 +174,11 @@ pub enum GenKind {
     Clouds,
     PositionGradient,
     IdMask,
+    CustomMap,
 }
 
 impl GenKind {
-    pub const ALL: [GenKind; 13] = [
+    pub const ALL: [GenKind; 14] = [
         GenKind::EdgeWear,
         GenKind::Dirt,
         GenKind::Dust,
@@ -185,6 +192,7 @@ impl GenKind {
         GenKind::Clouds,
         GenKind::PositionGradient,
         GenKind::IdMask,
+        GenKind::CustomMap,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -201,6 +209,7 @@ impl GenKind {
             GenKind::Clouds => "Clouds",
             GenKind::PositionGradient => "World Gradient",
             GenKind::IdMask => "ID Mask",
+            GenKind::CustomMap => "Custom Bake Map",
         }
     }
     pub fn default_generator(self) -> Generator {
@@ -269,6 +278,10 @@ impl GenKind {
                 w[ID] = 1.0;
                 (0.5, 0.05, 3.0, 0.0)
             }
+            GenKind::CustomMap => {
+                w[CUSTOM] = 1.0;
+                (0.35, 0.15, 3.0, 0.3)
+            }
         };
         Generator {
             kind: self,
@@ -320,7 +333,10 @@ impl Generator {
             (gin::PART_GRADIENT, 8),
             (gin::PART_RANDOM, 7),
         ];
-        FROM.iter().filter(|(i, _)| self.weights[*i].abs() > 1e-4).fold(0, |acc, (_, m)| acc | (1 << m))
+        let custom = (0..crate::bake::CUSTOM_SLOTS)
+            .filter(|k| self.weights[gin::CUSTOM + k].abs() > 1e-4)
+            .fold(0, |acc, k| acc | 1 << (crate::bake::CUSTOM_BASE + k));
+        FROM.iter().filter(|(i, _)| self.weights[*i].abs() > 1e-4).fold(custom, |acc, (_, m)| acc | (1 << m))
     }
 }
 
@@ -353,8 +369,13 @@ const fn map(name: &'static str, tex: usize, comp: usize, kind: MapKind, desc: &
     MapInfo { name, tex, comp, kind, desc }
 }
 
-/// Every baked map, packed into five textures. View mode `6 + index` displays map `index`.
-pub const MAPS: [MapInfo; 13] = [
+/// How many baked maps there are (see [`MAPS`]).
+pub const MAP_COUNT: usize = 17;
+
+/// Every baked map, packed into six textures (`bake::MAP_TEXTURES`); the
+/// custom slots start at `bake::CUSTOM_BASE`. See `ViewMode::index` for how
+/// the views display them.
+pub const MAPS: [MapInfo; MAP_COUNT] = [
     map("Ambient Occlusion", 0, 0, MapKind::Scalar, "How much ambient light reaches each point."),
     map("Curvature", 0, 1, MapKind::Scalar, "Per-texel convex (bright) / concave (dark); includes high-poly detail."),
     map("Cavity", 0, 2, MapKind::Scalar, "Short-range occlusion: seams, panel gaps, engravings."),
@@ -368,6 +389,10 @@ pub const MAPS: [MapInfo; 13] = [
     map("Normal", 3, 0, MapKind::Normal, "Tangent-space normal from the high poly."),
     map("Height", 3, 2, MapKind::Scalar, "High-poly displacement relative to the low poly."),
     map("ID", 4, 0, MapKind::Info, "Color per material or mesh part, for ID masks."),
+    map("Custom 1", 5, 0, MapKind::Scalar, "Custom bake map 1: flow, exposure, deposits, contact or distance (bake window)."),
+    map("Custom 2", 5, 1, MapKind::Scalar, "Custom bake map 2 (bake window)."),
+    map("Custom 3", 5, 2, MapKind::Scalar, "Custom bake map 3 (bake window)."),
+    map("Custom 4", 5, 3, MapKind::Scalar, "Custom bake map 4 (bake window)."),
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -778,7 +803,7 @@ struct LayerUniform {
     var1: [f32; 4],
     bmin: [f32; 4],
     bsize: [f32; 4],
-    gw: [[f32; 4]; 5],
+    gw: [[f32; 4]; 6],
     gp0: [f32; 4],
     gp1: [f32; 4],
     gid: [f32; 4],
@@ -876,11 +901,11 @@ pub struct Engine {
     snap: [Option<Tex>; 4],
     snap_mask: Option<Tex>,
     /// Baked mesh maps as produced by the baker (see [`MAPS`]).
-    maps: [Tex; 5],
+    maps: [Tex; MAP_TEXTURES],
     /// Maps with levels and painted fixes applied; `None` when unchanged.
-    resolved: [Option<Tex>; 5],
-    pub map_fix: [Option<Tex>; 13],
-    pub map_levels: [Levels; 13],
+    resolved: [Option<Tex>; MAP_TEXTURES],
+    pub map_fix: [Option<Tex>; MAP_COUNT],
+    pub map_levels: [Levels; MAP_COUNT],
     maps_dirty: bool,
     pub has_bake: bool,
     /// Bumped whenever the mesh maps (or their levels and fixes) change.
@@ -970,9 +995,9 @@ impl Engine {
             snap: [None, None, None, None],
             snap_mask: None,
             maps,
-            resolved: [None, None, None, None, None],
+            resolved: Default::default(),
             map_fix: Default::default(),
-            map_levels: [Levels::default(); 13],
+            map_levels: [Levels::default(); MAP_COUNT],
             maps_dirty: true,
             has_bake: false,
             maps_version: 0,
@@ -1374,18 +1399,19 @@ impl Engine {
     // ------------------------------------------------------------------ mesh maps
 
     /// 1x1 neutral maps used until the first bake.
-    fn default_maps(device: &wgpu::Device, queue: &wgpu::Queue) -> [Tex; 5] {
-        let tex = |i: usize| Tex::new(device, "mesh map", 1, 1, MAP_FORMATS[i], LAYER_USAGE);
-        let maps = [tex(0), tex(1), tex(2), tex(3), tex(4)];
+    fn default_maps(device: &wgpu::Device, queue: &wgpu::Queue) -> [Tex; MAP_TEXTURES] {
+        let maps = std::array::from_fn(|i| Tex::new(device, "mesh map", 1, 1, MAP_FORMATS[i], LAYER_USAGE));
         // f16 bit patterns: 0.0 = 0x0000, 0.5 = 0x3800, 1.0 = 0x3C00.
         let map_b: [u16; 4] = [0x3C00, 0x3C00, 0x3C00, 0x3800];
         let half: [u16; 4] = [0, 0, 0x3800, 0];
-        let data: [&[u8]; 5] = [
+        let zero: [u16; 4] = [0; 4];
+        let data: [&[u8]; MAP_TEXTURES] = [
             &[255, 128, 255, 255],
             bytemuck::cast_slice(&map_b),
             &[128, 255, 128, 128],
             bytemuck::cast_slice(&half),
             &[128, 128, 128, 255],
+            bytemuck::cast_slice(&zero),
         ];
         for (t, d) in maps.iter().zip(data) {
             queue.write_texture(t.copy_info(), d, Default::default(), t.extent());
@@ -1404,7 +1430,7 @@ impl Engine {
 
     /// Adopts freshly baked maps. Painted fixes and levels are kept, so artists
     /// can re-bake with new settings without losing their corrections.
-    pub fn set_maps(&mut self, maps: [Tex; 5], report: Arc<BakeReport>) {
+    pub fn set_maps(&mut self, maps: [Tex; MAP_TEXTURES], report: Arc<BakeReport>) {
         // Bakes stop at `bake::MAX_BAKE_RES`; bigger texture sets get them upscaled.
         let maps = if maps[0].width < self.res {
             let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -1477,7 +1503,7 @@ impl Engine {
     fn resolve_maps(&mut self) {
         self.maps_version += 1;
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for t in 0..5 {
+        for t in 0..MAP_TEXTURES {
             if !self.map_needs_resolve(t) {
                 self.resolved[t] = None;
                 continue;
@@ -3106,7 +3132,9 @@ impl Engine {
                     wgpu::BindGroupEntry { binding: 12, resource: view(Some(self.map_tex(0))) },
                     wgpu::BindGroupEntry { binding: 13, resource: view(Some(self.map_tex(1))) },
                     wgpu::BindGroupEntry { binding: 14, resource: view(Some(self.map_tex(2))) },
-                    wgpu::BindGroupEntry { binding: 15, resource: view(Some(self.map_tex(3))) },
+                    // Composite never reads map D; its slot holds map F
+                    // (the custom maps) instead.
+                    wgpu::BindGroupEntry { binding: 15, resource: view(Some(self.map_tex(5))) },
                     wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                     wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
@@ -3217,7 +3245,7 @@ impl Engine {
             new_layers.push((content, mask));
         }
         if self.has_bake {
-            let maps = [0, 1, 2, 3, 4].map(|t| self.resample(&mut encoder, &self.maps[t], res));
+            let maps = std::array::from_fn(|t| self.resample(&mut encoder, &self.maps[t], res));
             self.maps = maps;
         }
         let fixes: Vec<Option<Tex>> =
@@ -3225,7 +3253,7 @@ impl Engine {
         for (dst, f) in self.map_fix.iter_mut().zip(fixes) {
             *dst = f;
         }
-        self.resolved = [None, None, None, None, None];
+        self.resolved = Default::default();
         self.maps_dirty = true;
         self.queue.submit([encoder.finish()]);
         for (layer, (content, mask)) in self.layers.iter_mut().zip(new_layers) {

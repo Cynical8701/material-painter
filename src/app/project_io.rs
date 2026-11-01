@@ -141,6 +141,36 @@ fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
+fn custom_map_json(c: &crate::bake::CustomMap) -> Value {
+    json!({
+        "kind": format!("{:?}", c.kind),
+        "azimuth": c.azimuth, "elevation": c.elevation, "spread": c.spread,
+        "distance": c.distance, "strength": c.strength, "wander": c.wander,
+        "point": c.point,
+    })
+}
+
+/// A custom bake map slot; `None` for an empty slot or an unknown kind.
+fn custom_map_from(v: &Value) -> Option<crate::bake::CustomMap> {
+    let name = s(v, "kind")?;
+    let kind = crate::bake::CustomKind::ALL.into_iter().find(|k| format!("{k:?}") == name)?;
+    let d = kind.default_map();
+    let mut point = d.point;
+    for (dst, x) in point.iter_mut().zip(v["point"].as_array().into_iter().flatten()) {
+        *dst = x.as_f64().unwrap_or(0.0) as f32;
+    }
+    Some(crate::bake::CustomMap {
+        kind,
+        azimuth: f(v, "azimuth", d.azimuth),
+        elevation: f(v, "elevation", d.elevation),
+        spread: f(v, "spread", d.spread),
+        distance: f(v, "distance", d.distance),
+        strength: f(v, "strength", d.strength),
+        wander: f(v, "wander", d.wander),
+        point,
+    })
+}
+
 pub(super) fn fill_json(p: &FillParams) -> Value {
     json!({
         "enabled": p.mat.enabled,
@@ -412,6 +442,7 @@ impl PainterApp {
             "match_by_name": bs.match_by_name,
             "cage": bs.cage.as_ref().map(|p| p.display().to_string()),
             "maps": bs.maps,
+            "custom": bs.custom.iter().map(|c| c.as_ref().map(custom_map_json)).collect::<Vec<_>>(),
         });
         let v = &self.view;
         let p = &v.post;
@@ -552,6 +583,9 @@ impl PainterApp {
         bs.cage = s(bv, "cage").map(PathBuf::from).filter(|p| p.is_file());
         // Projects from before map selection baked everything.
         bs.maps = bv["maps"].as_u64().map_or(crate::bake::ALL_MAPS, |m| m as u32);
+        for (slot, cv) in bs.custom.iter_mut().zip(bv["custom"].as_array().into_iter().flatten()) {
+            *slot = custom_map_from(cv);
+        }
         bs.id_source = match s(bv, "id_source") {
             Some("Materials") => IdSource::Materials,
             Some("VertexColors") => IdSource::VertexColors,

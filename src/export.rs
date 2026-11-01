@@ -565,7 +565,7 @@ pub struct Snapshot {
     rough: Plane,
     metal: Plane,
     height: Plane,
-    mesh: [Plane; 5],
+    mesh: [Plane; crate::bake::MAP_TEXTURES],
     world_normal: Plane,
     position: Plane,
     bounds: (Vec3, Vec3),
@@ -577,7 +577,7 @@ pub struct Snapshot {
 /// Reads the document's maps back from the GPU (call after compositing).
 pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mesh: Arc<Mesh>) -> Snapshot {
     let res = engine.res;
-    let mesh_maps = [0, 1, 2, 3, 4].map(|t| {
+    let mesh_maps = std::array::from_fn(|t| {
         let tex = engine.map_tex(t);
         resample(read_plane(device, queue, tex), tex.width, res)
     });

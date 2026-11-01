@@ -700,6 +700,9 @@ fn ui_screenshots() {
     harness.state_mut().test_show_missing();
     harness.run_steps(8);
     harness.render().expect("renders").save(dir.join("missing_maps.png")).unwrap();
+    harness.state_mut().test_show_custom();
+    harness.run_steps(8);
+    harness.render().expect("renders").save(dir.join("bake_custom.png")).unwrap();
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer
@@ -978,6 +981,109 @@ fn project_bake() {
             let bytes = read_texture(&rs.device, &rs.queue, img);
             let file = dir.join(format!("view_{cname}_{}.png", mname.to_lowercase().replace(' ', "_")));
             image::save_buffer(&file, &bytes, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+        }
+    }
+    println!("  wrote {}", dir.display());
+}
+
+/// Custom bake maps: each kind bakes something plausible (fluid flow from
+/// above, exposure to and deposits from a front wind, contact between
+/// parts, distance from a point), a Custom Bake Map mask reads it, and the
+/// views show every slot. Images in `target/bake_test/custom/`.
+/// `MP_PREVIEW_MESH=path` bakes that mesh instead of the material ball.
+#[test]
+#[ignore]
+fn custom_maps_bake() {
+    use crate::bake::{CustomKind, CUSTOM_BASE};
+    use crate::engine::{FillParams, GenKind, MatValues};
+    let mesh = match std::env::var("MP_PREVIEW_MESH") {
+        Ok(path) => Mesh::load_file(Path::new(&path)).unwrap_or_else(|e| panic!("{path}: {e}")),
+        Err(_) => crate::mesh::Primitive::MaterialBall.build(),
+    };
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 1024;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
+
+    // Two bakes: four kinds, then the point map in slot 1.
+    let mut point = CustomKind::Point.default_map();
+    point.point = [mesh.bounds_max.x, center.y, mesh.bounds_max.z];
+    let mut setups = vec![
+        [
+            Some(CustomKind::Flow.default_map()),
+            Some(CustomKind::Exposure.default_map()),
+            Some(CustomKind::Deposit.default_map()),
+            Some(CustomKind::Contact.default_map()),
+        ],
+        [None, Some(point), None, None],
+    ];
+    for (run, custom) in setups.drain(..).enumerate() {
+        let mut settings = BakeSettings::default();
+        settings.apply_quality(crate::bake::Quality::Draft);
+        settings.custom = custom;
+        let start = std::time::Instant::now();
+        let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &settings, res);
+        println!("  bake {run}: {:.2}s", start.elapsed().as_secs_f32());
+        for (k, c) in custom.iter().enumerate() {
+            assert_eq!(report.baked & (1 << (CUSTOM_BASE + k)) != 0, c.is_some(), "slot {k} reported");
+        }
+
+        // Map F, per channel: share of texels above 0.5 and the largest value.
+        let bytes = read_texture(&rs.device, &rs.queue, &maps[5]);
+        let texels: Vec<[f32; 4]> = bytes
+            .chunks_exact(8)
+            .map(|b| [0, 1, 2, 3].map(|k| crate::gpu::f16_to_f32(u16::from_le_bytes([b[k * 2], b[k * 2 + 1]]))))
+            .collect();
+        for (k, c) in custom.iter().enumerate() {
+            let vals = texels.iter().map(|t| t[k]);
+            let max = vals.clone().fold(0.0f32, f32::max);
+            let bright = vals.clone().filter(|&v| v > 0.5).count() as f32 / texels.len() as f32;
+            let lit = vals.filter(|&v| v > 0.02).count() as f32 / texels.len() as f32;
+            let name = c.map_or("empty", |c| c.kind.name());
+            println!("    slot {}: {name}: max {max:.2}, {:.1}% > 0.5, {:.1}% > 0.02", k + 1, bright * 100.0, lit * 100.0);
+            match c {
+                None => assert!(max == 0.0, "empty slot {k} stays black"),
+                Some(c) => {
+                    assert!(max > 0.4, "{} reaches bright values (max {max})", c.kind.name());
+                    assert!(lit < 0.98, "{} isn't uniformly lit ({lit})", c.kind.name());
+                }
+            }
+        }
+
+        let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+        engine.set_maps(maps, report);
+        // A red fill masked by the first baked slot, through the preset.
+        let slot = custom.iter().position(Option::is_some).unwrap();
+        let mut undo = crate::undo::UndoStack::default();
+        let fill = FillParams { mat: MatValues { color: [0.8, 0.1, 0.05], ..Default::default() }, ..Default::default() };
+        let idx = engine.add_fill_layer(0, None, "Custom".into(), fill, &mut undo);
+        let mut g = GenKind::CustomMap.default_generator();
+        g.weights = [0.0; crate::engine::GEN_INPUT_COUNT];
+        g.weights[crate::engine::gin::CUSTOM + slot] = 1.0;
+        engine.add_mask(idx, true, Some(g), &mut undo);
+        assert_eq!(engine.missing_maps() & g.needs_maps(), 0, "the mask's map was baked");
+        engine.composite();
+
+        let mut modes: Vec<(String, ViewMode)> = vec![("material".into(), ViewMode::Material), ("sky".into(), map_mode("Sky Exposure"))];
+        for (k, c) in custom.iter().enumerate() {
+            if let Some(c) = c {
+                modes.push((format!("{}_{}", k + 1, c.kind.name().to_lowercase().replace(' ', "_")), ViewMode::Map(CUSTOM_BASE + k)));
+            }
+        }
+        for (cname, yaw, pitch) in [("front", 0.35f32, 0.25f32), ("back", 3.5, 0.3), ("top", 0.6, 1.0)] {
+            let cam = OrbitCam { target: center, dist: 3.2, yaw, pitch, ..Default::default() };
+            for (mname, mode) in &modes {
+                views.render_3d(&rs, [700, 700], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode: *mode, ..Default::default() }, None);
+                let img = views.view3d.image();
+                let px = read_texture(&rs.device, &rs.queue, img);
+                let file = dir.join(format!("run{run}_{cname}_{mname}.png"));
+                image::save_buffer(&file, &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+            }
         }
     }
     println!("  wrote {}", dir.display());

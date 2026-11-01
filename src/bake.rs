@@ -18,10 +18,6 @@ use std::time::Instant;
 use wgpu::TextureFormat as F;
 use wgpu::util::DeviceExt;
 
-/// Formats of the five packed map textures (see `engine::MAPS`).
-/// Map B (sky, edge distance, crease distance, part random) is 16-bit: narrow
-/// edge masks read only a small slice of the distance range, which 8 bits
-/// would band into stripes running along every edge.
 /// Largest resolution the baker works at. Its working textures take about
 /// 240 bytes a texel (surface, low-poly and cage maps in 32-bit float, the
 /// edge search, the ray-traced maps and their scratch copies): 4 GB at
@@ -29,7 +25,143 @@ use wgpu::util::DeviceExt;
 /// set. Bigger texture sets get the bake upscaled (see `Engine::set_maps`).
 pub const MAX_BAKE_RES: u32 = 4096;
 
-pub const MAP_FORMATS: [F; 5] = [F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm];
+/// How many packed map textures a bake makes (see `engine::MAPS`).
+pub const MAP_TEXTURES: usize = 6;
+
+/// Formats of the packed map textures (see `engine::MAPS`).
+/// Map B (sky, edge distance, crease distance, part random) is 16-bit: narrow
+/// edge masks read only a small slice of the distance range, which 8 bits
+/// would band into stripes running along every edge. Map F holds the custom
+/// maps, 16-bit for smooth flow and exposure gradients.
+pub const MAP_FORMATS: [F; MAP_TEXTURES] =
+    [F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm, F::Rgba16Float];
+
+/// Custom map slots: user-defined maps baked into map F, one per channel.
+pub const CUSTOM_SLOTS: usize = 4;
+/// `engine::MAPS` index of the first custom slot.
+pub const CUSTOM_BASE: usize = 13;
+
+/// What a custom map bakes (see `cs_custom` in bake.wgsl).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CustomKind {
+    /// Run-off: fluid lands on surfaces facing its direction and runs along
+    /// the surface away from it (rain streaks, rust runs, leaks).
+    Flow,
+    /// Facing a direction and open to it (wind and sand erosion, sun bleaching).
+    Exposure,
+    /// Up-facing ground sheltered from a wind (sand, snow and dust drifts).
+    Deposit,
+    /// Closeness to other mesh parts (grime and rust where parts meet).
+    Contact,
+    /// Distance from a point (impact damage, heat around an exhaust).
+    Point,
+}
+
+impl CustomKind {
+    pub const ALL: [CustomKind; 5] =
+        [CustomKind::Flow, CustomKind::Exposure, CustomKind::Deposit, CustomKind::Contact, CustomKind::Point];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CustomKind::Flow => "Fluid Flow",
+            CustomKind::Exposure => "Directional Exposure",
+            CustomKind::Deposit => "Wind Deposits",
+            CustomKind::Contact => "Contact",
+            CustomKind::Point => "Distance from Point",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            CustomKind::Flow => {
+                "Fluid lands on the surfaces facing where it comes from and runs along the surface away from it. \
+                 Bright where a lot of surface drains through: the streaks below ledges, bolts and windows. \
+                 For rain streaks, rust runs, leaks and water stains."
+            }
+            CustomKind::Exposure => {
+                "How much each point faces the direction and sees it without anything in the way. \
+                 For wind and sand erosion, sandblasting, sun bleaching and weathered paint on the windward side."
+            }
+            CustomKind::Deposit => {
+                "Up-facing ground sheltered from the wind by something upwind. \
+                 For sand, snow and dust drifting in behind walls and into corners."
+            }
+            CustomKind::Contact => {
+                "How close another mesh part comes: 1 where parts touch, 0 at the distance. \
+                 For grime, rust and wear where bolts, plates and panels meet. Reads only separate parts."
+            }
+            CustomKind::Point => "Falls off from a point to the distance. For impact damage, scorching and heat tint.",
+        }
+    }
+
+    /// Takes a direction (where the fluid or wind comes from).
+    pub fn has_direction(self) -> bool {
+        matches!(self, CustomKind::Flow | CustomKind::Exposure | CustomKind::Deposit)
+    }
+
+    pub fn default_map(self) -> CustomMap {
+        let base = CustomMap {
+            kind: self,
+            azimuth: 0.0,
+            elevation: 90.0,
+            spread: 25.0,
+            distance: 0.5,
+            strength: 2.0,
+            wander: 25.0,
+            point: [0.0; 3],
+        };
+        match self {
+            CustomKind::Flow => CustomMap { spread: 12.0, ..base },
+            CustomKind::Exposure => CustomMap { elevation: 15.0, spread: 30.0, distance: 4.0, ..base },
+            CustomKind::Deposit => CustomMap { elevation: 5.0, spread: 25.0, distance: 0.4, ..base },
+            CustomKind::Contact => CustomMap { distance: 0.08, ..base },
+            CustomKind::Point => CustomMap { distance: 1.0, ..base },
+        }
+    }
+
+    /// The kind's number in the shader (0 = empty slot).
+    fn code(self) -> f32 {
+        match self {
+            CustomKind::Flow => 1.0,
+            CustomKind::Exposure => 2.0,
+            CustomKind::Deposit => 3.0,
+            CustomKind::Contact => 4.0,
+            CustomKind::Point => 5.0,
+        }
+    }
+}
+
+/// A custom map slot's settings. Distances are in mesh units (the mesh is
+/// normalized to a 2-unit box).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct CustomMap {
+    pub kind: CustomKind,
+    /// Where the fluid or wind comes from: compass angle around the up axis
+    /// (0 = +Z, 90 = +X) and height above the horizon (90 = straight above),
+    /// in degrees.
+    pub azimuth: f32,
+    pub elevation: f32,
+    /// Half-angle of the cone of directions around it (degrees): how
+    /// unevenly rain falls, how gusty the wind is.
+    pub spread: f32,
+    /// Flow length, how far a blocker shelters or blocks, contact reach, or
+    /// the point's radius.
+    pub distance: f32,
+    /// Flow: how quickly run-off saturates to white.
+    pub strength: f32,
+    /// Flow: how much the paths meander (degrees).
+    pub wander: f32,
+    /// Distance from point: the point.
+    pub point: [f32; 3],
+}
+
+impl CustomMap {
+    /// Unit vector toward where the fluid or wind comes from.
+    pub fn direction(&self) -> Vec3 {
+        let (az, el) = (self.azimuth.to_radians(), self.elevation.to_radians());
+        Vec3::new(el.cos() * az.sin(), el.sin(), el.cos() * az.cos())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Quality {
@@ -92,18 +224,23 @@ pub struct BakeSettings {
     /// rays start on the cage and travel toward the low poly.
     pub cage: Option<PathBuf>,
     /// Which maps to bake: a bit per `engine::MAPS` index. Maps left out are
-    /// written neutral and their passes skipped where they can be.
+    /// written neutral and their passes skipped where they can be. Custom
+    /// maps are baked for every slot that has one (`custom`).
     pub maps: u32,
+    /// The custom map slots (`engine::MAPS` from [`CUSTOM_BASE`]).
+    pub custom: [Option<CustomMap>; CUSTOM_SLOTS],
 }
 
-/// Every map (a bit per `engine::MAPS` index).
-pub const ALL_MAPS: u32 = (1 << 13) - 1;
+/// Every map (a bit per `engine::MAPS` index), custom slots included.
+pub const ALL_MAPS: u32 = (1 << (CUSTOM_BASE + CUSTOM_SLOTS)) - 1;
+/// The custom map slots' bits.
+pub const CUSTOM_MAPS: u32 = ALL_MAPS & !((1 << CUSTOM_BASE) - 1);
 /// The maps a bake can leave out (the rest are cheap and always baked):
 /// ambient occlusion, curvature, cavity, thickness, sky exposure, edge and
 /// crease distance.
 pub const OPTIONAL_MAPS: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
 /// Map bits always baked.
-const ALWAYS_MAPS: u32 = ALL_MAPS & !0b111_1111;
+const ALWAYS_MAPS: u32 = ((1 << CUSTOM_BASE) - 1) & !0b111_1111;
 
 impl Default for BakeSettings {
     fn default() -> Self {
@@ -130,6 +267,7 @@ impl Default for BakeSettings {
             match_by_name: true,
             cage: None,
             maps: ALL_MAPS,
+            custom: [None; CUSTOM_SLOTS],
         };
         s.apply_quality(Quality::Standard);
         s
@@ -139,7 +277,30 @@ impl Default for BakeSettings {
 impl BakeSettings {
     /// The maps this bake makes (the chosen ones plus the always-baked).
     pub fn baked_maps(&self) -> u32 {
-        (self.maps & ALL_MAPS) | ALWAYS_MAPS
+        let custom = self.custom.iter().enumerate().filter(|(_, c)| c.is_some()).fold(0, |acc, (k, _)| acc | 1 << (CUSTOM_BASE + k));
+        (self.maps & ALL_MAPS & !CUSTOM_MAPS) | ALWAYS_MAPS | custom
+    }
+
+    /// Rays per texel a custom map traces (flow: upstream walks).
+    fn custom_rays(&self, kind: CustomKind) -> u32 {
+        match kind {
+            CustomKind::Flow => (self.sky_rays / 8).clamp(2, 8),
+            CustomKind::Point => 0,
+            _ => self.sky_rays.max(8),
+        }
+    }
+
+    /// The custom slots as the shader reads them (see `BakeU.cust`).
+    fn custom_uniform(&self) -> [[f32; 4]; CUSTOM_SLOTS * 3] {
+        let mut u = [[0.0; 4]; CUSTOM_SLOTS * 3];
+        for (k, c) in self.custom.iter().enumerate() {
+            let Some(c) = c else { continue };
+            let d = c.direction();
+            u[k * 3] = [c.kind.code(), c.distance.max(1e-4), c.spread.clamp(0.0, 89.0).to_radians().cos(), self.custom_rays(c.kind) as f32];
+            u[k * 3 + 1] = [d.x, d.y, d.z, c.strength.max(0.0)];
+            u[k * 3 + 2] = [c.point[0], c.point[1], c.point[2], c.wander.clamp(0.0, 89.0).to_radians()];
+        }
+        u
     }
 
     fn bakes(&self, map: usize) -> bool {
@@ -185,7 +346,14 @@ impl BakeSettings {
     pub fn total_rays_per_texel(&self) -> u32 {
         // A low-poly-only bake traces a single projection ray per texel.
         let projection = if self.high_poly.is_some() { self.aa * self.aa } else { 1 };
-        projection + self.ao_rays + self.thickness_rays + self.sky_rays
+        // A flow walk traces about two rays per step.
+        let custom: u32 = self
+            .custom
+            .iter()
+            .flatten()
+            .map(|c| self.custom_rays(c.kind) * if c.kind == CustomKind::Flow { 64 } else { 1 })
+            .sum();
+        projection + self.ao_rays + self.thickness_rays + self.sky_rays + custom
     }
 }
 
@@ -899,6 +1067,7 @@ struct BakeUniform {
     e: [f32; 4],
     f: [f32; 4],
     g: [f32; 4],
+    cust: [[f32; 4]; CUSTOM_SLOTS * 3],
 }
 
 pub struct BakeReport {
@@ -1025,9 +1194,13 @@ pub struct GpuBaker {
     curv_smooth: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     occ_smooth: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     pack: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    custom: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    cust_smooth: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
 }
 
 const TILE: u32 = 256;
+/// Custom-map tiles are smaller: a flow walk traces hundreds of rays a texel.
+const CUSTOM_TILE: u32 = 128;
 const MAX_IN_FLIGHT: usize = 3;
 const DILATE: u32 = 16;
 
@@ -1043,13 +1216,14 @@ pub struct BakeRun {
     surf_curv: Tex,
     occ: Tex,
     bent: Tex,
-    maps: Option<[Tex; 5]>,
+    maps: Option<[Tex; MAP_TEXTURES]>,
     nodes: wgpu::Buffer,
     tri_pos: wgpu::Buffer,
     tri_nrm: wgpu::Buffer,
     seg_nodes: wgpu::Buffer,
     segs: wgpu::Buffer,
-    tiles: Vec<[u32; 2]>,
+    /// Ray-traced tiles: x, y and the pass (0 occlusion, 1 custom maps).
+    tiles: Vec<[u32; 3]>,
     next_tile: usize,
     done_tiles: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
@@ -1245,7 +1419,38 @@ impl GpuBaker {
                 (25, StorageTex(F::Rgba8Unorm)),
             ],
         );
-        GpuBaker { uv, dilate, dilate_bgl, surface, occlusion, curvature, jfa_init, jfa_step, edges, denoise, curv_smooth, occ_smooth, pack }
+        let custom = compute(
+            "cs_custom",
+            &[
+                (0, Uniform),
+                (1, Tex),
+                (4, Storage(false)),
+                (5, Storage(false)),
+                (6, Storage(false)),
+                (13, Tex),
+                (14, Tex),
+                (28, Tex),
+                (36, StorageTex(F::Rgba16Float)),
+            ],
+        );
+        let cust_smooth = compute("cs_cust_smooth", &smooth_inputs(&[(37, Tex), (36, StorageTex(F::Rgba16Float))]));
+        GpuBaker {
+            uv,
+            dilate,
+            dilate_bgl,
+            surface,
+            occlusion,
+            curvature,
+            jfa_init,
+            jfa_step,
+            edges,
+            denoise,
+            curv_smooth,
+            occ_smooth,
+            pack,
+            custom,
+            cust_smooth,
+        }
     }
 
     fn uniform_buffer(device: &wgpu::Device, u: &BakeUniform) -> wgpu::Buffer {
@@ -1432,6 +1637,7 @@ impl GpuBaker {
             e: [0.0, 0.0, 0.0, 1.0],
             f: [scene.edge_roots[0], scene.edge_roots[1], if cage.is_some() { 1.0 } else { 0.0 }, scene.edge_seed_curvature],
             g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), s.baked_maps() as f32, 0.0, 0.0],
+            cust: s.custom_uniform(),
         };
         let ubuf = Self::uniform_buffer(device, &uniform);
         let nodes = Self::storage(device, "bvh nodes", &scene.nodes);
@@ -1457,6 +1663,7 @@ impl GpuBaker {
             t("map C", MAP_FORMATS[2]),
             t("map D", MAP_FORMATS[3]),
             t("map E", MAP_FORMATS[4]),
+            t("map F", MAP_FORMATS[5]),
         ];
         let group = Self::group(
             device,
@@ -1530,7 +1737,15 @@ impl GpuBaker {
         let mut tiles = Vec::new();
         for y in (0..res).step_by(TILE as usize) {
             for x in (0..res).step_by(TILE as usize) {
-                tiles.push([x, y]);
+                tiles.push([x, y, 0]);
+            }
+        }
+        // Map F stays zero (nothing baked) when no slot has a custom map.
+        if settings.custom.iter().any(Option::is_some) {
+            for y in (0..res).step_by(CUSTOM_TILE as usize) {
+                for x in (0..res).step_by(CUSTOM_TILE as usize) {
+                    tiles.push([x, y, 1]);
+                }
             }
         }
         BakeRun {
@@ -1560,32 +1775,58 @@ impl GpuBaker {
     /// Feeds occlusion tiles to the GPU, keeping a bounded number in flight.
     /// Once every tile is submitted, encodes the final passes and returns the
     /// maps; the GPU runs them in submission order after the last tile.
-    pub fn pump(&self, run: &mut BakeRun, device: &wgpu::Device, queue: &wgpu::Queue, ctx: &egui::Context) -> Option<[Tex; 5]> {
+    pub fn pump(
+        &self,
+        run: &mut BakeRun,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ctx: &egui::Context,
+    ) -> Option<[Tex; MAP_TEXTURES]> {
         while run.next_tile < run.tiles.len() && run.in_flight.load(Ordering::Acquire) < MAX_IN_FLIGHT {
-            let [x, y] = run.tiles[run.next_tile];
+            let [x, y, pass] = run.tiles[run.next_tile];
             run.next_tile += 1;
             let mut u = run.uniform;
             u.e = [x as f32, y as f32, 0.0, run.next_tile as f32];
             let ubuf = Self::uniform_buffer(device, &u);
-            let group = Self::group(
-                device,
-                &self.occlusion.1,
-                vec![
-                    (0, ubuf.as_entire_binding()),
-                    (1, v(&run.low[0])),
-                    (4, run.nodes.as_entire_binding()),
-                    (5, run.tri_pos.as_entire_binding()),
-                    (6, run.tri_nrm.as_entire_binding()),
-                    (13, v(&run.surf_pos)),
-                    (14, v(&run.surf_nrm)),
-                    (15, v(&run.occ)),
-                    (16, v(&run.bent)),
-                    (28, v(&run.surf_geo)),
-                    (35, v(&run.surf_curv)),
-                ],
-            );
             let mut encoder = device.create_command_encoder(&Default::default());
-            Self::dispatch(&mut encoder, &self.occlusion.0, &group, TILE.min(run.res - x), TILE.min(run.res - y));
+            if pass == 0 {
+                let group = Self::group(
+                    device,
+                    &self.occlusion.1,
+                    vec![
+                        (0, ubuf.as_entire_binding()),
+                        (1, v(&run.low[0])),
+                        (4, run.nodes.as_entire_binding()),
+                        (5, run.tri_pos.as_entire_binding()),
+                        (6, run.tri_nrm.as_entire_binding()),
+                        (13, v(&run.surf_pos)),
+                        (14, v(&run.surf_nrm)),
+                        (15, v(&run.occ)),
+                        (16, v(&run.bent)),
+                        (28, v(&run.surf_geo)),
+                        (35, v(&run.surf_curv)),
+                    ],
+                );
+                Self::dispatch(&mut encoder, &self.occlusion.0, &group, TILE.min(run.res - x), TILE.min(run.res - y));
+            } else {
+                let map_f = &run.maps.as_ref().expect("maps until the bake finishes")[5];
+                let group = Self::group(
+                    device,
+                    &self.custom.1,
+                    vec![
+                        (0, ubuf.as_entire_binding()),
+                        (1, v(&run.low[0])),
+                        (4, run.nodes.as_entire_binding()),
+                        (5, run.tri_pos.as_entire_binding()),
+                        (6, run.tri_nrm.as_entire_binding()),
+                        (13, v(&run.surf_pos)),
+                        (14, v(&run.surf_nrm)),
+                        (28, v(&run.surf_geo)),
+                        (36, v(map_f)),
+                    ],
+                );
+                Self::dispatch(&mut encoder, &self.custom.0, &group, CUSTOM_TILE.min(run.res - x), CUSTOM_TILE.min(run.res - y));
+            }
             run.in_flight.fetch_add(1, Ordering::AcqRel);
             queue.submit([encoder.finish()]);
             let (in_flight, done, ctx) = (run.in_flight.clone(), run.done_tiles.clone(), ctx.clone());
@@ -1729,6 +1970,11 @@ impl GpuBaker {
             &[(&run.occ, &scratch[0], 21, 15), (&run.bent, &scratch[1], 22, 16)],
             6,
         );
+        if run.uniform.cust.iter().step_by(3).any(|a| a[0] > 0.0) {
+            let map_f = &run.maps.as_ref().expect("maps until the bake finishes")[5];
+            let scratch = Tex::new(device, "custom maps 2", res, res, MAP_FORMATS[5], usage);
+            Self::smooth_passes(device, &mut encoder, &self.cust_smooth, run, &[(map_f, &scratch, 37, 36)], 4);
+        }
 
         let maps = run.maps.take().unwrap();
         let g = Self::group(
@@ -1991,7 +2237,7 @@ pub(crate) mod tests {
         gpu_mesh: &GpuMesh,
         settings: &BakeSettings,
         res: u32,
-    ) -> ([Tex; 5], Arc<BakeReport>, Tex) {
+    ) -> ([Tex; MAP_TEXTURES], Arc<BakeReport>, Tex) {
         let scene = prepare(mesh, settings).expect("bake source");
         let baker = GpuBaker::new(device);
         let ctx = egui::Context::default();

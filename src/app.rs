@@ -1,7 +1,7 @@
 //! Application shell: Substance-Painter-style layout, input handling and
 //! the per-frame GPU flow (stamps -> composite -> viewport render).
 
-use crate::bake::{self, BakeRun, BakeSettings, GpuBaker, IdSource, PreparedScene, Quality};
+use crate::bake::{self, BakeRun, BakeSettings, CustomKind, GpuBaker, IdSource, PreparedScene, Quality};
 use crate::bake_cache;
 use crate::bvh::Bvh;
 use crate::cage::{CageProbe, CageStats, ProbeKey};
@@ -768,6 +768,71 @@ fn projection_combo(ui: &mut egui::Ui, id: &str, p: &mut BrushProjection) {
         .on_hover_text(p.tip());
 }
 
+/// One custom bake map slot in the bake window: its kind and settings.
+fn custom_map_ui(ui: &mut egui::Ui, k: usize, slot: &mut Option<bake::CustomMap>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("Custom {}", k + 1)).strong());
+        let current = slot.map_or("None", |c| c.kind.name());
+        egui::ComboBox::from_id_salt(("custom map kind", k)).selected_text(current).show_ui(ui, |ui| {
+            if ui.selectable_label(slot.is_none(), "None").clicked() {
+                *slot = None;
+            }
+            for kind in CustomKind::ALL {
+                let on = slot.is_some_and(|c| c.kind == kind);
+                if ui.selectable_label(on, kind.name()).on_hover_text(kind.help()).clicked() && !on {
+                    *slot = Some(kind.default_map());
+                }
+            }
+        });
+    });
+    let Some(c) = slot else { return };
+    ui.indent(("custom map", k), |ui| {
+        ui.label(egui::RichText::new(c.kind.help()).small().color(theme::TEXT_DIM));
+        if c.kind.has_direction() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Comes from").small().color(theme::TEXT_DIM));
+                for (name, az, el) in [("Above", None, 90.0), ("Front", Some(0.0), 0.0), ("Back", Some(180.0), 0.0), ("Right", Some(90.0), 0.0), ("Left", Some(270.0), 0.0), ("Below", None, -90.0)] {
+                    if ui.small_button(name).clicked() {
+                        if let Some(az) = az {
+                            c.azimuth = az;
+                        }
+                        c.elevation = el;
+                    }
+                }
+            });
+            slider(ui, "Compass (°)", &mut c.azimuth, 0.0..=360.0);
+            slider(ui, "Elevation (°)", &mut c.elevation, -90.0..=90.0);
+        }
+        match c.kind {
+            CustomKind::Flow => {
+                slider(ui, "Flow length", &mut c.distance, 0.05..=2.0);
+                slider(ui, "Spread (°)", &mut c.spread, 0.0..=60.0);
+                slider(ui, "Strength", &mut c.strength, 0.5..=12.0);
+                slider(ui, "Wander (°)", &mut c.wander, 0.0..=60.0);
+            }
+            CustomKind::Exposure => {
+                slider(ui, "Spread (°)", &mut c.spread, 0.0..=85.0);
+                slider(ui, "Blocker reach", &mut c.distance, 0.05..=4.0);
+            }
+            CustomKind::Deposit => {
+                slider(ui, "Spread (°)", &mut c.spread, 0.0..=85.0);
+                slider(ui, "Shelter reach", &mut c.distance, 0.02..=2.0);
+            }
+            CustomKind::Contact => {
+                slider(ui, "Reach", &mut c.distance, 0.005..=0.5);
+            }
+            CustomKind::Point => {
+                labeled(ui, "Point", |ui| {
+                    for (axis, v) in ["X", "Y", "Z"].iter().zip(c.point.iter_mut()) {
+                        ui.add(egui::DragValue::new(v).speed(0.01).range(-2.0..=2.0).prefix(format!("{axis} ")));
+                    }
+                });
+                slider(ui, "Radius", &mut c.distance, 0.05..=4.0);
+            }
+        }
+    });
+}
+
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) -> bool {
     labeled(ui, label, |ui| ui.add(egui::Slider::new(v, range).max_decimals(2)).changed())
 }
@@ -968,7 +1033,15 @@ impl PainterApp {
             self.bake_settings.maps = crate::bake::ALL_MAPS & !maps;
             self.start_bake(ctx);
         }
-        self.bake_job.is_none() && self.engine.missing_maps() == maps
+        self.bake_job.is_none() && self.engine.missing_maps() & !crate::bake::CUSTOM_MAPS == maps
+    }
+
+    /// Sets up two custom bake map slots and shows the bake window (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_show_custom(&mut self) {
+        self.show_bake = true;
+        self.bake_settings.custom[0] = Some(CustomKind::Flow.default_map());
+        self.bake_settings.custom[1] = Some(CustomKind::Deposit.default_map());
     }
 
     /// Shows smart materials on the shelf, the bake window, and selects the
@@ -2781,6 +2854,10 @@ impl PainterApp {
         };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, info) in MAPS.iter().enumerate() {
+                // Custom slots are listed once a bake made them.
+                if i >= bake::CUSTOM_BASE && (!self.engine.has_bake || self.engine.missing_maps() & (1 << i) != 0) {
+                    continue;
+                }
                 let shown = self.view.mode == ViewMode::Map(i);
                 let has_fix = self.engine.map_fix[i].is_some();
                 let frame = egui::Frame::new()
@@ -2953,6 +3030,19 @@ impl PainterApp {
                         .color(theme::TEXT_DIM),
                 );
             });
+
+            section(ui, "Custom maps");
+            ui.label(
+                egui::RichText::new(
+                    "Maps of what happens around the model: fluid running off it, wind and sand, drifts, parts touching. \
+                     Masks read them through the Custom Bake Map preset (or the Custom inputs); graphs through Mesh Map nodes.",
+                )
+                .small()
+                .color(theme::TEXT_DIM),
+            );
+            for k in 0..bake::CUSTOM_SLOTS {
+                custom_map_ui(ui, k, &mut s.custom[k]);
+            }
 
             section(ui, "Quality");
             labeled(ui, "Preset", |ui| {

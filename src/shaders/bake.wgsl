@@ -12,6 +12,8 @@
 //                 segments, so it works across UV seams), merged with the JFA
 //                 for high-poly bakes.
 //   cs_denoise    geometry-aware a-trous filter for the ray-traced maps.
+//   cs_custom     (tiled) the user's custom maps: fluid flow, directional
+//                 exposure, deposits, contact and distance from a point.
 //   cs_pack       pack everything into the final map textures.
 //
 // Binding numbers are unique across the module; each pipeline's layout only
@@ -24,7 +26,12 @@ struct BakeU {
     d: vec4<f32>,   // edge threshold, edge max distance, curvature scale, low-poly-only flag
     e: vec4<f32>,   // tile x, tile y, JFA / filter step, seed
     f: vec4<f32>,   // convex edge BVH root, concave edge BVH root (-1 = none), has cage, low-poly-only edge seed curvature
-    g: vec4<f32>,   // height range (largest distance above / below the low poly a ray can find), unused x3
+    g: vec4<f32>,   // height range (largest distance above / below the low poly a ray can find), baked-map bits, unused x2
+    // Custom map slot k (see `bake::CustomMap`), three vec4 each:
+    //   [3k]     kind (0 none), distance, cos(spread), rays
+    //   [3k + 1] unit direction the fluid or wind comes from, strength
+    //   [3k + 2] point, wander (radians)
+    cust: array<vec4<f32>, 12>,
 };
 
 @group(0) @binding(0) var<uniform> u: BakeU;
@@ -67,6 +74,9 @@ struct BakeU {
 // projected point, and the mean edge length of the source triangle there.
 @group(0) @binding(34) var surf_curv_w: texture_storage_2d<rg32float, write>;
 @group(0) @binding(35) var surf_curv: texture_2d<f32>;
+// The custom maps, one per channel.
+@group(0) @binding(36) var cust_w: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(37) var cust_t: texture_2d<f32>;
 
 // Match-by-name group of the texel being projected (0 = hit anything). Only
 // projection rays set it; occlusion rays see the whole mesh.
@@ -80,6 +90,10 @@ var<private> fold_reach: f32 = 0.0;
 var<private> fold_n: vec3<f32> = vec3<f32>(0.0, 0.0, 1.0);
 var<private> fold_part: u32 = 0xffffffffu;
 const FOLD_COS: f32 = 0.7071;
+
+// Rays ignore every triangle of this part (contact maps look for the other
+// parts). NONE = off.
+var<private> skip_part: u32 = 0xffffffffu;
 
 const NONE: u32 = 0xffffffffu;
 const STACK: u32 = 64u;
@@ -143,6 +157,9 @@ fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any_hit: bool) -> Hit {
                     if (tg != 0u && tg != match_group) {
                         continue;
                     }
+                }
+                if (skip_part != NONE && bitcast<u32>(tri_pos[ti * 3u].w) == skip_part) {
+                    continue;
                 }
                 let v0 = tri_pos[ti * 3u].xyz;
                 let e1 = tri_pos[ti * 3u + 1u].xyz - v0;
@@ -1125,6 +1142,269 @@ fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bn = select(n0, normalize(bent), dot(bent, bent) > 1e-8);
     textureStore(occ_w, c, occ / wsum);
     textureStore(bent_w, c, vec4<f32>(bn * 0.5 + 0.5, 1.0));
+}
+
+// ------------------------------------------------------------------ custom maps
+
+const CK_FLOW: u32 = 1u;
+const CK_EXPOSURE: u32 = 2u;
+const CK_DEPOSIT: u32 = 3u;
+const CK_CONTACT: u32 = 4u;
+const CK_POINT: u32 = 5u;
+// Steps of a flow walk; each covers 1/FLOW_STEPS of the flow length.
+const FLOW_STEPS: u32 = 32u;
+
+fn lattice(c: vec3<f32>) -> f32 {
+    let i = vec3<i32>(c);
+    let h = hash_u(bitcast<u32>(i.x) * 73856093u ^ bitcast<u32>(i.y) * 19349663u ^ bitcast<u32>(i.z) * 83492791u);
+    return f32(h & 0xffffffu) / 16777216.0;
+}
+
+// Smooth value noise in [0, 1): flow paths meander alike at neighboring
+// texels, so they read as streaks instead of grain.
+fn value_noise(x: vec3<f32>) -> f32 {
+    let i = floor(x);
+    let f = fract(x);
+    let w = f * f * (3.0 - 2.0 * f);
+    let a = mix(lattice(i), lattice(i + vec3<f32>(1.0, 0.0, 0.0)), w.x);
+    let b = mix(lattice(i + vec3<f32>(0.0, 1.0, 0.0)), lattice(i + vec3<f32>(1.0, 1.0, 0.0)), w.x);
+    let c = mix(lattice(i + vec3<f32>(0.0, 0.0, 1.0)), lattice(i + vec3<f32>(1.0, 0.0, 1.0)), w.x);
+    let d = mix(lattice(i + vec3<f32>(0.0, 1.0, 1.0)), lattice(i + vec3<f32>(1.0, 1.0, 1.0)), w.x);
+    return mix(mix(a, b, w.y), mix(c, d, w.y), w.z);
+}
+
+struct Landing {
+    ok: bool,
+    p: vec3<f32>,
+    n: vec3<f32>,
+};
+
+// Where a ray from `o` along `d` meets the surface, with the normal on the
+// side it arrives from.
+fn land(o: vec3<f32>, d: vec3<f32>, h: Hit) -> Landing {
+    var r: Landing;
+    r.ok = h.tri != NONE;
+    if (r.ok) {
+        r.p = o + d * h.t;
+        let n = hit_normal(h, d);
+        r.n = select(n, -n, dot(n, d) > 0.0);
+    }
+    return r;
+}
+
+// One step of length `s` along the surface from `p` (normal `n`) toward the
+// tangent direction `d`: up a wall met on the way (a concave corner), on
+// along the surface, or around a convex edge onto the face beyond. Fails
+// where the surface ends (an open border).
+fn surface_step(p: vec3<f32>, n: vec3<f32>, d: vec3<f32>, s: f32) -> Landing {
+    let lift = s * 0.25;
+    let o = p + n * lift;
+    var r = land(o, d, intersect(o, d, s, false));
+    if (r.ok) {
+        return r;
+    }
+    let a = o + d * s;
+    let down = lift + s * 2.0;
+    r = land(a, -n, intersect(a, -n, down, false));
+    if (r.ok) {
+        return r;
+    }
+    let b = a - n * down;
+    return land(b, -d, intersect(b, -d, s * 2.0, false));
+}
+
+// How much of a fluid arriving from `src` lands at a point: facing it, with
+// nothing in the way. `r` picks one direction in the cone of `cos_spread`
+// around it (rain never falls quite straight), which softens the shelter
+// overhangs give.
+fn fluid_catch(p: vec3<f32>, n: vec3<f32>, src: vec3<f32>, cos_spread: f32, r: vec2<f32>, bias: f32) -> f32 {
+    let d = cone_dir(src, cos_spread, r);
+    let f = dot(n, d);
+    if (f <= 0.0) {
+        return 0.0;
+    }
+    return select(0.0, f, intersect(p + n * bias, d, 1e6, true).tri == NONE);
+}
+
+// Fluid flow: fluid lands on the surfaces facing where it comes from and
+// runs along the surface away from it. Each walk follows a texel's flow
+// upstream for the flow length, collecting the fluid landing on the way; the
+// more surface drains through a texel, the brighter. Under a ledge or a bolt
+// head this draws the run-off streaks below it, fading with distance.
+fn flow_map(p0: vec3<f32>, n0: vec3<f32>, src: vec3<f32>, cos_spread: f32, len: f32, wander: f32, walks: u32, gain: f32, bias: f32, seed: u32) -> f32 {
+    let s = len / f32(FLOW_STEPS);
+    let freq = 6.0 / max(len, 1e-4);
+    var total = 0.0;
+    for (var w = 0u; w < walks; w++) {
+        var p = p0;
+        var n = n0;
+        var heading = vec3<f32>(0.0);
+        var acc = 0.0;
+        let offset = vec3<f32>(f32(w) * 17.13, f32(w) * 5.71, f32(w) * 11.37);
+        for (var k = 0u; k < FLOW_STEPS; k++) {
+            let wet = fluid_catch(p, n, src, cos_spread, rand2(seed ^ (w * 0x2c1b3c6du + k * 0x297a2d39u)), bias);
+            acc += wet * s;
+            // Upstream: toward the source, along the surface. Where the
+            // surface faces the flow head-on (a roof under rain) there is no
+            // downhill; fluid spreads, so the walk keeps its heading.
+            var t = src - n * dot(src, n);
+            if (length(t) < 0.2) {
+                t = heading - n * dot(heading, n);
+            }
+            let tl = length(t);
+            if (tl < 1e-4) {
+                // Level ground with nowhere to come from: fluid stands here,
+                // as wet as a full run.
+                acc += wet * s * f32(FLOW_STEPS - 1u - k);
+                break;
+            }
+            var d = t / tl;
+            if (wander > 0.0) {
+                let a = (value_noise(p * freq + offset) - 0.5) * 2.0 * wander;
+                d = normalize(d * cos(a) + cross(n, d) * sin(a));
+            }
+            heading = d;
+            let r = surface_step(p, n, d, s);
+            if (!r.ok) {
+                break;
+            }
+            p = r.p;
+            n = r.n;
+        }
+        total += 1.0 - exp(-gain * acc / max(len, 1e-4));
+    }
+    return total / f32(max(walks, 1u));
+}
+
+// Exposure to a direction (wind, sandblasting, sun bleaching): how much of
+// a cone around it the surface faces and sees without anything in the way
+// within `dist`.
+fn exposure_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_spread: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
+    let shift = rand2(seed ^ 0x2545f491u);
+    var acc = 0.0;
+    for (var i = 0u; i < rays; i++) {
+        let d = cone_dir(src, cos_spread, hammersley(i, rays, shift));
+        let f = dot(d, n);
+        if (f <= 0.0 || dot(d, gs) <= 0.0) {
+            continue;
+        }
+        if (intersect(p + gs * bias, d, dist, true).tri == NONE) {
+            acc += f;
+        }
+    }
+    return acc / f32(max(rays, 1u));
+}
+
+// Deposits (sand, snow, dust drifts): ground facing up, sheltered from the
+// wind by something within `dist` upwind.
+fn deposit_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_spread: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
+    let ground = smoothstep(0.25, 0.75, n.y);
+    if (ground <= 0.0) {
+        return 0.0;
+    }
+    let shift = rand2(seed ^ 0x68e31da4u);
+    var blocked = 0.0;
+    for (var i = 0u; i < rays; i++) {
+        let d = above(cone_dir(src, cos_spread, hammersley(i, rays, shift)), gs);
+        if (intersect(p + gs * bias, d, dist, true).tri != NONE) {
+            blocked += 1.0;
+        }
+    }
+    return ground * blocked / f32(max(rays, 1u));
+}
+
+// Contact: how close another part of the mesh comes (rays over the whole
+// hemisphere, ignoring the texel's own part), 1 touching, 0 at `dist`.
+fn contact_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, part: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
+    if (part < 0.0) {
+        return 0.0;
+    }
+    skip_part = u32(part);
+    let shift = rand2(seed ^ 0x1b56c4e9u);
+    var nearest = dist;
+    for (var i = 0u; i < rays; i++) {
+        let d = above(cone_dir(n, 0.0, hammersley(i, rays, shift)), gs);
+        let h = intersect(p + gs * bias, d, nearest, false);
+        if (h.tri != NONE) {
+            nearest = h.t;
+        }
+    }
+    skip_part = NONE;
+    let x = 1.0 - nearest / max(dist, 1e-5);
+    return x * x;
+}
+
+@compute @workgroup_size(8, 8)
+fn cs_custom(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = vec2<i32>(gid.xy) + vec2<i32>(u.e.xy);
+    if (!in_bounds(c)) {
+        return;
+    }
+    let sp = textureLoad(surf_pos, c, 0);
+    if (sp.w < 0.0) {
+        textureStore(cust_w, c, vec4<f32>(0.0));
+        return;
+    }
+    let p = sp.xyz;
+    let n = normalize(textureLoad(surf_nrm, c, 0).xyz);
+    let geo = textureLoad(surf_geo, c, 0);
+    let gs = normalize(geo.xyz + n);
+    let texel = texel_size(c, textureLoad(low_pos, c, 0).xyz);
+    let bias = clamp(texel * 0.25, 1e-5, 4e-3);
+    let seed = hash_u(u32(c.y) * 7919u + u32(c.x) * 104729u + 0x51ed27u);
+    var out = vec4<f32>(0.0);
+    for (var k = 0u; k < 4u; k++) {
+        let a = u.cust[k * 3u];
+        let b = u.cust[k * 3u + 1u];
+        let q = u.cust[k * 3u + 2u];
+        let rays = u32(a.w);
+        let ks = seed ^ (k * 0x27d4eb2fu);
+        var v = 0.0;
+        switch u32(a.x) {
+            case 1u: { v = flow_map(p, n, b.xyz, a.z, a.y, q.w, rays, b.w, bias, ks); }
+            case 2u: { v = exposure_map(p, n, gs, b.xyz, a.z, a.y, rays, bias, ks); }
+            case 3u: { v = deposit_map(p, n, gs, b.xyz, a.z, a.y, rays, bias, ks); }
+            case 4u: { v = contact_map(p, n, gs, geo.w, a.y, rays, bias, ks); }
+            case 5u: { v = 1.0 - smoothstep(0.0, max(a.y, 1e-5), distance(p, q.xyz)); }
+            default: {}
+        }
+        out[k] = clamp(v, 0.0, 1.0);
+    }
+    textureStore(cust_w, c, out);
+}
+
+// Ray-sampled custom maps carry per-texel noise; smooth them over a few
+// texels on the same surface (as `cs_curv_smooth` does).
+@compute @workgroup_size(8, 8)
+fn cs_cust_smooth(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = vec2<i32>(gid.xy);
+    if (!in_bounds(c)) {
+        return;
+    }
+    let s = smooth_center(c);
+    let v0 = textureLoad(cust_t, c, 0);
+    if (!s.ok) {
+        textureStore(cust_w, c, v0);
+        return;
+    }
+    let sigma = clamp(s.tri * 0.5, s.texel, 3.0 * s.texel);
+    let step = i32(u.e.z);
+    let kernel = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
+    var acc = vec4<f32>(0.0);
+    var wsum = 0.0;
+    for (var dy = -2; dy <= 2; dy++) {
+        for (var dx = -2; dx <= 2; dx++) {
+            let q = c + vec2<i32>(dx, dy) * step;
+            let off = length(vec2<f32>(f32(dx), f32(dy))) * f32(step);
+            let w = kernel[dx + 2] * kernel[dy + 2] * select(smooth_tap(q, off, s.p, s.n, s.part, s.texel, sigma), 1.0, dx == 0 && dy == 0);
+            if (w <= 0.0) {
+                continue;
+            }
+            acc += textureLoad(cust_t, q, 0) * w;
+            wsum += w;
+        }
+    }
+    textureStore(cust_w, c, acc / wsum);
 }
 
 // ------------------------------------------------------------------ pack

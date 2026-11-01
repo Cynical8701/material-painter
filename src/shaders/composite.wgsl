@@ -12,7 +12,7 @@ struct LayerU {
     var1: vec4<f32>,        // variation seed, per-part variation, projection (engine::Projection order), image channel bits
     bmin: vec4<f32>,
     bsize: vec4<f32>,
-    gw: array<vec4<f32>, 5>, // smart mask input weights (see engine::GEN_INPUTS)
+    gw: array<vec4<f32>, 6>, // smart mask input weights (see engine::GEN_INPUTS)
     gp0: vec4<f32>,         // level, contrast, scale, noise
     gp1: vec4<f32>,         // invert, seed, has generator, edge width
     gid: vec4<f32>,         // ID color, tolerance
@@ -35,7 +35,7 @@ struct LayerU {
 @group(0) @binding(12) var map_a: texture_2d<f32>;  // AO, curvature, cavity, thickness
 @group(0) @binding(13) var map_b: texture_2d<f32>;  // sky, edge dist, crease dist, part random
 @group(0) @binding(14) var map_c: texture_2d<f32>;  // bent normal, part gradient
-@group(0) @binding(15) var map_d: texture_2d<f32>;  // baked normal xy, height, missed
+@group(0) @binding(15) var map_f: texture_2d<f32>;  // custom maps 1-4
 @group(0) @binding(16) var map_e: texture_2d<f32>;  // ID color
 @group(0) @binding(17) var samp: sampler;
 @group(0) @binding(18) var rsamp: sampler;  // tiling, mipmapped: fill images
@@ -222,6 +222,7 @@ fn generator(p: vec3<f32>, n: vec3<f32>, uv: vec2<f32>, texel_world: f32) -> f32
     let B = textureSampleLevel(map_b, samp, uv, 0.0);
     let C = textureSampleLevel(map_c, samp, uv, 0.0);
     let E = textureSampleLevel(map_e, samp, uv, 0.0);
+    let F = textureSampleLevel(map_f, samp, uv, 0.0);
     let scale = u.gp0.z;
     let q = p * scale + vec3<f32>(u.gp1.y * 17.31);
     let curv = (A.g - 0.5) * 2.0;
@@ -231,7 +232,7 @@ fn generator(p: vec3<f32>, n: vec3<f32>, uv: vec2<f32>, texel_world: f32) -> f32
     // Thin parts (rods, rims, belts) are rounded all the way around, so edge
     // and convexity inputs would wear them completely; damp them there.
     let thick = mix(0.15, 1.0, smoothstep(0.15, 0.75, A.a));
-    var inp: array<f32, 19>;
+    var inp: array<f32, 23>;
     inp[0] = (1.0 - smoothstep(0.0, width, B.g * emax)) * thick;
     inp[1] = max(curv, 0.0) * thick;
     inp[2] = max(-curv, 0.0);
@@ -269,8 +270,13 @@ fn generator(p: vec3<f32>, n: vec3<f32>, uv: vec2<f32>, texel_world: f32) -> f32
         inp[18] = scratches(p, n, scale, texel_world);
     }
 
+    inp[19] = F.r;
+    inp[20] = F.g;
+    inp[21] = F.b;
+    inp[22] = F.a;
+
     var v = 0.0;
-    for (var i = 0; i < 19; i++) {
+    for (var i = 0; i < 23; i++) {
         v += weight(i) * inp[i];
     }
     let noise_amt = u.gp0.w;
