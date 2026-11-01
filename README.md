@@ -52,11 +52,15 @@ maps, build materials in a node graph and write your own node shaders.
 
 ## Download
 
-Ready-to-run builds are on the [releases page](https://github.com/alla2001/material-painter/releases/latest):
-the installer, or a zip to unpack and run. Both are free; donations on
-[Ko-fi](https://ko-fi.com/allaeddinerakik) fund development.
+Ready-to-run builds are on the [releases page](https://github.com/alla2001/material-painter/releases/latest),
+all free; donations on [Ko-fi](https://ko-fi.com/allaeddinerakik) fund development.
 
-**Requirements**: Windows 10 or 11, 64-bit, and a GPU with DirectX 12 or
+- **Windows**: the installer, or the zip to unpack and run.
+- **Linux**: the tarball. Unpack it, run `./material-painter`, and
+  optionally `./install.sh` to add it to your app menu.
+
+**Requirements**: 64-bit Windows 10 or 11, or Linux (x64, glibc 2.35 or newer:
+Ubuntu 22.04, Fedora 36, Debian 12 and later), and a GPU with DirectX 12 or
 Vulkan support (most cards from 2016 on). 8 GB of video memory is
 comfortable for 4K texture sets.
 
