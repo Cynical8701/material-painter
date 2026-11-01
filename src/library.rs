@@ -66,6 +66,8 @@ pub enum Kind {
     Graph,
     /// A custom node (`.wgsl`, into the node library).
     Node,
+    /// A smart material (`.mpsmart`, onto the Smart materials shelf).
+    Smart,
 }
 
 #[derive(Clone, Debug)]
@@ -353,6 +355,7 @@ fn parse_catalog(source: Source, v: &Value) -> Vec<Entry> {
                 let Some(id) = item["id"].as_str() else { continue };
                 let kind = match item["kind"].as_str() {
                     Some("node") => Kind::Node,
+                    Some("smart") => Kind::Smart,
                     _ => Kind::Graph,
                 };
                 let name = item["name"].as_str().unwrap_or(id).to_string();
@@ -518,16 +521,17 @@ fn download_community(agent: &ureq::Agent, entry: &Entry, progress: &dyn Fn(u64,
         // Graphs (with their thumbnail) go on the Graphs shelf; nodes into the node library.
         let target = match ext {
             "mpgraph" => data.join("graphs").join(format!("{}.mpgraph", sanitize(&entry.id))),
+            "mpsmart" => data.join("smart").join(format!("{}.mpsmart", entry.name.replace(['/', '\\', ':'], "_"))),
             "wgsl" => data.join("nodes").join(name),
             "png" if entry.kind == Kind::Graph => data.join("graphs").join(format!("{}.png", sanitize(&entry.id))),
             _ => continue,
         };
         write_atomic(&target, &bytes).map_err(|e| e.to_string())?;
-        if ext == "mpgraph" || (entry.kind == Kind::Node && ext == "wgsl") {
+        if ext == "mpgraph" || ext == "mpsmart" || (entry.kind == Kind::Node && ext == "wgsl") {
             main = Some(target);
         }
     }
-    main.ok_or_else(|| format!("{} has no graph or node file", entry.name))
+    main.ok_or_else(|| format!("{} has no graph, smart material or node file", entry.name))
 }
 
 /// Where a downloaded community entry lives (to show it as installed).
@@ -536,6 +540,7 @@ pub fn installed_path(entry: &Entry) -> Option<PathBuf> {
     match entry.kind {
         Kind::Material => Some(library_dir()?.join(entry.key()).join("meta.json")),
         Kind::Graph => Some(data.join("graphs").join(format!("{}.mpgraph", sanitize(&entry.id)))),
+        Kind::Smart => Some(data.join("smart").join(format!("{}.mpsmart", entry.name.replace(['/', '\\', ':'], "_")))),
         Kind::Node => {
             let file = entry.files.iter().find(|f| f.ends_with(".wgsl"))?;
             Some(data.join("nodes").join(Path::new(file).file_name()?))
@@ -545,18 +550,19 @@ pub fn installed_path(entry: &Entry) -> Option<PathBuf> {
 
 // ---------------------------------------------------------------- sharing
 
-/// Packs a saved graph for the community library: the graph, its thumbnail,
-/// the custom nodes it uses and an `info.json`, in a folder and a `.zip` of
-/// it (to attach to the submission). Returns (folder, zip).
-pub fn package_graph(graph_path: &Path, user_nodes: &[PathBuf], name: &str) -> Result<(PathBuf, PathBuf), String> {
+/// Packs a creation for the community library: the file itself (a graph or
+/// smart material), its thumbnail, the custom nodes it uses and an
+/// `info.json`, in a folder and a `.zip` of it (to attach to the
+/// submission). Returns (folder, zip).
+pub fn package(kind: Kind, main: &Path, thumb_png: Option<Vec<u8>>, user_nodes: &[PathBuf], name: &str) -> Result<(PathBuf, PathBuf), String> {
     let id = sanitize(&name.to_lowercase().replace(' ', "-"));
     let dir = data_dir().ok_or("no settings folder")?.join("share").join(&id);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("nodes")).map_err(|e| e.to_string())?;
-    let mut files = vec![format!("{id}.mpgraph")];
-    std::fs::copy(graph_path, dir.join(&files[0])).map_err(|e| e.to_string())?;
-    let thumb = graph_path.with_extension("png");
-    let has_thumb = thumb.is_file() && std::fs::copy(&thumb, dir.join("thumb.png")).is_ok();
+    let ext = main.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+    let mut files = vec![format!("{id}.{ext}")];
+    std::fs::copy(main, dir.join(&files[0])).map_err(|e| e.to_string())?;
+    let has_thumb = thumb_png.is_some_and(|png| std::fs::write(dir.join("thumb.png"), png).is_ok());
     for node in user_nodes {
         let Some(file) = node.file_name().and_then(|f| f.to_str()) else { continue };
         std::fs::copy(node, dir.join("nodes").join(file)).map_err(|e| e.to_string())?;
@@ -565,7 +571,11 @@ pub fn package_graph(graph_path: &Path, user_nodes: &[PathBuf], name: &str) -> R
     let info = json!({
         "id": id,
         "name": name,
-        "kind": "graph",
+        "kind": match kind {
+            Kind::Smart => "smart",
+            Kind::Node => "node",
+            _ => "graph",
+        },
         "author": "",
         "description": "",
         "tags": [],
@@ -692,7 +702,8 @@ mod tests {
         let node = src.join("crackle.wgsl");
         std::fs::write(&node, "// @name Crackle").unwrap();
 
-        let (dir, zip_path) = package_graph(&graph, &[node], "Lava Crust").unwrap();
+        let thumb = std::fs::read(src.join("Lava Crust.png")).ok();
+        let (dir, zip_path) = package(Kind::Graph, &graph, thumb, &[node], "Lava Crust").unwrap();
         let info: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("info.json")).unwrap()).unwrap();
         assert_eq!(info["id"], "lava-crust");
         assert_eq!(info["files"], json!(["lava-crust.mpgraph", "nodes/crackle.wgsl"]));

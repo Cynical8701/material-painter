@@ -1882,6 +1882,31 @@ impl Engine {
         Some(at - 1)
     }
 
+    /// Inserts layers (bottom first, a folder after its contents, as in the
+    /// stack) at `at` as one undo step. They get new ids; parents among them
+    /// are remapped, and the rest go into `parent`. Returns the new ids.
+    pub fn insert_layers(&mut self, at: usize, parent: Option<u64>, mut layers: Vec<Layer>, label: String, undo: &mut UndoStack) -> Vec<u64> {
+        self.commit_props(undo);
+        undo.begin_group(label);
+        let mut new_ids: HashMap<u64, u64> = HashMap::new();
+        for l in &mut layers {
+            let id = self.new_id();
+            new_ids.insert(l.id, id);
+            l.id = id;
+        }
+        let mut at = at.min(self.layers.len());
+        let mut ids = Vec::with_capacity(layers.len());
+        for mut l in layers {
+            l.parent = l.parent.and_then(|p| new_ids.get(&p).copied()).or(parent);
+            Self::attach_thumb(&self.rs, &mut l);
+            ids.push(l.id);
+            let label = format!("Add {}", l.name);
+            at = self.insert_layer(at, l, undo, label) + 1;
+        }
+        undo.end_group();
+        ids
+    }
+
     /// A copy of one layer with new textures and id, not yet in the stack.
     fn copy_layer(&mut self, idx: usize) -> Layer {
         let src = &self.layers[idx];

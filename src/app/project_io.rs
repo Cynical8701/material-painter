@@ -141,7 +141,7 @@ fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
-fn fill_json(p: &FillParams) -> Value {
+pub(super) fn fill_json(p: &FillParams) -> Value {
     json!({
         "enabled": p.mat.enabled,
         "color": p.mat.color,
@@ -163,7 +163,7 @@ fn fill_json(p: &FillParams) -> Value {
     })
 }
 
-fn fill_from(v: &Value) -> FillParams {
+pub(super) fn fill_from(v: &Value) -> FillParams {
     let d = FillParams::default();
     let enabled = match v.get("enabled").and_then(Value::as_array) {
         Some(a) if a.len() == 4 => std::array::from_fn(|i| a[i].as_bool().unwrap_or(true)),
@@ -192,7 +192,7 @@ fn fill_from(v: &Value) -> FillParams {
     }
 }
 
-fn generator_json(g: &Generator) -> Value {
+pub(super) fn generator_json(g: &Generator) -> Value {
     json!({
         "kind": g.kind.name(),
         "weights": g.weights,
@@ -208,7 +208,63 @@ fn generator_json(g: &Generator) -> Value {
     })
 }
 
-fn generator_from(v: &Value) -> Result<Generator, String> {
+/// A mask's filters, as saved.
+pub(super) fn mask_filters_json(filters: &[crate::engine::MaskFilter]) -> Value {
+    filters.iter().map(|f| json!({"kind": f.kind.key(), "enabled": f.enabled, "a": f.a, "b": f.b, "c": f.c})).collect()
+}
+
+pub(super) fn mask_filters_from(v: &Value) -> Vec<crate::engine::MaskFilter> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|fv| {
+            let kind = crate::engine::FilterKind::ALL.into_iter().find(|k| Some(k.key()) == fv["kind"].as_str())?;
+            let mut f = crate::engine::MaskFilter::new(kind);
+            f.enabled = fv["enabled"].as_bool().unwrap_or(true);
+            f.a = fv["a"].as_f64().map_or(f.a, |v| v as f32);
+            f.b = fv["b"].as_f64().map_or(f.b, |v| v as f32);
+            f.c = fv["c"].as_f64().map_or(f.c, |v| v as f32);
+            Some(f)
+        })
+        .collect()
+}
+
+/// A mask's mask layers, as saved.
+pub(super) fn mask_layers_json(layers: &[crate::engine::MaskLayer]) -> Value {
+    layers
+        .iter()
+        .map(|ml| {
+            let source = match &ml.source {
+                crate::engine::MaskSource::Generator(g) => json!({"generator": generator_json(g)}),
+                crate::engine::MaskSource::Fill(v) => json!({"fill": v}),
+            };
+            json!({"source": source, "blend": ml.blend.key(), "opacity": ml.opacity, "enabled": ml.enabled})
+        })
+        .collect()
+}
+
+pub(super) fn mask_layers_from(v: &Value) -> Vec<crate::engine::MaskLayer> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|lv| {
+            let src = &lv["source"];
+            let source = match (src.get("generator"), src["fill"].as_f64()) {
+                (Some(g), _) => crate::engine::MaskSource::Generator(generator_from(g).ok()?),
+                (None, Some(v)) => crate::engine::MaskSource::Fill(v as f32),
+                _ => return None,
+            };
+            Some(crate::engine::MaskLayer {
+                source,
+                blend: crate::engine::MaskBlend::ALL.into_iter().find(|b| Some(b.key()) == lv["blend"].as_str()).unwrap_or(crate::engine::MaskBlend::Multiply),
+                opacity: lv["opacity"].as_f64().unwrap_or(1.0) as f32,
+                enabled: lv["enabled"].as_bool().unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
     let name = s(v, "kind").ok_or("generator without a kind")?;
     let kind = GenKind::ALL.into_iter().find(|k| k.name() == name).ok_or(format!("unknown generator '{name}'"))?;
     let d = kind.default_generator();
@@ -313,14 +369,8 @@ impl PainterApp {
                     "paint": m.paint.as_ref().map(|t| self.tex_json(&mut w, t)),
                     "generator": m.generator.as_ref().map(generator_json),
                     "graph": m.graph,
-                    "filters": m.filters.iter().map(|f| json!({"kind": f.kind.key(), "enabled": f.enabled, "a": f.a, "b": f.b, "c": f.c})).collect::<Vec<_>>(),
-                    "layers": m.layers.iter().map(|ml| {
-                        let source = match &ml.source {
-                            crate::engine::MaskSource::Generator(g) => json!({"generator": generator_json(g)}),
-                            crate::engine::MaskSource::Fill(v) => json!({"fill": v}),
-                        };
-                        json!({"source": source, "blend": ml.blend.key(), "opacity": ml.opacity, "enabled": ml.enabled})
-                    }).collect::<Vec<_>>(),
+                    "filters": mask_filters_json(&m.filters),
+                    "layers": mask_layers_json(&m.layers),
                 })
             });
             // A graph's outputs are rendered again on load, not stored.
@@ -543,39 +593,8 @@ impl PainterApp {
                         None => None,
                     },
                     graph: mv["graph"].as_u64(),
-                    filters: mv["filters"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|fv| {
-                            let kind = crate::engine::FilterKind::ALL.into_iter().find(|k| Some(k.key()) == fv["kind"].as_str())?;
-                            let mut f = crate::engine::MaskFilter::new(kind);
-                            f.enabled = fv["enabled"].as_bool().unwrap_or(true);
-                            f.a = fv["a"].as_f64().map_or(f.a, |v| v as f32);
-                            f.b = fv["b"].as_f64().map_or(f.b, |v| v as f32);
-                            f.c = fv["c"].as_f64().map_or(f.c, |v| v as f32);
-                            Some(f)
-                        })
-                        .collect(),
-                    layers: mv["layers"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|lv| {
-                            let src = &lv["source"];
-                            let source = match (src.get("generator"), src["fill"].as_f64()) {
-                                (Some(g), _) => crate::engine::MaskSource::Generator(generator_from(g).ok()?),
-                                (None, Some(v)) => crate::engine::MaskSource::Fill(v as f32),
-                                _ => return None,
-                            };
-                            Some(crate::engine::MaskLayer {
-                                source,
-                                blend: crate::engine::MaskBlend::ALL.into_iter().find(|b| Some(b.key()) == lv["blend"].as_str()).unwrap_or(crate::engine::MaskBlend::Multiply),
-                                opacity: lv["opacity"].as_f64().unwrap_or(1.0) as f32,
-                                enabled: lv["enabled"].as_bool().unwrap_or(true),
-                            })
-                        })
-                        .collect(),
+                    filters: mask_filters_from(&mv["filters"]),
+                    layers: mask_layers_from(&mv["layers"]),
                 }),
                 None => None,
             };

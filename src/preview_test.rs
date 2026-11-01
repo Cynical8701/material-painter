@@ -662,6 +662,13 @@ fn ui_screenshots() {
     harness.state_mut().test_add_downloaded();
     harness.run_steps(10);
     harness.render().expect("renders").save(dir.join("library_layer.png")).unwrap();
+    // A smart material saved from the stack and applied again keeps its structure.
+    let ctx = harness.ctx.clone();
+    let [before, after] = harness.state_mut().test_smart_roundtrip(&ctx);
+    println!("  smart material (layers, masks, generators, filters, images, folders): saved {before:?}, applied {after:?}");
+    assert_eq!(before, after, "the smart material round-trips");
+    harness.run_steps(10);
+    harness.render().expect("renders").save(dir.join("smart_roundtrip.png")).unwrap();
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer

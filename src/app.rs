@@ -33,6 +33,7 @@ mod gallery;
 mod graph_ui;
 mod shader_ui;
 mod library_ui;
+mod smart_io;
 mod welcome;
 mod mcp_tools;
 pub(crate) mod prefs;
@@ -360,6 +361,8 @@ enum Action {
     /// Puts a node into the graph open in the Material Designer and shows it.
     GraphAddNode(String),
     AddOnTop(ShelfItem),
+    /// Saves the selected layer (with its folder contents) as a smart material.
+    SaveSmart,
     AddFolder,
     /// Puts the selected layer into a new folder.
     GroupIntoFolder,
@@ -430,6 +433,7 @@ pub struct PainterApp {
     show_welcome: bool,
     welcome_tex: Option<egui::TextureHandle>,
     library: library_ui::LibraryUi,
+    user_smarts: Vec<smart_io::UserSmart>,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
@@ -865,6 +869,8 @@ enum ShelfItem {
     Graph(usize),
     /// A downloaded material (`LibraryUi::local`).
     Library(usize),
+    /// A smart material the user saved or downloaded (`user_smarts`).
+    UserSmart(usize),
 }
 
 /// A layer being dragged in the layer stack.
@@ -912,6 +918,40 @@ impl PainterApp {
         self.library.open = true;
         self.shelf.cat = ShelfCat::Downloaded;
         self.library.test_ready()
+    }
+
+    /// Saves a built-in scanned smart material as a user smart material and
+    /// applies it again (offscreen UI tests). Returns a summary of the
+    /// original and the applied block: (layers, masks, generators, filters,
+    /// images, folders).
+    #[cfg(test)]
+    pub(crate) fn test_smart_roundtrip(&mut self, ctx: &egui::Context) -> [[usize; 6]; 2] {
+        let k = presets::SMART_MATERIALS.iter().position(|s| s.is_scanned()).expect("a scanned smart material");
+        let at = self.engine.layers.len();
+        self.selected = add_smart_material(&mut self.engine, &mut self.undo, &presets::SMART_MATERIALS[k], at, None);
+        // A mask filter, which smart materials must keep.
+        let first = self.engine.block(self.selected).start;
+        if let Some(m) = self.engine.layers[first..self.selected].iter_mut().find_map(|l| l.mask.as_mut()) {
+            m.filters.push(crate::engine::MaskFilter::new(crate::engine::FilterKind::ALL[0]));
+        }
+        let summary = |e: &Engine, top: usize| {
+            let b = e.block(top);
+            let ls = &e.layers[b];
+            [
+                ls.len(),
+                ls.iter().filter(|l| l.mask.is_some()).count(),
+                ls.iter().filter(|l| l.mask.as_ref().is_some_and(|m| m.generator.is_some())).count(),
+                ls.iter().map(|l| l.mask.as_ref().map_or(0, |m| m.filters.len())).sum(),
+                ls.iter().map(|l| l.images.iter().flatten().count()).sum(),
+                ls.iter().filter(|l| l.is_folder()).count(),
+            ]
+        };
+        let before = summary(&self.engine, self.selected);
+        self.save_smart_material(ctx);
+        let path = self.user_smarts.iter().find(|s| s.name.starts_with(presets::SMART_MATERIALS[k].name)).expect("saved").path.clone();
+        let at = self.engine.layers.len();
+        self.apply_smart_material(&path, at, None);
+        [before, summary(&self.engine, self.selected)]
     }
 
     /// Closes the library and adds the first downloaded material as a layer
@@ -1045,6 +1085,7 @@ impl PainterApp {
             show_welcome: false,
             welcome_tex: None,
             library: Default::default(),
+            user_smarts: smart_io::list(&cc.egui_ctx),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
@@ -1315,6 +1356,7 @@ impl PainterApp {
                     self.engine.remove_mask(self.selected, &mut self.undo);
                     self.target = StrokeTarget::Content;
                 }
+                Action::SaveSmart => self.save_smart_material(ctx),
                 Action::Duplicate => {
                     if let Some(i) = self.engine.duplicate_layer(self.selected, &mut self.undo) {
                         self.selected = i;
@@ -1352,6 +1394,11 @@ impl PainterApp {
                         }
                     }
                     ShelfItem::Library(i) => self.add_library_material(i, at, parent),
+                    ShelfItem::UserSmart(i) => {
+                        if let Some(path) = self.user_smarts.get(i).map(|s| s.path.clone()) {
+                            self.apply_smart_material(&path, at, parent);
+                        }
+                    }
                 },
                 Action::AddGraphLayer => self.add_graph_layer(None, at, parent),
                 Action::AddGraphPreset(i) => {
@@ -1877,6 +1924,7 @@ impl PainterApp {
         item(ui, true, "Open graph in Material Designer (Ctrl+G)", || Action::EditGraph);
         item(ui, has_mask, "Remove mask", || Action::RemoveMask);
         ui.separator();
+        item(ui, has, "Save as smart material", || Action::SaveSmart);
         item(ui, has, "Duplicate layer", || Action::Duplicate);
         item(ui, is_paint, "Clear layer", || Action::Clear);
         item(ui, has, "Delete layer", || Action::Delete);
@@ -3404,7 +3452,7 @@ impl PainterApp {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (cat, icon, name, count) in [
-                    (ShelfCat::SmartMaterials, icons::SPARKLE, "Smart materials", presets::SMART_MATERIALS.len()),
+                    (ShelfCat::SmartMaterials, icons::SPARKLE, "Smart materials", presets::SMART_MATERIALS.len() + self.user_smarts.len()),
                     (ShelfCat::Materials, icons::SPHERE, "Materials", presets::MATERIALS.len()),
                     (ShelfCat::Generators, icons::MAGIC_WAND, "Generators", GenKind::ALL.len()),
                     (ShelfCat::Brushes, icons::PAINT_BRUSH, "Brushes", crate::brushes::BRUSH_ALPHAS.len()),
@@ -3439,7 +3487,7 @@ impl PainterApp {
                     }
                     ui.add(egui::TextEdit::singleline(&mut self.shelf.search).hint_text("Search…").desired_width(200.0));
                     let hint = match self.shelf.cat {
-                        ShelfCat::SmartMaterials => "Double-click or drag onto a view to add a smart material (a folder of layers).",
+                        ShelfCat::SmartMaterials => "Double-click or drag onto a view to add a smart material (a folder of layers). Save your own: right-click a folder in Layers → Save as smart material.",
                         ShelfCat::Materials => "Double-click or drag onto a view to add as a fill layer. Right-click for more.",
                         ShelfCat::Generators => "Double-click or drag onto a view to mask the selected layer.",
                         ShelfCat::Brushes => "Double-click or drag onto a view to paint with this brush tip.",
@@ -3464,6 +3512,7 @@ impl PainterApp {
                 let icon = self.shelf.icon_size;
                 let search = self.shelf.search.to_lowercase();
                 let mut share = None;
+                let mut share_smart = None;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -3519,6 +3568,26 @@ impl PainterApp {
                                 }
                             }
                             ShelfCat::SmartMaterials => {
+                                // Your own first, marked with a badge.
+                                let fallback = self.shelf.smart.first().map(|t| t.id());
+                                for i in 0..self.user_smarts.len() {
+                                    let s = &self.user_smarts[i];
+                                    if !s.name.to_lowercase().contains(&search) {
+                                        continue;
+                                    }
+                                    let Some(tex) = s.thumb.as_ref().map(|t| t.id()).or(fallback) else { continue };
+                                    let resp = Self::swatch(ui, tex, &s.name.clone(), icon);
+                                    let at = resp.rect.left_top() + vec2(8.0, 6.0);
+                                    let g = ui.painter().layout_no_wrap("MINE".into(), egui::FontId::proportional(8.5), Color32::WHITE);
+                                    let r = Rect::from_min_size(at, g.size() + vec2(6.0, 2.0));
+                                    ui.painter().rect_filled(r, 0.0, theme::DONATE.gamma_multiply(0.9));
+                                    ui.painter().galley(r.min + vec2(3.0, 1.0), g, Color32::WHITE);
+                                    resp.dnd_set_drag_payload(ShelfItem::UserSmart(i));
+                                    if resp.double_clicked() {
+                                        self.pending.push(Action::AddOnTop(ShelfItem::UserSmart(i)));
+                                    }
+                                    resp.context_menu(|ui| self.user_smart_menu(ui, i, &mut share_smart));
+                                }
                                 for (i, s) in presets::SMART_MATERIALS.iter().enumerate() {
                                     if !s.name.to_lowercase().contains(&search) {
                                         continue;
@@ -3624,6 +3693,9 @@ impl PainterApp {
                 });
                 if let Some(i) = share {
                     self.share_graph(ui.ctx(), i);
+                }
+                if let Some(path) = share_smart {
+                    self.share_smart(ui.ctx(), &path);
                 }
             });
     }

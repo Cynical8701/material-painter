@@ -155,6 +155,10 @@ impl PainterApp {
                                 Kind::Node => {
                                     self.status = "Downloaded. The node is in the Material Designer's add-node menu.".into();
                                 }
+                                Kind::Smart => {
+                                    self.reload_user_smarts(ctx);
+                                    self.status = "Downloaded. It's first in the shelf's Smart materials.".into();
+                                }
                             }
                         }
                         Err(e) => self.status = format!("Download failed: {e}"),
@@ -214,7 +218,7 @@ impl PainterApp {
             });
         });
         let note = match self.library.tab {
-            Source::Community => "Graphs and nodes made by Material Painter users. Share yours: right-click a graph on the shelf → Share to community.",
+            Source::Community => "Smart materials, graphs and nodes made by Material Painter users. Share yours: right-click it on the shelf → Share to community.",
             _ => "Free CC0 (public domain) materials: use them for anything, no credit needed. Click to download; they go on the shelf under Downloaded.",
         };
         ui.label(egui::RichText::new(note).small().color(theme::TEXT_DIM));
@@ -253,7 +257,7 @@ impl PainterApp {
         };
         if entries.is_empty() {
             let msg = if tab == Source::Community && search.is_empty() {
-                "The community library is empty for now. Be the first: right-click a graph on the shelf → Share to community."
+                "The community library is empty for now. Be the first: right-click a smart material or graph on the shelf → Share to community."
             } else {
                 "Nothing matches your search."
             };
@@ -399,7 +403,21 @@ impl PainterApp {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        match library::package_graph(&path, &user_nodes, &name) {
+        let thumb = std::fs::read(path.with_extension("png")).ok();
+        self.share_package(ctx, Kind::Graph, &path, thumb, &user_nodes, &name);
+    }
+
+    /// Packs a user smart material (with any custom nodes its graphs use) for
+    /// the community library and opens the submission page.
+    pub(super) fn share_smart(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let name = path.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned());
+        let nodes = self.smart_user_nodes(path);
+        let thumb = Self::smart_thumb_png(path);
+        self.share_package(ctx, Kind::Smart, path, thumb, &nodes, &name);
+    }
+
+    fn share_package(&mut self, ctx: &egui::Context, kind: Kind, path: &std::path::Path, thumb: Option<Vec<u8>>, user_nodes: &[std::path::PathBuf], name: &str) {
+        match library::package(kind, path, thumb, user_nodes, name) {
             Ok((dir, zip)) => {
                 open_in_file_browser(&dir.parent().unwrap_or(&dir).to_path_buf());
                 ctx.open_url(egui::OpenUrl::new_tab(library::submit_url(&name)));
@@ -420,5 +438,6 @@ fn kind_label(kind: Kind) -> &'static str {
         Kind::Material => "Material",
         Kind::Graph => "Graph",
         Kind::Node => "Node",
+        Kind::Smart => "Smart material",
     }
 }
