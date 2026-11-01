@@ -476,27 +476,30 @@ pub(crate) fn feature_edges(
 
 /// Mean curvature at each vertex of a mesh, from how its shading normals
 /// turn toward its neighbors: (n_j - n_i)·(p_j - p_i) / |p_j - p_i|²,
-/// averaged. Vertices that share a position and normal (copies along UV
-/// seams) are one sample; split normals (hard edges) stay apart, so flat
-/// faces read as flat.
+/// averaged. Vertices that share a position and (within a degree) a normal
+/// are one sample: copies along UV seams weld; split normals (hard edges)
+/// stay apart, so flat faces read as flat.
+///
+/// The result is then smoothed over the welded mesh (neighbors weighted by
+/// distance), which removes the fan pattern a coarse mesh's triangles leave
+/// when the values are interpolated, without ever seeing a UV seam: meshes
+/// cut into many small UV islands smooth as one surface.
 ///
 /// Interpolated across each triangle this gives smooth, continuous
 /// curvature. Measuring it per texel from interpolated normals instead
 /// gives one constant per triangle, which shows the triangles on a dense
 /// mesh as faceted steps.
-pub(crate) fn vertex_curvature(positions: &[Vec3], normals: &[Vec3], indices: &[u32]) -> Vec<f32> {
-    let mut group: HashMap<([i32; 3], [i32; 3]), u32> = HashMap::with_capacity(positions.len());
-    let ids: Vec<u32> = positions
-        .iter()
-        .zip(normals)
-        .map(|(p, n)| {
-            let key = ((*p * 1.0e4).round().as_ivec3().to_array(), (*n * 1.0e3).round().as_ivec3().to_array());
-            let next = group.len() as u32;
-            *group.entry(key).or_insert(next)
-        })
-        .collect();
-    let mut sum = vec![0.0f32; group.len()];
-    let mut count = vec![0u32; group.len()];
+///
+/// `limit` is the curvature the map saturates at: values past it look the
+/// same in the map but would swamp their neighbors when smoothing (a thin
+/// edge's curvature is huge), so they're clamped first.
+pub(crate) fn vertex_curvature(positions: &[Vec3], normals: &[Vec3], indices: &[u32], limit: f32) -> Vec<f32> {
+    let ids = weld_groups(positions, normals);
+    let groups = ids.iter().map(|&g| g as usize + 1).max().unwrap_or(0);
+    let mut sum = vec![0.0f32; groups];
+    let mut count = vec![0u32; groups];
+    // Welded edges (both directions) with their length, for smoothing.
+    let mut edges: Vec<(u32, u32, f32)> = Vec::with_capacity(indices.len() * 2);
     for tri in indices.chunks_exact(3) {
         for k in 0..3 {
             let (i, j) = (tri[k] as usize, tri[(k + 1) % 3] as usize);
@@ -511,9 +514,62 @@ pub(crate) fn vertex_curvature(positions: &[Vec3], normals: &[Vec3], indices: &[
                 sum[ids[v] as usize] += k_ij;
                 count[ids[v] as usize] += 1;
             }
+            let (gi, gj) = (ids[i], ids[j]);
+            if gi != gj {
+                let l = l2.sqrt();
+                edges.push((gi, gj, l));
+                edges.push((gj, gi, l));
+            }
         }
     }
-    ids.iter().map(|&g| sum[g as usize] / count[g as usize].max(1) as f32).collect()
+    let mut k: Vec<f32> = sum.iter().zip(&count).map(|(s, &c)| (s / c.max(1) as f32).clamp(-limit, limit)).collect();
+    // Two diffusion passes; each neighbor weighs like a Gaussian of its
+    // distance relative to the vertex's own edge length.
+    let mut mean_len = vec![0.0f32; groups];
+    let mut n_len = vec![0u32; groups];
+    for &(a, _, l) in &edges {
+        mean_len[a as usize] += l;
+        n_len[a as usize] += 1;
+    }
+    for (m, &n) in mean_len.iter_mut().zip(&n_len) {
+        *m /= n.max(1) as f32;
+    }
+    for _ in 0..2 {
+        let mut acc: Vec<f32> = k.clone();
+        let mut wsum = vec![1.0f32; groups];
+        for &(a, b, l) in &edges {
+            let s = mean_len[a as usize].max(1e-9);
+            let w = (-0.5 * (l / s) * (l / s)).exp();
+            acc[a as usize] += k[b as usize] * w;
+            wsum[a as usize] += w;
+        }
+        k = acc.iter().zip(&wsum).map(|(a, w)| a / w).collect();
+    }
+    ids.iter().map(|&g| k[g as usize]).collect()
+}
+
+/// Welds vertices for curvature: same position (to 1e-4 of the unit-sized
+/// mesh) and normals within about a degree share a group.
+fn weld_groups(positions: &[Vec3], normals: &[Vec3]) -> Vec<u32> {
+    let mut by_pos: HashMap<[i32; 3], Vec<(Vec3, u32)>> = HashMap::with_capacity(positions.len());
+    let mut next = 0u32;
+    positions
+        .iter()
+        .zip(normals)
+        .map(|(p, n)| {
+            let key = (*p * 1.0e4).round().as_ivec3().to_array();
+            let list = by_pos.entry(key).or_default();
+            let n = n.normalize_or_zero();
+            match list.iter().find(|(m, _)| m.dot(n) > 0.99985) {
+                Some(&(_, g)) => g,
+                None => {
+                    list.push((n, next));
+                    next += 1;
+                    next - 1
+                }
+            }
+        })
+        .collect()
 }
 
 /// Packs edge-segment sets into one node and segment buffer: a BVH per set,
@@ -723,7 +779,7 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, Str
 
     // Curvature comes from the source mesh's vertices (see
     // `vertex_curvature`) and rides in the normal's w.
-    let curvature = vertex_curvature(&positions, &normals, &indices);
+    let curvature = vertex_curvature(&positions, &normals, &indices, 1.0 / settings.curvature_scale_for(low).max(1e-6));
     let mut tri_pos = Vec::with_capacity(bvh.order.len() * 3);
     let mut tri_nrm = Vec::with_capacity(bvh.order.len() * 3);
     for &t in &bvh.order {
@@ -1204,8 +1260,11 @@ impl GpuBaker {
         pipeline: &(wgpu::ComputePipeline, wgpu::BindGroupLayout),
         run: &BakeRun,
         maps: &[(&Tex, &Tex, u32, u32)],
+        passes: u32,
     ) {
-        for i in 0..6 {
+        // An even count ends back in the source texture.
+        debug_assert!(passes % 2 == 0);
+        for i in 0..passes {
             let mut u = run.uniform;
             u.e[2] = (1u32 << i) as f32;
             let buf = Self::uniform_buffer(device, &u);
@@ -1535,7 +1594,7 @@ impl GpuBaker {
         // Triangle-scale smoothing (see `cs_curv_smooth`), before edges are
         // seeded from it. An even pass count ends back in `curv`.
         let curv_scratch = Tex::new(device, "curvature 2", res, res, F::Rgba16Float, usage);
-        Self::smooth_passes(device, &mut encoder, &self.curv_smooth, run, &[(&curv, &curv_scratch, 18, 17)]);
+        Self::smooth_passes(device, &mut encoder, &self.curv_smooth, run, &[(&curv, &curv_scratch, 18, 17)], 2);
         let g = Self::group(
             device,
             &self.jfa_init.1,
@@ -1632,6 +1691,7 @@ impl GpuBaker {
             &self.occ_smooth,
             run,
             &[(&run.occ, &scratch[0], 21, 15), (&run.bent, &scratch[1], 22, 16)],
+            6,
         );
 
         let maps = run.maps.take().unwrap();
@@ -1816,11 +1876,11 @@ pub(crate) mod tests {
         let p: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.pos)).collect();
         let n: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.normal)).collect();
         let r = p.iter().map(|p| p.length()).sum::<f32>() / p.len() as f32;
-        let k = vertex_curvature(&p, &n, &mesh.indices);
+        let k = vertex_curvature(&p, &n, &mesh.indices, f32::INFINITY);
         let mean = k.iter().sum::<f32>() / k.len() as f32;
         assert!((mean * r - 1.0).abs() < 0.02, "mean curvature {mean}, radius {r}");
         let inward: Vec<Vec3> = n.iter().map(|n| -*n).collect();
-        let k_in = vertex_curvature(&p, &inward, &mesh.indices);
+        let k_in = vertex_curvature(&p, &inward, &mesh.indices, f32::INFINITY);
         assert!(k_in.iter().all(|&k| k < 0.0));
     }
 

@@ -819,3 +819,156 @@ fn preview_shaders_compile_and_render() {
         println!("  {name} -> {}", file.display());
     }
 }
+
+/// Reads a project's mesh (`MP_PROJECT=path.mpp`), reports what's wrong with
+/// it (degenerate and flipped UV triangles, overlapping UVs, ...), bakes it
+/// with the project's bake settings and writes every map to
+/// `target/bake_test/project/`. For diagnosing bake artifacts.
+#[test]
+#[ignore]
+fn project_bake() {
+    use glam::Vec2;
+    let Ok(path) = std::env::var("MP_PROJECT") else {
+        println!("set MP_PROJECT to a .mpp file");
+        return;
+    };
+    let data = std::fs::read(&path).expect("project file");
+    let u64_at = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
+    let len = u64_at(8);
+    let manifest: serde_json::Value = serde_json::from_slice(&data[16..16 + len]).unwrap();
+    let mut at = 16 + len;
+    let count = u64_at(at);
+    at += 8;
+    let mut blobs = Vec::new();
+    for _ in 0..count {
+        let n = u64_at(at);
+        blobs.push(lz4_flex::decompress_size_prepended(&data[at + 8..at + 8 + n]).unwrap());
+        at += 8 + n;
+    }
+    let m = &manifest["mesh"];
+    let blob = |k: &str| &blobs[m[k].as_u64().unwrap() as usize];
+    let vertices: Vec<crate::mesh::Vertex> = bytemuck::pod_collect_to_vec(blob("vertices"));
+    let indices: Vec<u32> = bytemuck::pod_collect_to_vec(blob("indices"));
+    let c: Vec<f32> = m["center"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    let mesh = Mesh::from_saved("project".into(), vertices, indices, Vec3::new(c[0], c[1], c[2]), m["scale"].as_f64().unwrap() as f32);
+
+    // ---- mesh health
+    let tris = mesh.indices.len() / 3;
+    let (mut degenerate, mut uv_degenerate, mut outside) = (0, 0, 0);
+    let mut uv_area = 0.0f64;
+    let mut signs = [0usize; 2];
+    let res = 2048usize;
+    let mut cover = vec![0u16; res * res];
+    for t in mesh.indices.chunks_exact(3) {
+        let v = [t[0], t[1], t[2]].map(|i| &mesh.vertices[i as usize]);
+        let p = v.map(|v| Vec3::from_array(v.pos));
+        let uv = v.map(|v| Vec2::from_array(v.uv));
+        if (p[1] - p[0]).cross(p[2] - p[0]).length() < 1e-10 {
+            degenerate += 1;
+        }
+        let a = (uv[1] - uv[0]).perp_dot(uv[2] - uv[0]);
+        uv_area += (a.abs() * 0.5) as f64;
+        if a.abs() < 1e-12 {
+            uv_degenerate += 1;
+        } else {
+            signs[(a < 0.0) as usize] += 1;
+        }
+        if uv.iter().any(|u| u.x < 0.0 || u.y < 0.0 || u.x > 1.0 || u.y > 1.0) {
+            outside += 1;
+        }
+        // Rasterize to count texels covered more than once (overlapping UVs).
+        let px = uv.map(|u| u * res as f32);
+        let lo = px[0].min(px[1]).min(px[2]).max(Vec2::ZERO);
+        let hi = px[0].max(px[1]).max(px[2]).min(Vec2::splat(res as f32 - 1.0));
+        if lo.x > hi.x || lo.y > hi.y {
+            continue;
+        }
+        for y in lo.y as usize..=hi.y as usize {
+            for x in lo.x as usize..=hi.x as usize {
+                let q = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let e = |a: Vec2, b: Vec2| (b - a).perp_dot(q - a);
+                let (w0, w1, w2) = (e(px[1], px[2]), e(px[2], px[0]), e(px[0], px[1]));
+                if (w0 > 0.0 && w1 > 0.0 && w2 > 0.0) || (w0 < 0.0 && w1 < 0.0 && w2 < 0.0) {
+                    cover[y * res + x] = cover[y * res + x].saturating_add(1);
+                }
+            }
+        }
+    }
+    let flipped = signs[0].min(signs[1]);
+    let covered = cover.iter().filter(|&&c| c > 0).count();
+    let overlapped = cover.iter().filter(|&&c| c > 1).count();
+    // Seams: vertices sharing a position but not a UV.
+    let mut by_pos: std::collections::HashMap<[u32; 3], Vec<[u32; 2]>> = Default::default();
+    for v in &mesh.vertices {
+        by_pos.entry(v.pos.map(f32::to_bits)).or_default().push(v.uv.map(f32::to_bits));
+    }
+    let seam_verts = by_pos.values().filter(|uvs| uvs.iter().any(|u| *u != uvs[0])).count();
+    println!("  mesh: {tris} tris, {} verts ({} unique positions, {seam_verts} on UV seams)", mesh.vertices.len(), by_pos.len());
+    println!("  degenerate tris: {degenerate} (3D), {uv_degenerate} (UV); flipped UV tris: {flipped} of {}; tris with UVs outside 0-1: {outside}", signs[0] + signs[1]);
+    println!(
+        "  UV area used: {:.1}%; texels covered {:.1}%, of which overlapping {:.2}% ({overlapped} texels at {res}^2)",
+        uv_area * 100.0,
+        covered as f64 / (res * res) as f64 * 100.0,
+        overlapped as f64 / covered.max(1) as f64 * 100.0
+    );
+    let ov: Vec<u8> = cover.iter().map(|&c| match c {
+        0 => 0,
+        1 => 90,
+        _ => 255,
+    }).collect();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/project");
+    std::fs::create_dir_all(&dir).unwrap();
+    image::save_buffer(dir.join("uv_coverage.png"), &ov, res as u32, res as u32, image::ExtendedColorType::L8).unwrap();
+
+    // ---- bake with the project's settings
+    let bv = &manifest["bake"];
+    let mut settings = BakeSettings::default();
+    if let Some(q) = bv["quality"].as_str().and_then(|q| crate::bake::Quality::ALL.into_iter().find(|x| format!("{x:?}") == q)) {
+        settings.apply_quality(q);
+    }
+    let fl = |k: &str, d: f32| bv[k].as_f64().map_or(d, |v| v as f32);
+    settings.ao_distance = fl("ao_distance", settings.ao_distance);
+    settings.cavity_distance = fl("cavity_distance", settings.cavity_distance);
+    settings.thickness_distance = fl("thickness_distance", settings.thickness_distance);
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let bake_res: u32 = std::env::var("MP_BAKE_RES").ok().and_then(|r| r.parse().ok()).unwrap_or(2048);
+    let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &settings, bake_res);
+    let packed: Vec<Vec<u8>> = maps.iter().map(|t| read_texture(&rs.device, &rs.queue, t)).collect();
+    let fmt: Vec<_> = maps.iter().map(|t| t.format).collect();
+    for mi in MAPS.iter() {
+        let (bytes, f) = (&packed[mi.tex], fmt[mi.tex]);
+        let px = |i: usize| -> [f32; 4] {
+            match f {
+                wgpu::TextureFormat::Rgba16Float => {
+                    let b = &bytes[i * 8..i * 8 + 8];
+                    [0, 1, 2, 3].map(|k| crate::gpu::f16_to_f32(u16::from_le_bytes([b[k * 2], b[k * 2 + 1]])))
+                }
+                _ => [0, 1, 2, 3].map(|k| bytes[i * 4 + k] as f32 / 255.0),
+            }
+        };
+        let n = (bake_res * bake_res) as usize;
+        let img: Vec<u8> = (0..n).map(|i| (px(i)[mi.comp].clamp(0.0, 1.0) * 255.0) as u8).collect();
+        let name = mi.name.to_lowercase().replace(' ', "_");
+        image::save_buffer(dir.join(format!("map_{name}.png")), &img, bake_res, bake_res, image::ExtendedColorType::L8).unwrap();
+    }
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), bake_res);
+    engine.set_maps(maps, report);
+    engine.composite();
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
+    for (cname, yaw) in [("front", 0.0f32), ("back", std::f32::consts::PI), ("side", 1.3)] {
+        let cam = OrbitCam { target: center, dist: 3.0, yaw, pitch: 0.15, ..Default::default() };
+        for mname in ["Ambient Occlusion", "Curvature", "Normal", "Cavity", "Edge Distance", "Thickness"] {
+            let mode = ViewMode::all().into_iter().find(|v| v.name() == mname).unwrap_or(ViewMode::Material);
+            views.render_3d(&rs, [900, 900], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode, ..Default::default() }, None);
+            let img = views.view3d.image();
+            let bytes = read_texture(&rs.device, &rs.queue, img);
+            let file = dir.join(format!("view_{cname}_{}.png", mname.to_lowercase().replace(' ', "_")));
+            image::save_buffer(&file, &bytes, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+        }
+    }
+    println!("  wrote {}", dir.display());
+}

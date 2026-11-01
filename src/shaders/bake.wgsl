@@ -826,8 +826,11 @@ fn cs_curv_smooth(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(curv_w, c, v0);
         return;
     }
-    // Half a triangle, and at least the curvature radius setting (pixels).
-    let sigma = max(max(u.c.w, 1.0) * s.texel, s.tri * 0.5);
+    // The curvature radius setting (pixels). The vertex curvature is already
+    // smooth across the mesh (see `vertex_curvature`), so this only evens
+    // out the interpolation; a wider blur here would smooth each UV island
+    // on its own and show its borders on meshes cut into many islands.
+    let sigma = max(u.c.w, 1.0) * s.texel;
     let step = i32(u.e.z);
     let kernel = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
     var acc = 0.0;
@@ -861,7 +864,10 @@ fn cs_occ_smooth(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(bent_w, c, b0);
         return;
     }
-    let want = s.tri * 0.5;
+    // Half a triangle (rays follow a coarse mesh's facets), but at most a
+    // few texels: the pass smooths each UV island on its own, so a wider
+    // blur shows island borders on meshes cut into many small islands.
+    let want = min(s.tri * 0.5, 4.0 * s.texel);
     let ao_sigma = clamp(want, s.texel, max(u.b.y * 0.05, s.texel));
     let sigma = vec4<f32>(
         ao_sigma,
