@@ -679,7 +679,9 @@ pub(crate) fn stroke_region(
 fn notices_path() -> Option<std::path::PathBuf> {
     let name = "THIRD_PARTY_NOTICES.html";
     let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
-    exe_dir.into_iter().chain(std::env::current_dir().ok()).map(|d| d.join(name)).find(|p| p.is_file())
+    // A macOS app bundle keeps it in Contents/Resources, beside Contents/MacOS.
+    let resources = exe_dir.as_ref().and_then(|d| d.parent()).map(|c| c.join("Resources"));
+    exe_dir.into_iter().chain(resources).chain(std::env::current_dir().ok()).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// HDRI preview pictures: width, height.

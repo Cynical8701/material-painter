@@ -136,11 +136,12 @@ fn assets_dir() -> Option<PathBuf> {
 }
 
 /// `assets/<name>`, looked up from the working directory and the
-/// executable's folders (so it works from target/debug and installs).
+/// executable's folders (so it works from target/debug and installs), and
+/// their `Resources` folders (a macOS app keeps it in `Contents/Resources`).
 pub(crate) fn asset_dir(name: &str) -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = std::env::current_dir().into_iter().collect();
     if let Ok(exe) = std::env::current_exe() {
-        roots.extend(exe.ancestors().skip(1).map(Path::to_path_buf));
+        roots.extend(exe.ancestors().skip(1).flat_map(|d| [d.to_path_buf(), d.join("Resources")]));
     }
     roots.into_iter().map(|r| r.join("assets").join(name)).find(|d| d.is_dir())
 }
