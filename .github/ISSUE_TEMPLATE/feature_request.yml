@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest something new or better.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: Check the roadmap on Discord and search the issues first; if it's there, add a 👍 to that issue instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the problem, not just the fix. "I want wear to follow scratches I painted" helps more than "add anchor points".
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could Material Painter help?
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: Does another tool do this well?
+      description: Which one, and how. Screenshots welcome.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to work on this myself.

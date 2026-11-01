@@ -86,6 +86,8 @@ cargo test --bin material_painter -- --ignored --test-threads 1
 Questions, renders and shared materials: join the [Discord](https://discord.gg/TqKD5xKp7Y).
 Bugs and feature requests are welcome there or as [GitHub issues](https://github.com/alla2001/material-painter/issues).
 
+Want to help build it? See [CONTRIBUTING.md](CONTRIBUTING.md) (AI-assisted contributions are welcome; [AGENTS.md](AGENTS.md) is the guide for coding agents).
+
 If Material Painter is useful to you, a donation keeps development going:
 
 <a href="https://ko-fi.com/allaeddinerakik"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support Material Painter on Ko-fi" height="44"></a>

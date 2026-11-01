@@ -1,0 +1,51 @@
+name: Bug report
+description: Something is broken, crashes or looks wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting! One bug per issue, please, and check that it isn't already reported.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Help → About Material Painter
+      placeholder: "0.1.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, Linux, macOS]
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: Shown in Help → About Material Painter.
+      placeholder: "NVIDIA RTX 3060, driver 566.36"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. New project on the Material Ball
+        2. Drag "Rusty Iron" onto the mesh
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Screenshots, mesh or crash log
+      description: For crashes, attach the newest file from Help → Open crash reports folder. Drag images and files here.

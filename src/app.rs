@@ -4397,6 +4397,10 @@ impl PainterApp {
             ui.set_width(360.0);
             ui.label(egui::RichText::new("Material Painter").heading().color(Color32::WHITE));
             ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT_DIM));
+            if let Some(gpu) = crate::crash::context() {
+                // Selectable, so it can be copied into bug reports.
+                ui.add(egui::Label::new(egui::RichText::new(format!("GPU: {gpu}")).color(theme::TEXT_DIM)).selectable(true));
+            }
             ui.add_space(8.0);
             ui.label("A PBR texture painter: layers, smart materials and masks, mesh map baking, material graphs and custom node shaders.");
             ui.add_space(8.0);

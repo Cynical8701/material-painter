@@ -32,6 +32,11 @@ pub fn set_context(context: String) {
     let _ = CONTEXT.set(context);
 }
 
+/// The GPU and driver line recorded at startup, for the About window.
+pub fn context() -> Option<&'static str> {
+    CONTEXT.get().map(String::as_str)
+}
+
 /// Writes a crash report on any panic, then runs the default handler.
 pub fn install() {
     let previous = std::panic::take_hook();
