@@ -851,25 +851,7 @@ fn project_bake() {
         println!("set MP_PROJECT to a .mpp file");
         return;
     };
-    let data = std::fs::read(&path).expect("project file");
-    let u64_at = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
-    let len = u64_at(8);
-    let manifest: serde_json::Value = serde_json::from_slice(&data[16..16 + len]).unwrap();
-    let mut at = 16 + len;
-    let count = u64_at(at);
-    at += 8;
-    let mut blobs = Vec::new();
-    for _ in 0..count {
-        let n = u64_at(at);
-        blobs.push(lz4_flex::decompress_size_prepended(&data[at + 8..at + 8 + n]).unwrap());
-        at += 8 + n;
-    }
-    let m = &manifest["mesh"];
-    let blob = |k: &str| &blobs[m[k].as_u64().unwrap() as usize];
-    let vertices: Vec<crate::mesh::Vertex> = bytemuck::pod_collect_to_vec(blob("vertices"));
-    let indices: Vec<u32> = bytemuck::pod_collect_to_vec(blob("indices"));
-    let c: Vec<f32> = m["center"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
-    let mesh = Mesh::from_saved("project".into(), vertices, indices, Vec3::new(c[0], c[1], c[2]), m["scale"].as_f64().unwrap() as f32);
+    let (mesh, manifest) = load_project_mesh(&path);
 
     // ---- mesh health
     let tris = mesh.indices.len() / 3;
@@ -1186,7 +1168,11 @@ fn live_bake_preview() {
 #[ignore]
 fn custom_map_seams() {
     use crate::bake::{CustomKind, CUSTOM_BASE};
-    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    // MP_PROJECT=path.mpp: a real mesh, usually cut into many UV islands.
+    let mesh = match std::env::var("MP_PROJECT") {
+        Ok(path) => load_project_mesh(&path).0,
+        Err(_) => crate::mesh::Primitive::MaterialBall.build(),
+    };
     let rs = render_state();
     let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/custom");
@@ -1201,18 +1187,173 @@ fn custom_map_seams() {
     let mut full = BakeSettings::default();
     full.apply_quality(crate::bake::Quality::Ultra);
     full.custom[0] = Some(c);
+    full.custom[1] = Some(CustomKind::Flow.default_map());
     let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
     for (name, settings, res) in [("preview", full.preview(), 512), ("refined", full.preview(), 1024), ("full", full.clone(), 2048)] {
         let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &settings, res);
+        seam_report(&rs, &mesh, &maps, res, name);
         let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 2048);
         engine.set_maps(maps, report);
         engine.composite();
         for (cname, yaw, pitch) in [("right", 0.9f32, 0.35f32), ("left", -0.6, 0.35)] {
             let cam = OrbitCam { target: center - Vec3::Y * 0.4, dist: 2.2, yaw, pitch, ..Default::default() };
-            views.render_3d(&rs, [900, 700], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode: ViewMode::Map(CUSTOM_BASE), ..Default::default() }, None);
+            for (slot, map) in [(0, "deposit"), (1, "flow")] {
+                views.render_3d(&rs, [900, 700], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode: ViewMode::Map(CUSTOM_BASE + slot), ..Default::default() }, None);
+                let img = views.view3d.image();
+                let px = read_texture(&rs.device, &rs.queue, img);
+                image::save_buffer(dir.join(format!("seams_{map}_{name}_{cname}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+            }
+        }
+    }
+}
+
+/// A project file's mesh and its manifest (for tests that bake a real project).
+fn load_project_mesh(path: &str) -> (Mesh, serde_json::Value) {
+    let data = std::fs::read(&path).expect("project file");
+    let u64_at = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
+    let len = u64_at(8);
+    let manifest: serde_json::Value = serde_json::from_slice(&data[16..16 + len]).unwrap();
+    let mut at = 16 + len;
+    let count = u64_at(at);
+    at += 8;
+    let mut blobs = Vec::new();
+    for _ in 0..count {
+        let n = u64_at(at);
+        blobs.push(lz4_flex::decompress_size_prepended(&data[at + 8..at + 8 + n]).unwrap());
+        at += 8 + n;
+    }
+    let m = &manifest["mesh"];
+    let blob = |k: &str| &blobs[m[k].as_u64().unwrap() as usize];
+    let vertices: Vec<crate::mesh::Vertex> = bytemuck::pod_collect_to_vec(blob("vertices"));
+    let indices: Vec<u32> = bytemuck::pod_collect_to_vec(blob("indices"));
+    let c: Vec<f32> = m["center"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    let mesh = Mesh::from_saved("project".into(), vertices, indices, Vec3::new(c[0], c[1], c[2]), m["scale"].as_f64().unwrap() as f32);
+
+    (mesh, manifest)
+}
+
+/// How much each scalar map jumps across UV seams: along every seam edge,
+/// the value just inside the island on one side against the other side
+/// (the same surface point), next to how much it changes between two texels
+/// inside one island. A map without seams has both about equal.
+fn seam_report(rs: &egui_wgpu::RenderState, mesh: &Mesh, maps: &[crate::gpu::Tex], res: u32, name: &str) {
+    use crate::engine::MapKind;
+    use glam::Vec2;
+    let planes: Vec<Vec<[f32; 4]>> = maps
+        .iter()
+        .map(|t| {
+            let bytes = read_texture(&rs.device, &rs.queue, t);
+            match t.format {
+                wgpu::TextureFormat::Rgba16Float => bytes
+                    .chunks_exact(8)
+                    .map(|b| [0, 1, 2, 3].map(|k| crate::gpu::f16_to_f32(u16::from_le_bytes([b[k * 2], b[k * 2 + 1]]))))
+                    .collect(),
+                _ => bytes.chunks_exact(4).map(|b| [0, 1, 2, 3].map(|k| b[k] as f32 / 255.0)).collect(),
+            }
+        })
+        .collect();
+    let at = |plane: &[[f32; 4]], comp: usize, uv: Vec2| -> f32 {
+        let x = ((uv.x * res as f32) as i32).clamp(0, res as i32 - 1) as usize;
+        let y = ((uv.y * res as f32) as i32).clamp(0, res as i32 - 1) as usize;
+        plane[y * res as usize + x][comp]
+    };
+    // Edges by their two (quantized) end positions, with the UVs each
+    // triangle gives them and the triangle's UV centroid.
+    let key = |p: [f32; 3]| (Vec3::from_array(p) * 1e4).round().as_ivec3().to_array();
+    let mut edges: std::collections::HashMap<([i32; 3], [i32; 3]), Vec<(Vec2, Vec2, Vec2)>> = Default::default();
+    for t in mesh.indices.chunks_exact(3) {
+        let v = [t[0], t[1], t[2]].map(|i| &mesh.vertices[i as usize]);
+        let centroid = (Vec2::from_array(v[0].uv) + Vec2::from_array(v[1].uv) + Vec2::from_array(v[2].uv)) / 3.0;
+        for k in 0..3 {
+            let (a, b) = (v[k], v[(k + 1) % 3]);
+            let (ka, kb) = (key(a.pos), key(b.pos));
+            let (ua, ub) = (Vec2::from_array(a.uv), Vec2::from_array(b.uv));
+            let entry = if ka <= kb { ((ka, kb), (ua, ub)) } else { ((kb, ka), (ub, ua)) };
+            edges.entry(entry.0).or_default().push((entry.1.0, entry.1.1, centroid));
+        }
+    }
+    let texel = 1.0 / res as f32;
+    let mut samples: Vec<(Vec2, Vec2, Vec2)> = Vec::new(); // side A, side B, A further in
+    for list in edges.values() {
+        if list.len() != 2 {
+            continue;
+        }
+        let ((a0, a1, ca), (b0, b1, cb)) = (list[0], list[1]);
+        if a0.distance(b0) < texel && a1.distance(b1) < texel {
+            continue; // not a seam
+        }
+        if a0.distance(a1) < 4.0 * texel || b0.distance(b1) < 4.0 * texel {
+            continue; // too short to sample
+        }
+        for t in [0.3f32, 0.5, 0.7] {
+            let (pa, pb) = (a0.lerp(a1, t), b0.lerp(b1, t));
+            let ina = (ca - pa).normalize_or_zero();
+            let inb = (cb - pb).normalize_or_zero();
+            samples.push((pa + ina * 2.0 * texel, pb + inb * 2.0 * texel, pa + ina * 4.0 * texel));
+        }
+    }
+    println!("  {name}: {} seam samples at {res}^2; mean |jump| across seams vs between texels inside an island:", samples.len());
+    for m in MAPS.iter().filter(|m| m.kind == MapKind::Scalar) {
+        let plane = &planes[m.tex];
+        let (mut across, mut inside) = (0.0f64, 0.0f64);
+        for &(a, b, a2) in &samples {
+            across += (at(plane, m.comp, a) - at(plane, m.comp, b)).abs() as f64;
+            inside += (at(plane, m.comp, a) - at(plane, m.comp, a2)).abs() as f64;
+        }
+        let n = samples.len().max(1) as f64;
+        println!("    {:<18} across {:.4}  inside {:.4}  ratio {:.1}", m.name, across / n, inside / n, across / inside.max(1e-9));
+    }
+}
+
+/// Close-ups of the material ball's base with UV seams drawn over the
+/// custom maps and AO, to see whether lines in a map sit on the seams.
+/// Images in `target/bake_test/custom/closeup_*.png`.
+#[test]
+#[ignore]
+fn custom_map_closeups() {
+    use crate::bake::{CustomKind, CUSTOM_BASE};
+    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let mut deposit = CustomKind::Deposit.default_map();
+    deposit.azimuth = 270.0;
+    deposit.spread = 50.0;
+    deposit.distance = 0.6;
+    let mut s = BakeSettings::default();
+    s.apply_quality(crate::bake::Quality::Standard);
+    s.custom = [Some(deposit), Some(CustomKind::Flow.default_map()), Some(CustomKind::Exposure.default_map()), None];
+    let (maps, report, low_pos) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &s, 2048);
+    // Map F's flow channel and the island mask, in UV space.
+    let f = read_texture(&rs.device, &rs.queue, &maps[5]);
+    let flow: Vec<u8> = f.chunks_exact(8).map(|b| (crate::gpu::f16_to_f32(u16::from_le_bytes([b[2], b[3]])).clamp(0.0, 1.0) * 255.0) as u8).collect();
+    image::save_buffer(dir.join("uv_flow.png"), &flow, 2048, 2048, image::ExtendedColorType::L8).unwrap();
+    let lp = read_texture(&rs.device, &rs.queue, &low_pos);
+    let mask: Vec<u8> = lp.chunks_exact(16).map(|b| (f32::from_le_bytes([b[12], b[13], b[14], b[15]]).clamp(0.0, 1.0) * 255.0) as u8).collect();
+    image::save_buffer(dir.join("uv_islands.png"), &mask, 2048, 2048, image::ExtendedColorType::L8).unwrap();
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 2048);
+    engine.set_maps(maps, report);
+    engine.composite();
+    let base = Vec3::new(mesh.bounds_max.x * 0.8, mesh.bounds_min.y + (mesh.bounds_max.y - mesh.bounds_min.y) * 0.2, mesh.bounds_max.z * 0.8);
+    let cam = OrbitCam { target: base, dist: 1.1, yaw: 0.75, pitch: 0.45, ..Default::default() };
+    for (name, mode) in [
+        ("deposit", ViewMode::Map(CUSTOM_BASE)),
+        ("flow", ViewMode::Map(CUSTOM_BASE + 1)),
+        ("exposure", ViewMode::Map(CUSTOM_BASE + 2)),
+        ("ao", map_mode("Ambient Occlusion")),
+        ("sky", map_mode("Sky Exposure")),
+    ] {
+        for seams in [false, true] {
+            let settings = ViewSettings { mode, show_seams_3d: seams, ..Default::default() };
+            views.render_3d(&rs, [800, 800], &engine, &env, &gpu_mesh, &cam, &settings, None);
             let img = views.view3d.image();
             let px = read_texture(&rs.device, &rs.queue, img);
-            image::save_buffer(dir.join(format!("seams_{name}_{cname}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+            let file = dir.join(format!("closeup_{name}{}.png", if seams { "_seams" } else { "" }));
+            image::save_buffer(&file, &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
         }
     }
 }

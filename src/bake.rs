@@ -423,6 +423,23 @@ pub struct PreparedScene {
     cage: Option<Vec<crate::mesh::Vertex>>,
     /// Largest distance from a low-poly corner to its cage corner (0 without a cage).
     cage_reach: f32,
+    /// World units per UV unit on the low poly (on average): a texel's size
+    /// in the world is this over the resolution.
+    uv_scale: f32,
+}
+
+/// World units per UV unit, averaged over the mesh: the square root of its
+/// surface area over the UV area it covers.
+fn uv_scale(mesh: &Mesh) -> f32 {
+    let (mut area, mut uv_area) = (0.0f64, 0.0f64);
+    for t in mesh.indices.chunks_exact(3) {
+        let v = [t[0], t[1], t[2]].map(|i| &mesh.vertices[i as usize]);
+        let p = v.map(|v| Vec3::from_array(v.pos));
+        let uv = v.map(|v| glam::Vec2::from_array(v.uv));
+        area += ((p[1] - p[0]).cross(p[2] - p[0]).length() * 0.5) as f64;
+        uv_area += ((uv[1] - uv[0]).perp_dot(uv[2] - uv[0]).abs() * 0.5) as f64;
+    }
+    if uv_area < 1e-9 { 2.0 } else { (area / uv_area).sqrt() as f32 }
 }
 
 /// A part's name with low/high-poly suffixes and duplicate numbers removed,
@@ -1076,6 +1093,7 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, Str
         matched_names,
         cage,
         cage_reach,
+        uv_scale: uv_scale(low),
     })
 }
 
@@ -1459,6 +1477,7 @@ impl GpuBaker {
                 (13, Tex),
                 (14, Tex),
                 (28, Tex),
+                (35, Tex),
                 (36, StorageTex(F::Rgba16Float)),
             ],
         );
@@ -1665,7 +1684,9 @@ impl GpuBaker {
             d: [s.edge_threshold, scene.edge_max_distance, scene.curvature_scale, if s.high_poly.is_none() { 1.0 } else { 0.0 }],
             e: [0.0, 0.0, 0.0, 1.0],
             f: [scene.edge_roots[0], scene.edge_roots[1], if cage.is_some() { 1.0 } else { 0.0 }, scene.edge_seed_curvature],
-            g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), s.baked_maps() as f32, 0.0, 0.0],
+            // Random ray sets are picked per world cell of about two texels
+            // (see `world_seed` in bake.wgsl).
+            g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), s.baked_maps() as f32, 2.0 * scene.uv_scale / res as f32, 0.0],
             cust: s.custom_uniform(),
         };
         let ubuf = Self::uniform_buffer(device, &uniform);
@@ -1851,6 +1872,7 @@ impl GpuBaker {
                         (13, v(&run.surf_pos)),
                         (14, v(&run.surf_nrm)),
                         (28, v(&run.surf_geo)),
+                        (35, v(&run.surf_curv)),
                         (36, v(map_f)),
                     ],
                 );

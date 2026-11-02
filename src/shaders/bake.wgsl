@@ -26,7 +26,7 @@ struct BakeU {
     d: vec4<f32>,   // edge threshold, edge max distance, curvature scale, low-poly-only flag
     e: vec4<f32>,   // tile x, tile y, JFA / filter step, seed
     f: vec4<f32>,   // convex edge BVH root, concave edge BVH root (-1 = none), has cage, low-poly-only edge seed curvature
-    g: vec4<f32>,   // height range (largest distance above / below the low poly a ray can find), baked-map bits, unused x2
+    g: vec4<f32>,   // height range (largest distance above / below the low poly a ray can find), baked-map bits, random cell size (world), unused
     // Custom map slot k (see `bake::CustomMap`), three vec4 each:
     //   [3k]     kind (0 none), distance, cos(spread), rays
     //   [3k + 1] unit direction the fluid or wind comes from, strength
@@ -256,6 +256,16 @@ fn hash_u(x_in: u32) -> u32 {
     x *= 0x846ca68bu;
     x ^= x >> 16u;
     return x;
+}
+
+// The random seed for rays traced from world point `p`. It changes per world
+// cell of about two texels, not per texel: the texels on both sides of a UV
+// seam are the same surface point, so they pick the same random rays and
+// come out the same. Per-texel seeds gave each side its own noise, which the
+// per-island smoothing then left as a line along every seam.
+fn world_seed(p: vec3<f32>) -> u32 {
+    let q = vec3<i32>(floor(p / max(u.g.z, 1e-6)));
+    return hash_u(bitcast<u32>(q.x) * 73856093u ^ bitcast<u32>(q.y) * 19349663u ^ bitcast<u32>(q.z) * 83492791u);
 }
 
 fn rand2(seed: u32) -> vec2<f32> {
@@ -666,7 +676,7 @@ fn cs_occlusion(@builtin(global_invocation_id) gid: vec3<u32>) {
     // cavity nothing to see.
     let tri_size = textureLoad(surf_curv, c, 0).g;
     let geo_part = textureLoad(surf_geo, c, 0).w;
-    let seed = hash_u(u32(c.y) * 7919u + u32(c.x) * 104729u + u32(u.e.w));
+    let seed = world_seed(p);
     let shift_ao = rand2(seed);
     let shift_th = rand2(seed ^ 0x1b873593u);
     let shift_sky = rand2(seed ^ 0xcc9e2d51u);
@@ -1234,6 +1244,7 @@ fn fluid_catch(p: vec3<f32>, n: vec3<f32>, src: vec3<f32>, cos_spread: f32, r: v
 fn flow_map(p0: vec3<f32>, n0: vec3<f32>, src: vec3<f32>, cos_spread: f32, len: f32, wander: f32, walks: u32, gain: f32, bias: f32, seed: u32) -> f32 {
     let s = len / f32(FLOW_STEPS);
     let freq = 6.0 / max(len, 1e-4);
+    let shift = rand2(seed ^ 0x3c6ef372u);
     var total = 0.0;
     for (var w = 0u; w < walks; w++) {
         var p = p0;
@@ -1242,7 +1253,10 @@ fn flow_map(p0: vec3<f32>, n0: vec3<f32>, src: vec3<f32>, cos_spread: f32, len: 
         var acc = 0.0;
         let offset = vec3<f32>(f32(w) * 17.13, f32(w) * 5.71, f32(w) * 11.37);
         for (var k = 0u; k < FLOW_STEPS; k++) {
-            let wet = fluid_catch(p, n, src, cos_spread, rand2(seed ^ (w * 0x2c1b3c6du + k * 0x297a2d39u)), bias);
+            // The catch directions of all walks and steps form one
+            // low-discrepancy set: far less noise than picking each at random.
+            let dir = hammersley(w * FLOW_STEPS + k, walks * FLOW_STEPS, shift);
+            let wet = fluid_catch(p, n, src, cos_spread, dir, bias);
             acc += wet * s;
             // Upstream: toward the source, along the surface. Where the
             // surface faces the flow head-on (a roof under rain) there is no
@@ -1276,19 +1290,46 @@ fn flow_map(p0: vec3<f32>, n0: vec3<f32>, src: vec3<f32>, cos_spread: f32, len: 
     return total / f32(max(walks, 1u));
 }
 
+// The ray maps below depend on the smooth (interpolated) normal only, never
+// on the face normal of the triangle under the texel: that one changes at
+// every triangle edge, and where a UV seam runs along such an edge the
+// step can't be smoothed away (smoothing stays within a UV island), so it
+// showed as a line along the seam. Rays leaving a faceted surface around
+// its smooth normal can graze the neighboring facets; `fold_on` lets them
+// pass, as for ambient occlusion.
+
+// Ignore hits on the texel's own part, facing the same way, within `reach`
+// (see `fold_reach`).
+fn fold_on(n: vec3<f32>, part: f32, reach: f32) {
+    fold_reach = reach;
+    fold_n = n;
+    fold_part = select(NONE, u32(part), part >= 0.0);
+}
+
+fn fold_off() {
+    fold_reach = 0.0;
+    fold_part = NONE;
+}
+
+// `d` mirrored to the outside of the smooth surface.
+fn outward(d: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let k = dot(d, n);
+    return select(d, normalize(d - 2.0 * k * n), k < 1e-3);
+}
+
 // Exposure to a direction (wind, sandblasting, sun bleaching): how much of
 // a cone around it the surface faces and sees without anything in the way
 // within `dist`.
-fn exposure_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_spread: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
+fn exposure_map(p: vec3<f32>, n: vec3<f32>, src: vec3<f32>, cos_spread: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
     let shift = rand2(seed ^ 0x2545f491u);
     var acc = 0.0;
     for (var i = 0u; i < rays; i++) {
         let d = cone_dir(src, cos_spread, hammersley(i, rays, shift));
         let f = dot(d, n);
-        if (f <= 0.0 || dot(d, gs) <= 0.0) {
+        if (f <= 0.0) {
             continue;
         }
-        if (intersect(p + gs * bias, d, dist, true).tri == NONE) {
+        if (intersect(p + n * bias, d, dist, true).tri == NONE) {
             acc += f;
         }
     }
@@ -1297,7 +1338,7 @@ fn exposure_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_s
 
 // Deposits (sand, snow, dust drifts): ground facing up, sheltered from the
 // wind by something within `dist` upwind.
-fn deposit_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_spread: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
+fn deposit_map(p: vec3<f32>, n: vec3<f32>, src: vec3<f32>, cos_spread: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
     let ground = smoothstep(0.25, 0.75, n.y);
     if (ground <= 0.0) {
         return 0.0;
@@ -1305,8 +1346,8 @@ fn deposit_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_sp
     let shift = rand2(seed ^ 0x68e31da4u);
     var blocked = 0.0;
     for (var i = 0u; i < rays; i++) {
-        let d = above(cone_dir(src, cos_spread, hammersley(i, rays, shift)), gs);
-        if (intersect(p + gs * bias, d, dist, true).tri != NONE) {
+        let d = outward(cone_dir(src, cos_spread, hammersley(i, rays, shift)), n);
+        if (intersect(p + n * bias, d, dist, true).tri != NONE) {
             blocked += 1.0;
         }
     }
@@ -1315,7 +1356,7 @@ fn deposit_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, src: vec3<f32>, cos_sp
 
 // Contact: how close another part of the mesh comes (rays over the whole
 // hemisphere, ignoring the texel's own part), 1 touching, 0 at `dist`.
-fn contact_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, part: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
+fn contact_map(p: vec3<f32>, n: vec3<f32>, part: f32, dist: f32, rays: u32, bias: f32, seed: u32) -> f32 {
     if (part < 0.0) {
         return 0.0;
     }
@@ -1323,8 +1364,8 @@ fn contact_map(p: vec3<f32>, n: vec3<f32>, gs: vec3<f32>, part: f32, dist: f32, 
     let shift = rand2(seed ^ 0x1b56c4e9u);
     var nearest = dist;
     for (var i = 0u; i < rays; i++) {
-        let d = above(cone_dir(n, 0.0, hammersley(i, rays, shift)), gs);
-        let h = intersect(p + gs * bias, d, nearest, false);
+        let d = cone_dir(n, 0.0, hammersley(i, rays, shift));
+        let h = intersect(p + n * bias, d, nearest, false);
         if (h.tri != NONE) {
             nearest = h.t;
         }
@@ -1348,10 +1389,11 @@ fn cs_custom(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = sp.xyz;
     let n = normalize(textureLoad(surf_nrm, c, 0).xyz);
     let geo = textureLoad(surf_geo, c, 0);
-    let gs = normalize(geo.xyz + n);
     let texel = texel_size(c, textureLoad(low_pos, c, 0).xyz);
     let bias = clamp(texel * 0.25, 1e-5, 4e-3);
-    let seed = hash_u(u32(c.y) * 7919u + u32(c.x) * 104729u + 0x51ed27u);
+    // Neighboring facets within reach (see `fold_on`).
+    let reach = max(texel * 1.5, textureLoad(surf_curv, c, 0).g);
+    let seed = world_seed(p) ^ 0x51ed27u;
     var out = vec4<f32>(0.0);
     for (var k = 0u; k < 4u; k++) {
         let a = u.cust[k * 3u];
@@ -1362,9 +1404,17 @@ fn cs_custom(@builtin(global_invocation_id) gid: vec3<u32>) {
         var v = 0.0;
         switch u32(a.x) {
             case 1u: { v = flow_map(p, n, b.xyz, a.z, a.y, q.w, rays, b.w, bias, ks); }
-            case 2u: { v = exposure_map(p, n, gs, b.xyz, a.z, a.y, rays, bias, ks); }
-            case 3u: { v = deposit_map(p, n, gs, b.xyz, a.z, a.y, rays, bias, ks); }
-            case 4u: { v = contact_map(p, n, gs, geo.w, a.y, rays, bias, ks); }
+            case 2u: {
+                fold_on(n, geo.w, min(reach, a.y * 0.1));
+                v = exposure_map(p, n, b.xyz, a.z, a.y, rays, bias, ks);
+                fold_off();
+            }
+            case 3u: {
+                fold_on(n, geo.w, min(reach, a.y * 0.1));
+                v = deposit_map(p, n, b.xyz, a.z, a.y, rays, bias, ks);
+                fold_off();
+            }
+            case 4u: { v = contact_map(p, n, geo.w, a.y, rays, bias, ks); }
             case 5u: { v = 1.0 - smoothstep(0.0, max(a.y, 1e-5), distance(p, q.xyz)); }
             default: {}
         }
