@@ -771,6 +771,117 @@ fn projection_combo(ui: &mut egui::Ui, id: &str, p: &mut BrushProjection) {
         .on_hover_text(p.tip());
 }
 
+/// Smart mask inputs by what they read, for the Add input menu.
+const INPUT_GROUPS: [(&str, &[usize]); 5] = {
+    use crate::engine::gin::*;
+    [
+        ("Shape", &[EDGE, CONVEX, CONCAVE, CREASE, THIN]),
+        ("Light and exposure", &[OCCLUSION, CAVITY, SKY, UP, OVERHANG]),
+        ("Position and parts", &[PART_GRADIENT, WORLD_HEIGHT, PART_RANDOM, ID]),
+        ("Patterns", &[STREAKS, NOISE, GRAIN, CELLS, SCRATCHES]),
+        ("Custom maps", &[CUSTOM, CUSTOM + 1, CUSTOM + 2, CUSTOM + 3]),
+    ]
+};
+
+/// A smart mask input's name; custom bake maps say what they are.
+fn input_name(i: usize, custom: &[Option<bake::CustomMap>; bake::CUSTOM_SLOTS]) -> String {
+    let k = i.wrapping_sub(crate::engine::gin::CUSTOM);
+    match custom.get(k) {
+        Some(Some(c)) => format!("{}  Custom {} · {}", bake_live::kind_icon(c.kind), k + 1, c.kind.name()),
+        Some(None) => format!("Custom {} (not set up)", k + 1),
+        None => GEN_INPUTS[i].0.to_string(),
+    }
+}
+
+/// Which custom bake map a Custom Bake Map mask reads: a list of the maps
+/// set up in the bake window, by what they are.
+fn custom_map_picker(ui: &mut egui::Ui, g: &mut crate::engine::Generator, salt: usize, custom: &[Option<bake::CustomMap>; bake::CUSTOM_SLOTS]) -> bool {
+    use crate::engine::gin::CUSTOM;
+    let mut dirty = false;
+    // The slot the mask reads most.
+    let current = (0..bake::CUSTOM_SLOTS).max_by(|&a, &b| g.weights[CUSTOM + a].abs().total_cmp(&g.weights[CUSTOM + b].abs())).filter(|&k| g.weights[CUSTOM + k] != 0.0);
+    if custom.iter().all(Option::is_none) {
+        labeled(ui, "Map", |ui| {
+            ui.label(egui::RichText::new("No custom maps yet: add one in the bake window (Bake Mesh Maps → Custom maps).").small().color(theme::TEXT_DIM))
+        });
+        return false;
+    }
+    labeled(ui, "Map", |ui| {
+        let text = current.map_or("Choose…".to_string(), |k| input_name(CUSTOM + k, custom));
+        egui::ComboBox::from_id_salt(("gen custom map", salt)).selected_text(text).width(220.0).show_ui(ui, |ui| {
+            for k in 0..bake::CUSTOM_SLOTS {
+                let r = ui.add_enabled(custom[k].is_some(), egui::Button::selectable(current == Some(k), input_name(CUSTOM + k, custom)));
+                if r.clicked() && current != Some(k) {
+                    let strength = current.map_or(1.0, |c| g.weights[CUSTOM + c]);
+                    for j in 0..bake::CUSTOM_SLOTS {
+                        g.weights[CUSTOM + j] = 0.0;
+                    }
+                    g.weights[CUSTOM + k] = strength;
+                    dirty = true;
+                }
+            }
+        });
+    });
+    if current.is_some_and(|k| custom[k].is_none()) {
+        ui.label(egui::RichText::new("This map isn't set up in the bake window; pick another or add it there.").small().color(Color32::from_rgb(240, 180, 80)));
+    }
+    dirty
+}
+
+/// The inputs a smart mask mixes: only the ones it uses, each with its
+/// weight and a remove button, and a menu to add more by kind.
+fn generator_inputs_ui(ui: &mut egui::Ui, g: &mut crate::engine::Generator, salt: usize, custom: &[Option<bake::CustomMap>; bake::CUSTOM_SLOTS]) -> bool {
+    let mut dirty = false;
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Mixes").small().color(theme::TEXT_DIM))
+        .on_hover_text("What this mask is made of: each input adds (or with a negative weight, takes away) its share.");
+    let mut remove = None;
+    for i in 0..GEN_INPUTS.len() {
+        if g.weights[i] == 0.0 {
+            continue;
+        }
+        ui.horizontal(|ui| {
+            // Remove button first, so it never ends up past the panel's edge.
+            if ui.add(egui::Button::new(icons::X).frame(false)).on_hover_text("Remove this input").clicked() {
+                remove = Some(i);
+            }
+            let name = input_name(i, custom);
+            let label = egui::Label::new(egui::RichText::new(name).color(theme::TEXT)).truncate();
+            ui.allocate_ui_with_layout(vec2(140.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_width(140.0);
+                ui.add(label).on_hover_text(GEN_INPUTS[i].1);
+            });
+            // The slider takes what's left, next to its value box.
+            ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(40.0);
+            dirty |= ui.add(egui::Slider::new(&mut g.weights[i], -2.0..=2.0).max_decimals(2)).changed();
+        });
+    }
+    if let Some(i) = remove {
+        g.weights[i] = 0.0;
+        dirty = true;
+    }
+    ui.menu_button(theme::with_icon(icons::PLUS, "Add input"), |ui| {
+        ui.set_min_width(240.0);
+        for (group, inputs) in INPUT_GROUPS {
+            ui.label(egui::RichText::new(group).small().strong().color(theme::TEXT_DIM));
+            for &i in inputs {
+                let used = g.weights[i] != 0.0;
+                let r = ui.add_enabled(!used, egui::Button::new(input_name(i, custom)).frame(false)).on_hover_text(GEN_INPUTS[i].1);
+                if r.clicked() {
+                    g.weights[i] = 1.0;
+                    dirty = true;
+                    ui.close();
+                }
+            }
+            ui.add_space(4.0);
+        }
+    })
+    .response
+    .on_hover_text("Mix in another baked map or pattern");
+    let _ = salt;
+    dirty
+}
+
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) -> bool {
     labeled(ui, label, |ui| ui.add(egui::Slider::new(v, range).max_decimals(2)).changed())
 }
@@ -981,6 +1092,23 @@ impl PainterApp {
         self.add_custom_map(0, bake::CustomKind::Flow);
         self.add_custom_map(1, bake::CustomKind::Deposit);
         self.select_custom(0);
+    }
+
+    /// A fill layer masked by the Custom Bake Map preset reading custom map 2,
+    /// mixed with occlusion, selected with its mask (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_custom_mask(&mut self) {
+        use crate::engine::gin;
+        self.show_bake = false;
+        let fill = FillParams { mat: MatValues { color: [0.8, 0.6, 0.3], ..Default::default() }, ..Default::default() };
+        let idx = self.engine.add_fill_layer(self.engine.layers.len(), None, "Sand".into(), fill, &mut self.undo);
+        let mut g = GenKind::CustomMap.default_generator();
+        g.weights[gin::CUSTOM] = 0.0;
+        g.weights[gin::CUSTOM + 1] = 1.0;
+        g.weights[gin::OCCLUSION] = 0.4;
+        self.engine.add_mask(idx, true, Some(g), &mut self.undo);
+        self.selected = idx;
+        self.target = StrokeTarget::Mask;
     }
 
     /// Opens or closes the bake window (offscreen UI tests).
@@ -3088,7 +3216,9 @@ impl PainterApp {
     }
 
     /// A smart mask's settings; `salt` keeps several apart on one panel.
-    fn generator_ui(ui: &mut egui::Ui, g: &mut crate::engine::Generator, salt: usize) -> bool {
+    /// `custom` names the custom bake maps the mask can read.
+    fn generator_ui(ui: &mut egui::Ui, g: &mut crate::engine::Generator, salt: usize, custom: &[Option<bake::CustomMap>; bake::CUSTOM_SLOTS]) -> bool {
+        use crate::engine::gin;
         let mut dirty = false;
         labeled(ui, "Preset", |ui| {
             egui::ComboBox::from_id_salt(("gen", salt)).selected_text(g.kind.name()).show_ui(ui, |ui| {
@@ -3100,27 +3230,24 @@ impl PainterApp {
                 }
             });
         });
+        if g.kind == GenKind::CustomMap {
+            dirty |= custom_map_picker(ui, g, salt, custom);
+        }
         dirty |= slider(ui, "Level", &mut g.level, -1.0..=2.0);
         dirty |= slider(ui, "Contrast", &mut g.contrast, 0.001..=0.6);
         dirty |= slider(ui, "Noise breakup", &mut g.noise, 0.0..=2.0);
         dirty |= slider(ui, "Noise scale", &mut g.scale, 0.2..=20.0);
         dirty |= slider(ui, "Seed", &mut g.seed, 0.0..=100.0);
         dirty |= labeled(ui, "Invert", |ui| ui.checkbox(&mut g.invert, "").changed());
-        let uses_width = g.weights[crate::engine::gin::EDGE] != 0.0 || g.weights[crate::engine::gin::CREASE] != 0.0;
+        let uses_width = g.weights[gin::EDGE] != 0.0 || g.weights[gin::CREASE] != 0.0;
         if uses_width {
             dirty |= slider(ui, "Edge width", &mut g.edge_width, 0.002..=0.5);
         }
-        if g.weights[crate::engine::gin::ID] != 0.0 {
+        if g.weights[gin::ID] != 0.0 {
             dirty |= labeled(ui, "ID color", |ui| color_edit(ui, &mut g.id_color));
             dirty |= slider(ui, "ID tolerance", &mut g.id_tolerance, 0.01..=1.0);
         }
-        egui::CollapsingHeader::new("Inputs (mix any baked map)").id_salt(("gen inputs", salt)).show(ui, |ui| {
-            for (i, (name, desc)) in GEN_INPUTS.iter().enumerate() {
-                let r = labeled(ui, name, |ui| ui.add(egui::Slider::new(&mut g.weights[i], -2.0..=2.0).max_decimals(2)));
-                dirty |= r.on_hover_text(*desc).changed();
-            }
-        });
-        dirty
+        dirty | generator_inputs_ui(ui, g, salt, custom)
     }
 
     // ------------------------------------------------------------------ properties
@@ -3316,6 +3443,7 @@ impl PainterApp {
 
     fn mask_properties(&mut self, ui: &mut egui::Ui, idx: usize) -> bool {
         let mut dirty = false;
+        let custom = self.bake_settings.custom;
         section(ui, "Mask");
         self.missing_maps_note(ui, idx);
         let Some(mask) = self.engine.layers[idx].mask.as_mut() else {
@@ -3337,7 +3465,7 @@ impl PainterApp {
         }
         let has_paint = mask.paint.is_some();
         if let Some(g) = &mut mask.generator {
-            dirty |= Self::generator_ui(ui, g, 0);
+            dirty |= Self::generator_ui(ui, g, 0, &custom);
         }
         ui.horizontal(|ui| {
             if !has_paint && ui.button("Add paint to mask").clicked() {
@@ -3365,6 +3493,7 @@ impl PainterApp {
         let Some(mask) = self.engine.layers[idx].mask.as_mut() else { return false };
         section(ui, "Mask layers");
         let mut dirty = false;
+        let custom = self.bake_settings.custom;
         let (mut remove, mut swap) = (None, None);
         let count = mask.layers.len();
         // Top of the stack first, like the layer list.
@@ -3400,7 +3529,7 @@ impl PainterApp {
                     });
                     dirty |= slider(ui, "Opacity", &mut ml.opacity, 0.0..=1.0);
                     match &mut ml.source {
-                        MaskSource::Generator(g) => dirty |= Self::generator_ui(ui, g, 100 + i),
+                        MaskSource::Generator(g) => dirty |= Self::generator_ui(ui, g, 100 + i, &custom),
                         MaskSource::Fill(v) => dirty |= slider(ui, "Value", v, 0.0..=1.0),
                     }
                 });

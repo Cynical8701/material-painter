@@ -709,6 +709,10 @@ fn ui_screenshots() {
     harness.state_mut().test_show_custom();
     harness.run_steps(8);
     harness.render().expect("renders").save(dir.join("bake_custom.png")).unwrap();
+    // A mask reading a custom map: the map picker and the short inputs list.
+    harness.state_mut().test_custom_mask();
+    harness.run_steps(8);
+    harness.render().expect("renders").save(dir.join("mask_custom.png")).unwrap();
 }
 
 /// Mask filters change what a layer covers: a white mask shows the layer
