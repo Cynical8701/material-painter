@@ -1488,3 +1488,57 @@ fn viewport_crevices() {
         image::save_buffer(dir.join(format!("{name}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
     }
 }
+
+/// Opening Substance 3D Painter projects of your own (`MP_SPP=a.spp;b.spp`): the flattened
+/// result as a visible paint layer, the rebuilt stack hidden next to it, the report up.
+/// Screenshots in `target/bake_test/spp/`. Nothing runs without the variable (no Painter file
+/// ships with the tests; `spp_import`'s unit tests use a synthetic one).
+#[test]
+#[ignore]
+fn open_spp_projects() {
+    use crate::app::PainterApp;
+    let Ok(paths) = std::env::var("MP_SPP") else {
+        println!("set MP_SPP to .spp files of your own");
+        return;
+    };
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_welcome();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/spp");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (k, path) in paths.split(';').filter(|p| !p.is_empty()).enumerate() {
+        let ctx = harness.ctx.clone();
+        harness.state_mut().test_open_spp(Path::new(path), &ctx);
+        let start = std::time::Instant::now();
+        while !harness.state().test_spp_done() && start.elapsed().as_secs() < 120 {
+            harness.run_steps(1);
+        }
+        assert!(harness.state().test_spp_done(), "{path}: the import finished");
+        let layers = harness.state().test_layers();
+        println!("  {path}:");
+        for (name, kind, visible) in &layers {
+            println!("    {kind:<12} {} {name}", if *visible { "shown " } else { "hidden" });
+        }
+        let flat = layers.iter().find(|(n, ..)| n == "Painter result (flattened)").expect("the flattened layer");
+        assert_eq!((flat.1, flat.2), ("paint", true), "the flattened result is a visible paint layer");
+        if let Some(folder) = layers.iter().find(|(n, ..)| n == "Painter layers (rebuilt)") {
+            assert!(!folder.2, "the rebuilt stack starts hidden");
+        }
+        // Let the bake land, then picture it with the report.
+        for _ in 0..60 {
+            harness.run_steps(1);
+        }
+        harness.render().expect("renders").save(dir.join(format!("spp_{k}.png"))).unwrap();
+    }
+}

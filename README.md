@@ -53,6 +53,12 @@ maps, build materials in a node graph and write your own node shaders.
   ambientCG, one click from the shelf, plus a community library of material
   graphs and nodes that users share from inside the app. Downloads are plain
   image files with a `meta.json`, so nothing is locked into Material Painter.
+- **Open Substance 3D Painter projects** (`.spp`): the model, the final look
+  of base color, roughness, metallic and height, and as much of the layer
+  stack as maps onto Material Painter's layers. Procedural materials, brush
+  strokes and Painter-only channels don't come across; the import report
+  says exactly what did. Details and limits:
+  [docs/substance-painter-import.md](docs/substance-painter-import.md).
 - **Docking workspaces**, path-traced preview, HDRI lighting, and an MCP
   server so AI agents can drive the app (off by default).
 
@@ -113,3 +119,9 @@ Third-party code is listed with its licenses in
 [THIRD_PARTY_NOTICES.html](THIRD_PARTY_NOTICES.html). The bundled HDRIs and
 PBR textures are from [Poly Haven](https://polyhaven.com) (CC0), and the
 icons are [Phosphor](https://phosphoricons.com) (MIT).
+
+Reading Substance 3D Painter projects is adapted from
+[SubCraft](https://github.com/Aalzard/subcraft) by Aalzard and the SubCraft
+contributors (MIT), in [`src/spp`](src/spp) with its license. Material
+Painter is not affiliated with or endorsed by Adobe; Substance 3D Painter is
+a trademark of Adobe.

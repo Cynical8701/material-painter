@@ -25,6 +25,8 @@ mod presets;
 mod preview_test;
 mod raytrace;
 mod select;
+mod spp;
+mod spp_import;
 mod textures;
 mod theme;
 mod undo;

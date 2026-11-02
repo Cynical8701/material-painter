@@ -35,6 +35,7 @@ mod shader_ui;
 mod library_ui;
 mod path_tool;
 mod bake_live;
+mod spp_open;
 mod preview_shader;
 mod smart_io;
 mod welcome;
@@ -323,6 +324,8 @@ enum Action {
     NewProject(Primitive),
     /// `None` asks for a file.
     OpenProject(Option<std::path::PathBuf>),
+    /// Opens a Substance 3D Painter project as a new project.
+    OpenSpp(Option<std::path::PathBuf>),
     SaveProject,
     SaveProjectAs,
     /// Saves, then runs the action if the save went through.
@@ -442,6 +445,7 @@ pub struct PainterApp {
     path: path_tool::PathTool,
     bake_preview: bake_live::LivePreview,
     custom_ui: bake_live::CustomUi,
+    spp: spp_open::SppOpen,
     preview: preview_shader::PreviewShader,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
@@ -1354,6 +1358,7 @@ impl PainterApp {
             path: Default::default(),
             bake_preview: Default::default(),
             custom_ui: Default::default(),
+            spp: Default::default(),
             preview: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
@@ -1542,11 +1547,11 @@ impl PainterApp {
             }
             let (at, parent) = self.insert_place();
             match action {
-                a @ (Action::NewProject(_) | Action::OpenProject(_) | Action::Exit) if self.is_modified() => {
+                a @ (Action::NewProject(_) | Action::OpenProject(_) | Action::OpenSpp(_) | Action::Exit) if self.is_modified() => {
                     self.confirm = Some(a);
                 }
                 Action::Confirmed(a) => self.run_unchecked(*a, ctx),
-                a @ (Action::NewProject(_) | Action::OpenProject(_) | Action::Exit) => self.run_unchecked(a, ctx),
+                a @ (Action::NewProject(_) | Action::OpenProject(_) | Action::OpenSpp(_) | Action::Exit) => self.run_unchecked(a, ctx),
                 Action::SaveProject => {
                     self.save(false);
                 }
@@ -1777,6 +1782,7 @@ impl PainterApp {
                 self.apply_project_defaults();
                 self.load_mesh(p.build(), ctx);
             }
+            Action::OpenSpp(path) => self.start_spp_open(path, ctx),
             Action::OpenProject(path) => {
                 if let Some(path) = path.or_else(Self::open_dialog) {
                     if let Err(e) = self.open_project(&path, ctx) {
@@ -1836,6 +1842,7 @@ impl PainterApp {
         let what = match action {
             Action::Exit => "closing",
             Action::OpenProject(_) => "opening another project",
+            Action::OpenSpp(_) => "opening a Substance 3D Painter project",
             _ => "starting a new project",
         };
         let name = self.project_path.as_ref().and_then(|p| p.file_name()).map_or("this project".to_string(), |n| n.to_string_lossy().into_owned());
@@ -2051,6 +2058,13 @@ impl PainterApp {
                 });
                 if ui.button(theme::with_icon(icons::CUBE, "Import mesh (FBX, OBJ)…")).clicked() {
                     self.pending.push(Action::ImportMesh);
+                    ui.close();
+                }
+                let spp = ui
+                    .add_enabled(!self.spp_busy(), egui::Button::new(theme::with_icon(icons::FOLDER_OPEN, "Open Substance 3D Painter project (.spp)…")))
+                    .on_hover_text("Brings in the model, the final look of its color, roughness, metallic and height, and as much of the layer stack as maps onto Material Painter's. A report lists what came across and what didn't.");
+                if spp.clicked() {
+                    self.pending.push(Action::OpenSpp(None));
                     ui.close();
                 }
                 ui.separator();
@@ -5101,6 +5115,7 @@ impl eframe::App for PainterApp {
         let _ = self.rs.device.poll(wgpu::PollType::Poll);
         self.undo.update();
         self.poll_bake(&ctx);
+        self.poll_spp_open(&ctx);
         self.update_preview(&ctx);
         self.poll_env();
         self.poll_hdri_thumbs(&ctx);
@@ -5182,6 +5197,7 @@ impl eframe::App for PainterApp {
         self.preferences_window(&ctx);
         self.apply_preferences(&ctx);
         self.bake_window(&ctx);
+        self.spp_report_window(&ctx);
         self.help_window(&ctx);
         self.about_window(&ctx);
         self.crash_window(&ctx);

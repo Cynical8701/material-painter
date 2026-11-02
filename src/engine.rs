@@ -2017,6 +2017,46 @@ impl Engine {
         self.insert_layer(at, layer, undo, "Add paint layer".into())
     }
 
+    /// A paint layer holding given texels per channel (base color, roughness, metallic, height:
+    /// `(size, texels in PAINT_FORMATS layout)`), resampled to the texture set's size.
+    pub fn add_paint_layer_from(
+        &mut self,
+        at: usize,
+        parent: Option<u64>,
+        name: String,
+        channels: [Option<(u32, Vec<u8>)>; 4],
+        undo: &mut UndoStack,
+    ) -> usize {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut chans: [Option<Tex>; 4] = Default::default();
+        for (ch, data) in channels.into_iter().enumerate() {
+            let Some((size, texels)) = data else { continue };
+            let format = PAINT_FORMATS[ch];
+            if texels.len() != (size * size * gpu::bytes_per_texel(format)) as usize {
+                continue;
+            }
+            let src = Tex::new(&self.device, CH_NAMES[ch], size, size, format, LAYER_USAGE);
+            let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * gpu::bytes_per_texel(format)), rows_per_image: Some(size) };
+            self.queue.write_texture(src.copy_info(), &texels, layout, src.extent());
+            chans[ch] = Some(if size == self.res { src } else { self.resample(&mut encoder, &src, self.res) });
+        }
+        self.queue.submit([encoder.finish()]);
+        let thumb = chans[0].as_ref().map(|c| self.rs.renderer.write().register_native_texture(&self.device, c.srgb(), wgpu::FilterMode::Linear));
+        let layer = Layer {
+            id: self.new_id(),
+            name,
+            visible: true,
+            opacity: 1.0,
+            blend: Blend::Normal,
+            content: Content::Paint(chans),
+            mask: None,
+            parent,
+            images: Default::default(),
+            thumb,
+        };
+        self.insert_layer(at, layer, undo, "Add paint layer".into())
+    }
+
     pub fn add_fill_layer(
         &mut self,
         at: usize,

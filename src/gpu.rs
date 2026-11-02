@@ -343,6 +343,31 @@ pub fn read_wgpu_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu:
     out
 }
 
+/// A half float's bits for `v` (round to nearest; out of range clamps to infinity).
+pub fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - e);
+        return sign | ((m + 0x1000) >> 13) as u16;
+    }
+    let h = ((e as u32) << 10) | (man >> 13);
+    // Round to nearest (a carry into the exponent is still right).
+    sign | (h + ((man >> 12) & 1)) as u16
+}
+
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((h >> 10) & 0x1f) as i32;
