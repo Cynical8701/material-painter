@@ -6,6 +6,10 @@
 //!   CPU scene preparation (BVH, edges) is kept between previews and only
 //!   redone when a setting it reads changes. A change during a preview bake
 //!   starts the next one when it finishes, so dragging never queues work.
+//!   Once the settings stop changing, the preview is baked again at higher
+//!   resolutions (1024², then 2048²): at 512² thin UV islands (bevels) are a
+//!   texel or two wide and show as hard bands when stretched over the texture
+//!   set. A change drops any refinement in progress.
 //!   Closing the window (or switching the preview off) brings the full bake
 //!   back; Bake replaces both.
 //! - The custom map slots: cards you add, pick and remove, and the settings
@@ -23,8 +27,11 @@ use egui::{Color32, Rect, Stroke, vec2};
 use glam::{Vec2, Vec3};
 use std::sync::{Arc, mpsc};
 
-/// Largest resolution a preview bakes at.
-const PREVIEW_RES: u32 = 512;
+/// Preview resolutions: the quick one baked on every change, then the ones
+/// it's refined to while the settings stay put (each capped at the texture
+/// set's).
+const PREVIEW_STEPS: [u32; 3] = [512, 1024, 2048];
+const PREVIEW_RES: u32 = PREVIEW_STEPS[0];
 /// Grab distance for gizmo handles, in screen points.
 const GRAB: f32 = 11.0;
 
@@ -34,10 +41,10 @@ pub(super) struct LivePreview {
     /// The prepared scene previews reuse, under its [`prepare_key`](bake::BakeSettings::prepare_key).
     scene: Option<(String, Arc<PreparedScene>)>,
     preparing: Option<(String, mpsc::Receiver<Result<PreparedScene, String>>)>,
-    /// The preview bake in progress and the settings it bakes.
-    run: Option<(String, BakeRun)>,
-    /// The settings of the preview on screen (`None`: no preview shown).
-    shown: Option<String>,
+    /// The preview bake in progress: the settings it bakes and its resolution.
+    run: Option<(String, u32, BakeRun)>,
+    /// The settings and resolution of the preview on screen (`None`: no preview shown).
+    shown: Option<(String, u32)>,
     /// Settings whose preview failed, and why (not retried until they change).
     failed: Option<(String, String)>,
     /// The full bake the preview covers, put back when it ends (`Some(None)`:
@@ -132,10 +139,12 @@ impl PainterApp {
         self.bake_preview.shown = None;
     }
 
-    /// The preview of the current settings is on screen (offscreen tests).
+    /// The refined preview of the current settings is on screen, and nothing
+    /// more is baking (offscreen tests).
     #[cfg(test)]
     pub(crate) fn test_preview_shown(&self) -> bool {
-        self.bake_preview.shown.as_ref() == Some(&self.bake_key(false))
+        let sharpest = self.engine.res.min(PREVIEW_STEPS[PREVIEW_STEPS.len() - 1]);
+        self.bake_preview.run.is_none() && self.bake_preview.shown == Some((self.bake_key(false), sharpest))
     }
 
     /// Where the gizmo's handle is on screen (offscreen tests drag it).
@@ -210,28 +219,40 @@ impl PainterApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.bake_preview.preparing = None,
             }
         }
-        if let Some((rkey, run)) = &mut self.bake_preview.run {
+        let quick = self.engine.res.min(PREVIEW_RES);
+        // A refinement of settings that have changed since is dropped: the
+        // quick preview of the new ones comes first.
+        if self.bake_preview.run.as_ref().is_some_and(|(k, res, _)| *k != key && *res > quick) {
+            self.bake_preview.run = None;
+        }
+        if let Some((rkey, rres, run)) = &mut self.bake_preview.run {
             let Some(maps) = self.baker.pump(run, &self.rs.device, &self.rs.queue, ctx) else { return };
-            let (rkey, report) = (rkey.clone(), run.report.clone());
+            let (shown, report) = ((rkey.clone(), *rres), run.report.clone());
             if self.bake_preview.saved.is_none() {
                 self.bake_preview.saved = Some(self.engine.current_maps());
             }
             self.engine.set_maps(maps, report);
-            self.bake_preview.shown = Some(rkey);
+            self.bake_preview.shown = Some(shown);
             self.bake_preview.run = None;
         }
 
-        // Up to date, or these settings can't be baked: wait for a change.
-        if self.bake_preview.shown.as_ref() == Some(&key) || self.bake_preview.failed.as_ref().is_some_and(|(k, _)| *k == key) {
+        // A quick preview of new settings, then sharper ones of the same.
+        let res = match &self.bake_preview.shown {
+            Some((k, r)) if *k == key => match PREVIEW_STEPS.iter().map(|s| (*s).min(self.engine.res)).find(|s| s > r) {
+                Some(next) => next,
+                None => return,
+            },
+            _ => quick,
+        };
+        if self.bake_preview.failed.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
         self.bake_preview.failed = None;
         let pkey = self.bake_key(true);
         match &self.bake_preview.scene {
             Some((k, scene)) if *k == pkey => {
-                let res = self.engine.res.min(PREVIEW_RES);
                 let run = self.baker.start(&self.rs.device, &self.rs.queue, &self.gpu_mesh, scene, &self.bake_settings.preview(), res);
-                self.bake_preview.run = Some((key, run));
+                self.bake_preview.run = Some((key, res, run));
                 self.bake_preview.starts += 1;
                 ctx.request_repaint();
             }
@@ -265,6 +286,8 @@ impl PainterApp {
                     (format!("Can't preview: {e}"), Color32::from_rgb(255, 110, 90))
                 } else if self.bake_preview.preparing.is_some() {
                     ("Preparing the mesh…".to_string(), theme::TEXT)
+                } else if self.bake_preview.run.as_ref().is_some_and(|(_, res, _)| *res > PREVIEW_RES) {
+                    ("Sharpening…".to_string(), theme::TEXT)
                 } else if self.bake_preview.run.is_some() {
                     ("Updating…".to_string(), theme::TEXT)
                 } else if self.bake_preview.shown.is_some() {

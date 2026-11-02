@@ -1095,9 +1095,10 @@ fn custom_maps_bake() {
     println!("  wrote {}", dir.display());
 }
 
-/// The live bake preview: adding custom maps bakes a preview once (no
-/// restarts while nothing changes), a settings change bakes one more, and
-/// closing the bake window ends it. Frames are capped so a regression fails
+/// The live bake preview: adding custom maps bakes a quick preview, then a
+/// sharper one (no restarts while nothing changes), a settings change bakes
+/// again, and
+/// closing the bake window ends it. Waits are time-bounded so a regression fails
 /// instead of hanging.
 #[test]
 #[ignore]
@@ -1128,21 +1129,23 @@ fn live_bake_preview() {
     println!("  full bake after {frames} frames");
     harness.state_mut().test_show_custom();
     let wait = |harness: &mut egui_kittest::Harness<'_, PainterApp>, what: &str| {
-        for frame in 0..600 {
+        // Bounded by time: the sharpest preview step takes seconds, however
+        // fast offscreen frames go.
+        let start = std::time::Instant::now();
+        let mut frames = 0;
+        while start.elapsed().as_secs() < 60 {
             if harness.state().test_preview_shown() {
-                println!("  {what}: preview after {frame} frames, {} starts", harness.state().test_preview_starts());
+                println!("  {what}: preview after {frames} frames ({:.1}s), {} starts", start.elapsed().as_secs_f32(), harness.state().test_preview_starts());
                 return;
             }
             harness.run_steps(1);
-            if frame % 50 == 0 {
-                println!("    frame {frame}: {} starts", harness.state().test_preview_starts());
-            }
+            frames += 1;
         }
-        panic!("{what}: no preview after 600 frames ({} starts)", harness.state().test_preview_starts());
+        panic!("{what}: no preview after 60 s ({} starts)", harness.state().test_preview_starts());
     };
     wait(&mut harness, "custom maps added");
     let starts = harness.state().test_preview_starts();
-    assert!(starts <= 2, "one preparation and one preview bake ({starts} starts)");
+    assert!(starts <= 4, "one preparation, a quick preview and two sharper ones ({starts} starts)");
     harness.run_steps(20);
     assert_eq!(harness.state().test_preview_starts(), starts, "no restarts while nothing changes");
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
@@ -1174,4 +1177,42 @@ fn live_bake_preview() {
     harness.state_mut().test_set_bake_window(false);
     harness.run_steps(2);
     assert!(harness.state().test_preview_ended(), "closing the bake window ends the preview");
+}
+
+/// Seams in custom maps: the live preview's quick (512²) and refined
+/// (1024²) bakes and a full bake of the same Wind Deposits setup, rendered close up on the material ball's
+/// base. Images in `target/bake_test/custom/seams_*.png`.
+#[test]
+#[ignore]
+fn custom_map_seams() {
+    use crate::bake::{CustomKind, CUSTOM_BASE};
+    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let mut c = CustomKind::Deposit.default_map();
+    c.azimuth = 60.0;
+    c.spread = 50.0;
+    c.distance = 0.6;
+    let mut full = BakeSettings::default();
+    full.apply_quality(crate::bake::Quality::Ultra);
+    full.custom[0] = Some(c);
+    let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
+    for (name, settings, res) in [("preview", full.preview(), 512), ("refined", full.preview(), 1024), ("full", full.clone(), 2048)] {
+        let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &settings, res);
+        let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 2048);
+        engine.set_maps(maps, report);
+        engine.composite();
+        for (cname, yaw, pitch) in [("right", 0.9f32, 0.35f32), ("left", -0.6, 0.35)] {
+            let cam = OrbitCam { target: center - Vec3::Y * 0.4, dist: 2.2, yaw, pitch, ..Default::default() };
+            views.render_3d(&rs, [900, 700], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode: ViewMode::Map(CUSTOM_BASE), ..Default::default() }, None);
+            let img = views.view3d.image();
+            let px = read_texture(&rs.device, &rs.queue, img);
+            image::save_buffer(dir.join(format!("seams_{name}_{cname}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+        }
+    }
 }

@@ -314,7 +314,9 @@ impl BakeSettings {
         s.aa = 1;
         s.ao_rays = s.ao_rays.min(16);
         s.thickness_rays = s.thickness_rays.min(8);
-        s.sky_rays = s.sky_rays.min(8);
+        // Sky rays also set the custom maps' rays (see `custom_rays`); with
+        // fewer, their noise shows on thin UV islands.
+        s.sky_rays = s.sky_rays.min(24);
         s
     }
 
