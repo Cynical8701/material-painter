@@ -2876,6 +2876,10 @@ impl PainterApp {
                 v.env_rotation = deg.to_radians();
             }
             slider(ui, "Intensity", &mut v.env_intensity, 0.0..=4.0);
+            labeled(ui, "Ambient occlusion", |ui| {
+                ui.add(egui::Slider::new(&mut v.ao_strength, 0.0..=1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)))
+            })
+            .on_hover_text("How much the baked ambient occlusion darkens crevices in the 3D view. Only the view: bakes and exports keep the full map.");
 
             section(ui, "Key light");
             ui.checkbox(&mut v.key.on, theme::with_icon(icons::SUN, "Directional light with shadows"))

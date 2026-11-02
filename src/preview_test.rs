@@ -1440,3 +1440,51 @@ fn layer_thumbnails() {
     let (_, _, blue) = stats(&engine, engine.thumb_textures(id).0.unwrap(), "fill_blue");
     assert!(blue[2] > blue[0] * 2.0, "the thumbnail follows the fill's color: {blue:?}");
 }
+
+/// What darkens crevices in the 3D view: the same gray material ball with
+/// the baked AO at full and at the default view strength, without AO, and
+/// without the key light.
+/// Images in `target/bake_test/viewport/`.
+#[test]
+#[ignore]
+fn viewport_crevices() {
+    use crate::engine::{FillParams, MatValues};
+    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/viewport");
+    std::fs::create_dir_all(&dir).unwrap();
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let mut views = ViewRenderer::new(&rs);
+    let center = (mesh.bounds_min + mesh.bounds_max) * 0.5;
+    let cam = OrbitCam { target: center - Vec3::Y * 0.3, dist: 2.4, yaw: 0.5, pitch: 0.3, ..Default::default() };
+    let make = |baked: bool| {
+        let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 1024);
+        if baked {
+            let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &BakeSettings::default(), 1024);
+            engine.set_maps(maps, report);
+        }
+        let fill = FillParams { mat: MatValues { color: [0.7, 0.7, 0.7], rough: 0.5, ..Default::default() }, ..Default::default() };
+        engine.add_fill_layer(0, None, "Gray".into(), fill, &mut crate::undo::UndoStack::default());
+        engine.composite();
+        engine
+    };
+    let (baked, plain) = (make(true), make(false));
+    for (name, engine, key, ao) in [
+        ("baked_full", &baked, true, 1.0),
+        ("baked_default", &baked, true, ViewSettings::default().ao_strength),
+        ("noao", &plain, true, 1.0),
+        ("baked_nokey", &baked, false, 1.0),
+    ] {
+        let mut s = ViewSettings::default();
+        s.key.on = key;
+        s.ao_strength = ao;
+        views.render_3d(&rs, [900, 900], engine, &env, &gpu_mesh, &cam, &s, None);
+        let img = views.view3d.image();
+        let px = read_texture(&rs.device, &rs.queue, img);
+        let mean = px.chunks(4).map(|p| p[0] as f32).sum::<f32>() / (px.len() / 4) as f32;
+        println!("  {name}: mean {mean:.1}");
+        image::save_buffer(dir.join(format!("{name}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+    }
+}

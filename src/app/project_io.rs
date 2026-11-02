@@ -475,7 +475,7 @@ impl PainterApp {
             "exposure": v.exposure, "env_rotation": v.env_rotation, "env_intensity": v.env_intensity,
             "background": format!("{:?}", v.background), "bg_blur": v.bg_blur, "bg_intensity": v.bg_intensity,
             "bg_color": v.bg_color, "height_strength": v.height_strength,
-            "show_wire": v.show_wire, "use_baked_normal": v.use_baked_normal,
+            "show_wire": v.show_wire, "use_baked_normal": v.use_baked_normal, "ao_strength": v.ao_strength,
             "key_light": {"on": v.key.on, "azimuth": v.key.azimuth, "elevation": v.key.elevation,
                 "intensity": v.key.intensity, "color": v.key.color},
             "tonemap": format!("{:?}", p.tonemap), "contrast": p.contrast, "saturation": p.saturation,
@@ -715,6 +715,7 @@ impl PainterApp {
         vs.exposure = f(v, "exposure", d.exposure);
         vs.env_rotation = f(v, "env_rotation", d.env_rotation);
         vs.env_intensity = f(v, "env_intensity", d.env_intensity);
+        vs.ao_strength = f(v, "ao_strength", d.ao_strength);
         vs.background = Background::ALL.into_iter().find(|x| Some(format!("{x:?}").as_str()) == s(v, "background")).unwrap_or(d.background);
         vs.bg_blur = f(v, "bg_blur", d.bg_blur);
         vs.bg_intensity = f(v, "bg_intensity", d.bg_intensity);

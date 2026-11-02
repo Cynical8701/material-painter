@@ -199,6 +199,9 @@ pub struct ViewSettings {
     /// Opacity of the 2D view's polygon edges.
     pub uv_wire_opacity: f32,
     pub use_baked_normal: bool,
+    /// How much the baked ambient occlusion darkens the 3D view's lighting
+    /// (display only: bakes and exports keep the full map).
+    pub ao_strength: f32,
     pub post: PostSettings,
     pub key: KeyLight,
 }
@@ -249,6 +252,7 @@ impl Default for ViewSettings {
             show_seams_2d: true,
             uv_wire_opacity: 0.45,
             use_baked_normal: true,
+            ao_strength: 0.6,
             post: PostSettings::default(),
             key: KeyLight::default(),
         }
@@ -757,7 +761,7 @@ impl ViewRenderer {
             light: [s.env_rotation, s.exposure, s.env_intensity, (RADIANCE_MIPS - 1) as f32],
             params: [s.mode.index() as f32, s.height_strength, 1.0 / res, res],
             view2d: [0.0; 4],
-            size: [size[0] as f32, size[1] as f32, 0.0, 0.0],
+            size: [size[0] as f32, size[1] as f32, s.ao_strength, 0.0],
             extra: [
                 if s.use_baked_normal && engine.has_bake { 1.0 } else { 0.0 },
                 if engine.has_bake { 1.0 } else { 0.0 },

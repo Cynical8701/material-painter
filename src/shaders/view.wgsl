@@ -9,7 +9,7 @@ struct Globals {
     light: vec4<f32>,    // env rotation (radians), exposure, env intensity, radiance max lod
     params: vec4<f32>,   // view mode, height strength, texel size, texture resolution
     view2d: vec4<f32>,   // zoom (px per uv), pan x, pan y, unused
-    size: vec4<f32>,     // viewport width, height, unused, unused
+    size: vec4<f32>,     // viewport width, height, baked AO strength, unused
     extra: vec4<f32>,    // use baked normal, has bake, custom map shown (view mode 22), wireframe opacity
     bmin: vec4<f32>,
     bsize: vec4<f32>,
@@ -237,8 +237,10 @@ fn shade_pbr(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
     let nv = max(dot(n, v), 1e-4);
 
     // All light comes from the environment: SH irradiance for diffuse, the
-    // roughness-prefiltered radiance for specular.
-    let ao = s.a.r;
+    // roughness-prefiltered radiance for specular. The baked AO reaches far
+    // (it's sky occlusion), so at full strength it darkens whole crevices,
+    // not just contact lines; the view applies it at the user's strength.
+    let ao = mix(1.0, s.a.r, clamp(g.size.z, 0.0, 1.0));
     let spec = env_brdf(f0, rough, nv);
     var col = diffuse_c * (1.0 - spec) * irradiance(n) / PI * ao;
     let r = reflect(-v, n);
