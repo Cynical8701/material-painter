@@ -1361,3 +1361,71 @@ fn custom_map_closeups() {
         }
     }
 }
+
+/// Layer thumbnails show what the layer and its mask really do: a fill's
+/// color, a mask that inverts or breaks up with noise, a painted mask, and
+/// they follow changes. Images in `target/bake_test/thumbs/`.
+#[test]
+#[ignore]
+fn layer_thumbnails() {
+    use crate::engine::{FillParams, FilterKind, GenKind, MaskFilter, MatValues};
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::MaterialBall.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 512);
+    let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &BakeSettings::default(), 512);
+    engine.set_maps(maps, report);
+    let mut undo = crate::undo::UndoStack::default();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/thumbs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stats = |engine: &Engine, tex: &crate::gpu::Tex, name: &str| -> (f32, f32, [f32; 3]) {
+        let px = read_texture(&rs.device, &rs.queue, tex);
+        image::save_buffer(dir.join(format!("{name}.png")), &px, tex.width, tex.height, image::ExtendedColorType::Rgba8).unwrap();
+        let n = (px.len() / 4) as f32;
+        let lum: Vec<f32> = px.chunks(4).map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / (3.0 * 255.0)).collect();
+        let mean = lum.iter().sum::<f32>() / n;
+        let var = lum.iter().map(|l| (l - mean) * (l - mean)).sum::<f32>() / n;
+        let rgb = [0, 1, 2].map(|k| px.chunks(4).map(|p| p[k] as f32 / 255.0).sum::<f32>() / n);
+        let _ = engine;
+        (mean, var.sqrt(), rgb)
+    };
+
+    // A red fill with color variation, masked by edge wear.
+    let fill = FillParams { mat: MatValues { color: [0.8, 0.1, 0.05], ..Default::default() }, color_var: 0.4, ..Default::default() };
+    let idx = engine.add_fill_layer(0, None, "Red".into(), fill, &mut undo);
+    engine.add_mask(idx, true, Some(GenKind::EdgeWear.default_generator()), &mut undo);
+    let id = engine.layers[idx].id;
+    engine.composite();
+    let (content, mask) = engine.thumb_textures(id);
+    let (_, spread, rgb) = stats(&engine, content.expect("fill thumbnail"), "fill_content");
+    println!("  fill: rgb {rgb:?}, spread {spread:.3}");
+    assert!(rgb[0] > rgb[1] * 2.0 && rgb[0] > rgb[2] * 2.0, "the fill thumbnail is red: {rgb:?}");
+    assert!(spread > 0.01, "color variation shows ({spread})");
+    let (wear, wear_spread, _) = stats(&engine, mask.expect("mask thumbnail"), "mask_edge_wear");
+    println!("  edge wear mask: mean {wear:.3}, spread {wear_spread:.3}");
+    assert!(wear > 0.01 && wear < 0.6 && wear_spread > 0.05, "edge wear covers the edges, not everything");
+
+    // An Invert filter flips it.
+    engine.layers[idx].mask.as_mut().unwrap().filters = vec![MaskFilter::new(FilterKind::Invert)];
+    engine.mark_dirty();
+    engine.composite();
+    let (inverted, _, _) = stats(&engine, engine.thumb_textures(id).1.unwrap(), "mask_inverted");
+    // Off the islands both are the same dark gray (0.16); on them they sum to
+    // white. The fill thumbnail's alpha says how much is on them.
+    let covered = {
+        let px = read_texture(&rs.device, &rs.queue, engine.thumb_textures(id).0.unwrap());
+        px.chunks(4).map(|p| p[3] as f32 / 255.0).sum::<f32>() / (px.len() / 4) as f32
+    };
+    let expected = covered + 2.0 * 0.16 * (1.0 - covered);
+    println!("  inverted: mean {inverted:.3}; islands cover {:.0}%", covered * 100.0);
+    assert!((wear + inverted - expected).abs() < 0.05, "inverting the mask inverts its thumbnail ({wear:.3} + {inverted:.3}, expected {expected:.3})");
+
+    // A new fill color shows.
+    if let crate::engine::Content::Fill(f) = &mut engine.layers[idx].content {
+        f.mat.color = [0.05, 0.2, 0.9];
+    }
+    engine.mark_dirty();
+    engine.composite();
+    let (_, _, blue) = stats(&engine, engine.thumb_textures(id).0.unwrap(), "fill_blue");
+    assert!(blue[2] > blue[0] * 2.0, "the thumbnail follows the fill's color: {blue:?}");
+}

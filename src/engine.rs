@@ -135,6 +135,8 @@ pub const GEN_INPUTS: [(&str, &str); GEN_INPUT_COUNT] = [
 pub const GEN_INPUT_COUNT: usize = 23;
 
 /// Indices into [`GEN_INPUTS`].
+mod thumbs;
+
 pub mod gin {
     pub const EDGE: usize = 0;
     pub const CONVEX: usize = 1;
@@ -910,6 +912,12 @@ pub struct Engine {
     pub has_bake: bool,
     /// Bumped whenever the mesh maps (or their levels and fixes) change.
     pub maps_version: u64,
+    /// Bumped whenever the position and normal maps are made again.
+    uv_version: u64,
+    /// Layer thumbnails (see `thumbs`).
+    thumbs: thumbs::Thumbs,
+    /// Which of a filtered mask's textures (`mask_out`) holds its result.
+    mask_final: HashMap<u64, usize>,
     pub bake_report: Option<Arc<BakeReport>>,
     edge_max: f32,
     dummy: Tex,
@@ -1001,6 +1009,9 @@ impl Engine {
             maps_dirty: true,
             has_bake: false,
             maps_version: 0,
+            uv_version: 0,
+            thumbs: Default::default(),
+            mask_final: HashMap::new(),
             bake_report: None,
             edge_max: 0.2,
             dummy,
@@ -1384,6 +1395,7 @@ impl Engine {
         }
         // DILATE_PASSES is even, so the result ends up back in pos/nrm.
         self.queue.submit([encoder.finish()]);
+        self.uv_version += 1;
         self.mark_dirty();
     }
 
@@ -1488,6 +1500,7 @@ impl Engine {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.resample_into(&mut encoder, src, dst);
         self.queue.submit([encoder.finish()]);
+        self.invalidate_thumbs();
         self.mark_dirty();
     }
 
@@ -2740,6 +2753,8 @@ impl Engine {
 
     /// Finishes the stroke and returns its undo record.
     pub fn end_stroke(&mut self) -> Option<UndoEntry> {
+        // The stroke's layer keeps its last thumbnail; the next update redoes it.
+        self.invalidate_thumbs();
         self.stroke_layer = None;
         self.prefix = None;
         self.prefix_cache = None;
@@ -2784,6 +2799,7 @@ impl Engine {
     }
 
     fn after_history_step(&mut self) {
+        self.invalidate_thumbs();
         self.committed = self.doc_props();
         self.maps_dirty = true;
         self.mark_dirty();
@@ -3072,6 +3088,7 @@ impl Engine {
             Some(p) => (p.at, p.input.map_or(1, |i| i), p.depth, p.input.is_none()),
             None => (0, 0, 0, false),
         };
+        let mut finals: Vec<(u64, usize)> = Vec::new();
         for (k, pass) in passes.iter().enumerate().skip(start) {
             if record == Some(k) {
                 let input = if k + 1 < passes.len() {
@@ -3167,6 +3184,11 @@ impl Engine {
                 )),
                 _ => None,
             };
+            if let Some(t) = filtered {
+                if let Some(i) = self.mask_out[&layer.id].iter().position(|x| std::ptr::eq(x, t)) {
+                    finals.push((layer.id, i));
+                }
+            }
             let bg = make_bg(filtered.or(mask));
             let out = &self.accum[dst];
             // A patch keeps what is around it.
@@ -3199,6 +3221,9 @@ impl Engine {
         self.generation += 1;
         self.dirty = false;
         self.full_dirty = false;
+        self.mask_final.retain(|id, _| self.mask_out.contains_key(id));
+        self.mask_final.extend(finals);
+        self.update_thumbs();
     }
 
     /// Final composited channels: base color (sRGB-encoded), roughness, metallic, height.
@@ -3290,6 +3315,7 @@ impl Engine {
             }
         }
         self.res = res;
+        self.uv_version += 1;
         self.pos = Tex::new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE);
         self.nrm = Tex::new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE);
         self.accum = [accum_set(&self.device, res, "accum A"), accum_set(&self.device, res, "accum B")];

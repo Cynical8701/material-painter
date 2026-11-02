@@ -1109,6 +1109,7 @@ impl PainterApp {
         self.engine.add_mask(idx, true, Some(g), &mut self.undo);
         self.selected = idx;
         self.target = StrokeTarget::Mask;
+        self.docks.show_pane(Workspace::Paint, dock::Pane::Layers);
     }
 
     /// Opens or closes the bake window (offscreen UI tests).
@@ -2481,12 +2482,16 @@ impl PainterApp {
                     painter.image(tid, thumb, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
             }
-            Content::Fill(f) => {
-                painter.rect_filled(thumb, 0.0, srgb_u8(f.mat.color));
-                let tri = vec![thumb.right_top(), thumb.right_bottom(), thumb.left_bottom()];
-                let r = (f.mat.rough * 255.0) as u8;
-                painter.add(egui::Shape::convex_polygon(tri, Color32::from_gray(r).gamma_multiply(0.5), Stroke::NONE));
-            }
+            Content::Fill(f) => match self.engine.content_thumb(id) {
+                // The fill as it comes out on the texture set (images, graph, variation).
+                Some(tid) => {
+                    paint_checker(&painter, thumb);
+                    painter.image(tid, thumb, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None => {
+                    painter.rect_filled(thumb, 0.0, srgb_u8(f.mat.color));
+                }
+            },
             Content::Folder(f) => {
                 // Folder icon, open or closed; clicking it toggles.
                 let col = if visible { Color32::from_rgb(0xe8, 0xb9, 0x4a) } else { theme::TEXT_DIM };
@@ -2505,13 +2510,21 @@ impl PainterApp {
             let mrect = Rect::from_min_size(pos2(x, rect.min.y + 5.0), vec2(36.0, 36.0));
             mask_resp = Some(ui.interact(mrect, base_id.with("mask"), Sense::click()));
             painter.rect_filled(mrect, 0.0, Color32::BLACK);
-            if mask.paint.is_some() {
-                painter.circle_filled(mrect.center(), 10.0, Color32::WHITE);
+            match self.engine.mask_thumb(id) {
+                // The mask as it comes out (painting, smart mask, layers, filters).
+                Some(tid) => {
+                    painter.image(tid, mrect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None if mask.paint.is_some() => {
+                    painter.circle_filled(mrect.center(), 10.0, Color32::WHITE);
+                }
+                None => {}
             }
-            if let Some(g) = &mask.generator {
-                let short: String = g.kind.name().split_whitespace().map(|w| w.chars().next().unwrap_or(' ')).collect();
-                painter.rect_filled(mrect.shrink(3.0), 0.0, Color32::from_gray(0x60));
-                painter.text(mrect.center(), egui::Align2::CENTER_CENTER, short, egui::FontId::proportional(13.0), Color32::WHITE);
+            // A smart mask says so in the corner.
+            if mask.generator.is_some() || !mask.layers.is_empty() {
+                let at = mrect.right_bottom() - vec2(7.0, 7.0);
+                painter.circle_filled(at, 6.5, Color32::from_black_alpha(190));
+                painter.text(at, egui::Align2::CENTER_CENTER, icons::SPARKLE, egui::FontId::proportional(9.5), theme::ACCENT);
             }
             if selected && self.target == StrokeTarget::Mask {
                 painter.rect_stroke(mrect.expand(1.0), 0.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Outside);
