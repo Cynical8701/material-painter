@@ -230,6 +230,8 @@ fn value_json(v: &Value, kind: Option<&ParamKind>) -> Json {
             _ => json!(i),
         },
         Value::Image(p) => json!(p.as_ref().map(|p| p.display().to_string())),
+        // Custom bake maps by id ("custom:3"), built-in ones by name.
+        Value::MeshMap(i) if *i >= crate::engine::CUSTOM_MAP_VALUE => json!(format!("custom:{}", i - crate::engine::CUSTOM_MAP_VALUE)),
         Value::MeshMap(i) => json!(crate::engine::MAPS.get(*i).map_or("", |m| m.name)),
     }
 }
@@ -248,7 +250,13 @@ fn json_value(v: &Json, kind: &ParamKind) -> Option<Value> {
             _ => Value::Enum((v.as_u64()? as usize).min(opts.len().saturating_sub(1))),
         },
         ParamKind::Image => Value::Image(v.as_str().map(PathBuf::from)),
-        ParamKind::MeshMap => Value::MeshMap(crate::engine::MAPS.iter().position(|m| Some(m.name) == v.as_str())?),
+        ParamKind::MeshMap => {
+            let name = v.as_str()?;
+            match name.strip_prefix("custom:") {
+                Some(id) => Value::MeshMap(crate::engine::CUSTOM_MAP_VALUE + id.parse::<usize>().ok()?),
+                None => Value::MeshMap(crate::engine::MAPS.iter().position(|m| m.name == name)?),
+            }
+        }
     })
 }
 

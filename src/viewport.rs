@@ -15,7 +15,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// What the viewports display. Discriminants match `shade()` in view.wgsl;
-/// `Map(i)` shows baked map `engine::MAPS[i]`.
+/// `Map(i)` shows baked map `engine::MAPS[i]`, `Custom(id)` a custom bake map.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ViewMode {
     Material,
@@ -25,6 +25,7 @@ pub enum ViewMode {
     Height,
     Normal,
     Map(usize),
+    Custom(u32),
     WorldNormal,
     Position,
     MissedRays,
@@ -49,9 +50,9 @@ impl ViewMode {
             ViewMode::Metallic => 3,
             ViewMode::Height => 4,
             ViewMode::Normal => 5,
-            // The custom maps came later, after the other modes.
-            ViewMode::Map(i) if i >= crate::bake::CUSTOM_BASE => 22 + (i - crate::bake::CUSTOM_BASE) as u32,
             ViewMode::Map(i) => 6 + i as u32,
+            // Which custom map rides in the globals (see `base_globals`).
+            ViewMode::Custom(_) => 22,
             ViewMode::WorldNormal => 19,
             ViewMode::Position => 20,
             ViewMode::MissedRays => 21,
@@ -67,6 +68,8 @@ impl ViewMode {
             ViewMode::Height => "Height",
             ViewMode::Normal => "Normal (final)",
             ViewMode::Map(i) => crate::engine::MAPS[i].name,
+            // The app names it after the map (see `PainterApp::mode_name`).
+            ViewMode::Custom(_) => "Custom map",
             ViewMode::WorldNormal => "World Space Normal",
             ViewMode::Position => "Position",
             ViewMode::MissedRays => "Missed Rays",
@@ -454,7 +457,16 @@ impl ViewRenderer {
                 gpu::tex_entry(7, true),
                 gpu::tex_entry(8, true),
                 gpu::tex_entry(9, true),
-                gpu::tex_entry(19, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
                 gpu::sampler_entry(10),
                 gpu::tex_entry(11, true),
                 gpu::tex_entry(12, true),
@@ -722,7 +734,7 @@ impl ViewRenderer {
                 wgpu::BindGroupEntry { binding: 7, resource: v(&engine.map_tex(2).view) },
                 wgpu::BindGroupEntry { binding: 8, resource: v(&engine.map_tex(3).view) },
                 wgpu::BindGroupEntry { binding: 9, resource: v(&engine.map_tex(4).view) },
-                wgpu::BindGroupEntry { binding: 19, resource: v(&engine.map_tex(5).view) },
+                wgpu::BindGroupEntry { binding: 19, resource: v(engine.custom_maps_view()) },
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 11, resource: v(&engine.surface_maps().1.view) },
                 wgpu::BindGroupEntry { binding: 12, resource: v(&engine.surface_maps().0.view) },
@@ -749,7 +761,11 @@ impl ViewRenderer {
             extra: [
                 if s.use_baked_normal && engine.has_bake { 1.0 } else { 0.0 },
                 if engine.has_bake { 1.0 } else { 0.0 },
-                0.0,
+                // The custom map shown, by index among the baked ones.
+                match s.mode {
+                    ViewMode::Custom(id) => engine.custom_index(id).map_or(-1.0, |i| i as f32),
+                    _ => 0.0,
+                },
                 // 3D wireframe opacity.
                 0.35,
             ],

@@ -126,6 +126,7 @@ impl Engine {
             m.paint.is_some().hash(&mut h);
         }
         (self.maps_version, self.uv_version, self.has_mask_filters(li), self.mask_out.contains_key(&layer.id)).hash(&mut h);
+        self.custom_ids.hash(&mut h);
         h.finish().max(1)
     }
 
@@ -289,7 +290,7 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 12, resource: view(Some(self.map_tex(0))) },
                 wgpu::BindGroupEntry { binding: 13, resource: view(Some(self.map_tex(1))) },
                 wgpu::BindGroupEntry { binding: 14, resource: view(Some(self.map_tex(2))) },
-                wgpu::BindGroupEntry { binding: 15, resource: view(Some(self.map_tex(5))) },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(&self.custom_array.1) },
                 wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },

@@ -18,8 +18,7 @@
 //!   wind comes from, a marker to drag over the mesh for a point.
 
 use super::{PainterApp, ViewKind, labeled, section, slider, theme};
-use crate::bake::{self, BakeReport, BakeRun, CustomKind, CustomMap, MAP_TEXTURES, PreparedScene};
-use crate::gpu::Tex;
+use crate::bake::{self, BakeReport, BakeRun, BakedMaps, CustomKind, CustomMap, PreparedScene};
 use crate::icons;
 use crate::viewport::ViewMode;
 use eframe::egui;
@@ -49,7 +48,7 @@ pub(super) struct LivePreview {
     failed: Option<(String, String)>,
     /// The full bake the preview covers, put back when it ends (`Some(None)`:
     /// there was none).
-    saved: Option<Option<([Tex; MAP_TEXTURES], Arc<BakeReport>)>>,
+    saved: Option<Option<(BakedMaps, Arc<BakeReport>)>>,
     /// The settings of the last full bake: while they match, the full bake is
     /// what's shown and there is nothing to preview.
     pub baked: Option<String>,
@@ -66,8 +65,8 @@ impl Default for LivePreview {
 /// The bake window's custom-map editing state.
 #[derive(Default)]
 pub(super) struct CustomUi {
-    /// The slot whose settings are open and whose gizmo the 3D view shows.
-    pub slot: Option<usize>,
+    /// The custom map (by id) whose settings are open and whose gizmo the 3D view shows.
+    pub open: Option<u32>,
     /// A gizmo handle being dragged.
     drag: Option<Handle>,
     /// The next click on the mesh places the point.
@@ -157,10 +156,10 @@ impl PainterApp {
         Some(rect.min + vec2(p.x / self.ppp, p.y / self.ppp))
     }
 
-    /// A custom map slot's settings (offscreen tests).
+    /// A custom map's settings, by position (offscreen tests).
     #[cfg(test)]
     pub(crate) fn test_custom(&self, k: usize) -> Option<CustomMap> {
-        self.bake_settings.custom[k]
+        self.bake_settings.custom.get(k).cloned()
     }
 
     /// Preview bakes and preparations started so far (offscreen tests).
@@ -303,36 +302,36 @@ impl PainterApp {
         });
     }
 
-    // ------------------------------------------------------------------ custom map slots
+    // ------------------------------------------------------------------ custom maps
 
     /// The custom maps section of the bake window.
     pub(super) fn custom_maps_section(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Custom maps");
+        let count = self.bake_settings.custom.len();
         ui.horizontal(|ui| {
-            section(ui, "Custom maps");
-        });
-        let used = self.bake_settings.custom.iter().filter(|c| c.is_some()).count();
-        ui.horizontal(|ui| {
-            let free = self.bake_settings.custom.iter().position(Option::is_none);
-            ui.add_enabled_ui(free.is_some(), |ui| {
+            ui.add_enabled_ui(count < bake::MAX_CUSTOM_MAPS, |ui| {
                 ui.menu_button(theme::with_icon(icons::PLUS, "Add map"), |ui| {
                     ui.set_min_width(260.0);
                     for kind in CustomKind::ALL {
                         let text = egui::RichText::new(format!("{}  {}", kind_icon(kind), kind.name())).color(kind_color(kind));
                         let r = ui.add(egui::Button::new(text).right_text(egui::RichText::new(kind_blurb(kind)).small().color(theme::TEXT_DIM)));
                         if r.on_hover_text(kind.help()).clicked() {
-                            if let Some(k) = free {
-                                self.add_custom_map(k, kind);
-                            }
+                            self.add_custom_map(kind);
                             ui.close();
                         }
                     }
                 })
                 .response
-                .on_hover_text("Bake a map of what happens around the model: fluid flow, wind, drifts, parts touching, a point.");
+                .on_hover_text("Bake a map of what happens around the model: fluid flow, wind, drifts, parts touching, a point. Add as many as you need.");
             });
-            ui.label(egui::RichText::new(format!("{used} of {}", bake::CUSTOM_SLOTS)).small().color(theme::TEXT_DIM));
+            let text = match count {
+                0 => String::new(),
+                1 => "1 map".to_string(),
+                n => format!("{n} maps"),
+            };
+            ui.label(egui::RichText::new(text).small().color(theme::TEXT_DIM));
         });
-        if used == 0 {
+        if count == 0 {
             ui.label(
                 egui::RichText::new("None yet. Add one to bake rain streaks, wind erosion, sand and snow drifts, or grime where parts meet; masks then read it with the Custom Bake Map preset.")
                     .small()
@@ -340,86 +339,110 @@ impl PainterApp {
             );
             return;
         }
-        for k in 0..bake::CUSTOM_SLOTS {
-            if self.bake_settings.custom[k].is_some() {
-                self.custom_card(ui, k);
-            }
+        let ids: Vec<u32> = self.bake_settings.custom.iter().map(|c| c.id).collect();
+        for id in ids {
+            self.custom_card(ui, id);
         }
     }
 
-    pub(super) fn add_custom_map(&mut self, k: usize, kind: CustomKind) {
-        let mut c = kind.default_map();
-        let (lo, hi) = (self.mesh.bounds_min, self.mesh.bounds_max);
+    /// Adds a custom map of a kind and opens it.
+    pub(super) fn add_custom_map(&mut self, kind: CustomKind) {
+        let i = self.bake_settings.add_custom(kind);
         if kind == CustomKind::Point {
+            let (lo, hi) = (self.mesh.bounds_min, self.mesh.bounds_max);
+            let c = &mut self.bake_settings.custom[i];
             c.point = ((lo + hi) * 0.5).to_array();
             c.distance = (hi - lo).length() * 0.35;
             self.custom_ui.picking = true;
         }
-        self.bake_settings.custom[k] = Some(c);
-        self.select_custom(k);
+        self.select_custom(self.bake_settings.custom[i].id);
     }
 
-    /// Opens a slot's settings and shows its map.
-    pub(super) fn select_custom(&mut self, k: usize) {
-        self.custom_ui.slot = Some(k);
-        self.view.mode = ViewMode::Map(bake::CUSTOM_BASE + k);
+    /// Opens a custom map's settings and shows it.
+    pub(super) fn select_custom(&mut self, id: u32) {
+        self.custom_ui.open = Some(id);
+        self.view.mode = ViewMode::Custom(id);
     }
 
-    /// One slot: a header to pick, show or remove it, and the picked slot's settings.
-    fn custom_card(&mut self, ui: &mut egui::Ui, k: usize) {
-        let Some(c) = self.bake_settings.custom[k] else { return };
-        let picked = self.custom_ui.slot == Some(k);
-        let shown = self.view.mode == ViewMode::Map(bake::CUSTOM_BASE + k);
-        let color = kind_color(c.kind);
+    fn custom_pos(&self, id: u32) -> Option<usize> {
+        self.bake_settings.custom.iter().position(|c| c.id == id)
+    }
+
+    /// One custom map: a header to open, show, copy or remove it, and the
+    /// open map's name and settings.
+    fn custom_card(&mut self, ui: &mut egui::Ui, id: u32) {
+        let Some(i) = self.custom_pos(id) else { return };
+        let (kind, name) = (self.bake_settings.custom[i].kind, self.bake_settings.custom[i].name.clone());
+        let open = self.custom_ui.open == Some(id);
+        let shown = self.view.mode == ViewMode::Custom(id);
+        let color = kind_color(kind);
         let frame = egui::Frame::new()
-            .fill(if picked { theme::PANEL_DARK } else { Color32::TRANSPARENT })
-            .stroke(Stroke::new(1.0, if picked { color.gamma_multiply(0.6) } else { theme::PANEL_DARK }))
+            .fill(if open { theme::PANEL_DARK } else { Color32::TRANSPARENT })
+            .stroke(Stroke::new(1.0, if open { color.gamma_multiply(0.6) } else { theme::PANEL_DARK }))
             .corner_radius(4.0)
             .inner_margin(egui::Margin::symmetric(8, 6));
+        let (mut remove, mut copy) = (false, false);
         frame.show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mut remove = false;
             ui.horizontal(|ui| {
-                let title = egui::RichText::new(format!("{}  Custom {} · {}", kind_icon(c.kind), k + 1, c.kind.name())).color(color).strong();
-                let header = ui.add(egui::Button::new(title).frame(false)).on_hover_text("Edit this map (and show its gizmo in the 3D view)");
-                if header.clicked() {
-                    if picked {
-                        self.custom_ui.slot = None;
-                    } else {
-                        self.select_custom(k);
+                ui.label(egui::RichText::new(kind_icon(kind)).color(color));
+                if open {
+                    // The open map's name, to type over.
+                    let edit = egui::TextEdit::singleline(&mut self.bake_settings.custom[i].name).desired_width(200.0).hint_text(kind.name());
+                    ui.add(edit).on_hover_text("This map's name, as masks and graphs list it");
+                } else {
+                    let title = egui::RichText::new(&name).color(color).strong();
+                    if ui.add(egui::Button::new(title).frame(false)).on_hover_text("Edit this map (and show its gizmo in the 3D view)").clicked() {
+                        self.select_custom(id);
                     }
+                    ui.label(egui::RichText::new(kind.name()).small().color(theme::TEXT_DIM));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(egui::Button::new(icons::TRASH).frame(false)).on_hover_text("Remove this map").clicked() {
                         remove = true;
                     }
+                    let can_copy = self.bake_settings.custom.len() < bake::MAX_CUSTOM_MAPS;
+                    if ui.add_enabled(can_copy, egui::Button::new(icons::COPY).frame(false)).on_hover_text("Duplicate this map (same settings, a new name)").clicked() {
+                        copy = true;
+                    }
                     let eye = if shown { icons::EYE } else { icons::EYE_SLASH };
                     if ui.add(egui::Button::new(eye).frame(false)).on_hover_text("Show this map in the views").clicked() {
-                        self.view.mode = if shown { ViewMode::Material } else { ViewMode::Map(bake::CUSTOM_BASE + k) };
+                        self.view.mode = if shown { ViewMode::Material } else { ViewMode::Custom(id) };
+                    }
+                    if open && ui.add(egui::Button::new(icons::CHECK).frame(false)).on_hover_text("Done: close this map's settings").clicked() {
+                        self.custom_ui.open = None;
                     }
                 });
             });
-            if remove {
-                self.bake_settings.custom[k] = None;
-                if picked {
-                    self.custom_ui.slot = None;
-                }
-                if shown {
-                    self.view.mode = ViewMode::Material;
-                }
-                return;
-            }
-            if picked {
-                self.custom_settings(ui, k);
+            if open {
+                self.custom_settings(ui, id);
             }
         });
+        if remove {
+            self.bake_settings.custom.remove(i);
+            if open {
+                self.custom_ui.open = None;
+            }
+            if shown {
+                self.view.mode = ViewMode::Material;
+            }
+        } else if copy {
+            let mut c = self.bake_settings.custom[i].clone();
+            c.id = self.bake_settings.custom.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+            let taken = |n: &str| self.bake_settings.custom.iter().any(|c| c.name == n);
+            c.name = (2..).map(|k| format!("{} {k}", name.trim_end_matches(|ch: char| ch.is_ascii_digit()).trim_end())).find(|n| !taken(n)).expect("a free name");
+            let new_id = c.id;
+            self.bake_settings.custom.insert(i + 1, c);
+            self.select_custom(new_id);
+        }
         ui.add_space(2.0);
     }
 
-    /// The picked slot's settings, in words that say what they do.
-    fn custom_settings(&mut self, ui: &mut egui::Ui, k: usize) {
+    /// The open map's settings, in words that say what they do.
+    fn custom_settings(&mut self, ui: &mut egui::Ui, id: u32) {
+        let Some(i) = self.custom_pos(id) else { return };
         let picking = &mut self.custom_ui.picking;
-        let Some(c) = &mut self.bake_settings.custom[k] else { return };
+        let c = &mut self.bake_settings.custom[i];
         ui.label(egui::RichText::new(c.kind.help()).small().color(theme::TEXT_DIM));
         ui.add_space(2.0);
         if c.kind.has_direction() {
@@ -442,7 +465,7 @@ impl PainterApp {
                 }
             });
             ui.label(egui::RichText::new("Or drag the arrow's handle in the 3D view.").small().color(theme::TEXT_DIM));
-            egui::CollapsingHeader::new(egui::RichText::new("Exact angle").small()).id_salt(("custom angle", k)).show(ui, |ui| {
+            egui::CollapsingHeader::new(egui::RichText::new("Exact angle").small()).id_salt(("custom angle", id)).show(ui, |ui| {
                 slider(ui, "Compass (°)", &mut c.azimuth, 0.0..=360.0);
                 slider(ui, "Height (°)", &mut c.elevation, -90.0..=90.0);
             });
@@ -480,13 +503,13 @@ impl PainterApp {
 
     // ------------------------------------------------------------------ 3D gizmos
 
-    /// The slot whose gizmo the 3D view shows.
+    /// The custom map whose gizmo the 3D view shows: its index and settings.
     fn gizmo_slot(&self) -> Option<(usize, CustomMap)> {
         if !self.show_bake {
             return None;
         }
-        let k = self.custom_ui.slot?;
-        Some((k, self.bake_settings.custom[k]?))
+        let i = self.custom_pos(self.custom_ui.open?)?;
+        Some((i, self.bake_settings.custom[i].clone()))
     }
 
     /// The mesh's center and how far from it the direction handle sits:
@@ -556,14 +579,14 @@ impl PainterApp {
                     let on = if disc >= 0.0 { o + d * (-b - disc.sqrt()) } else { o + d * (-b) };
                     let dir = (on - center).normalize_or_zero();
                     if dir != Vec3::ZERO {
-                        let slot = self.bake_settings.custom[k].as_mut().expect("the gizmo's slot");
+                        let slot = &mut self.bake_settings.custom[k];
                         slot.elevation = dir.y.clamp(-1.0, 1.0).asin().to_degrees();
                         slot.azimuth = dir.x.atan2(dir.z).to_degrees().rem_euclid(360.0);
                     }
                 }
                 Handle::Point => {
                     if let Some(p) = mesh_hit(self, px) {
-                        self.bake_settings.custom[k].as_mut().expect("the gizmo's slot").point = p.to_array();
+                        self.bake_settings.custom[k].point = p.to_array();
                     }
                 }
             }
@@ -575,7 +598,7 @@ impl PainterApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             if pressed {
                 if let Some(p) = mesh_hit(self, px) {
-                    self.bake_settings.custom[k].as_mut().expect("the gizmo's slot").point = p.to_array();
+                    self.bake_settings.custom[k].point = p.to_array();
                     self.custom_ui.picking = false;
                 }
                 return true;

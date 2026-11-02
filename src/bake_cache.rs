@@ -7,7 +7,7 @@
 //! with a changed baker never serves stale maps. Entries are LZ4-compressed;
 //! the least recently used ones are dropped past [`MAX_BYTES`].
 
-use crate::bake::{BakeReport, BakeSettings, MAP_FORMATS, MAP_TEXTURES};
+use crate::bake::{BakeReport, BakeSettings, BakedMaps, CUSTOM_FORMAT, MAP_FORMATS, MAP_TEXTURES};
 use crate::gpu::{self, LAYER_USAGE, Tex};
 use crate::mesh::Mesh;
 use eframe::wgpu;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 const MAGIC: &[u8; 4] = b"MPBC";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 /// Total size the cache may grow to before old entries are evicted.
 const MAX_BYTES: u64 = 2 << 30;
 
@@ -25,10 +25,12 @@ const MAX_BYTES: u64 = 2 << 30;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Key(String);
 
-/// A cached bake: its report and the five packed maps, as uploaded bytes.
+/// A cached bake: its report, the packed maps and the custom map textures,
+/// as uploaded bytes.
 pub struct Entry {
     pub report: BakeReport,
     maps: [(u32, Vec<u8>); MAP_TEXTURES],
+    custom: Vec<(u32, Vec<u8>)>,
 }
 
 /// 64-bit FNV-1a over 8-byte words: stable across runs and builds (unlike
@@ -165,48 +167,53 @@ fn decode(mut b: &[u8]) -> Option<Entry> {
     let json_len = u32_(&mut b)? as usize;
     let report: serde_json::Value = serde_json::from_slice(take(&mut b, json_len)?).ok()?;
     let report = BakeReport::from_cache_json(&report)?;
+    let texture = |b: &mut &[u8], format: wgpu::TextureFormat| -> Option<(u32, Vec<u8>)> {
+        let res = u32_(b)?;
+        let len = u32_(b)? as usize;
+        let data = lz4_flex::decompress_size_prepended(take(b, len)?).ok()?;
+        let expected = (res as usize).pow(2) * gpu::bytes_per_texel(format) as usize;
+        (res != 0 && data.len() == expected).then_some((res, data))
+    };
     let mut maps: [(u32, Vec<u8>); MAP_TEXTURES] = Default::default();
     for (i, slot) in maps.iter_mut().enumerate() {
-        let res = u32_(&mut b)?;
-        let len = u32_(&mut b)? as usize;
-        let data = lz4_flex::decompress_size_prepended(take(&mut b, len)?).ok()?;
-        let expected = (res as usize).pow(2) * gpu::bytes_per_texel(MAP_FORMATS[i]) as usize;
-        if res == 0 || data.len() != expected {
-            return None;
-        }
-        *slot = (res, data);
+        *slot = texture(&mut b, MAP_FORMATS[i])?;
     }
-    Some(Entry { report, maps })
+    let count = u32_(&mut b)? as usize;
+    let custom = (0..count).map(|_| texture(&mut b, CUSTOM_FORMAT)).collect::<Option<Vec<_>>>()?;
+    Some(Entry { report, maps, custom })
 }
 
 impl Entry {
     /// Uploads the cached maps as the textures a bake would have produced.
-    pub fn upload(self, device: &wgpu::Device, queue: &wgpu::Queue) -> ([Tex; MAP_TEXTURES], BakeReport) {
+    pub fn upload(self, device: &wgpu::Device, queue: &wgpu::Queue) -> (BakedMaps, BakeReport) {
         let usage = LAYER_USAGE | wgpu::TextureUsages::STORAGE_BINDING;
-        let mut maps = self.maps.into_iter().enumerate().map(|(i, (res, data))| {
-            let tex = Tex::new(device, "mesh map", res, res, MAP_FORMATS[i], usage);
+        let make = |format: wgpu::TextureFormat, (res, data): (u32, Vec<u8>)| {
+            let tex = Tex::new(device, "mesh map", res, res, format, usage);
             let layout = wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(res * gpu::bytes_per_texel(MAP_FORMATS[i])),
+                bytes_per_row: Some(res * gpu::bytes_per_texel(format)),
                 rows_per_image: Some(res),
             };
             queue.write_texture(tex.copy_info(), &data, layout, tex.extent());
             tex
-        });
+        };
+        let mut maps = self.maps.into_iter().enumerate().map(|(i, m)| make(MAP_FORMATS[i], m));
         let maps = std::array::from_fn(|_| maps.next().expect("every map"));
-        (maps, self.report)
+        let custom = self.custom.into_iter().map(|m| make(CUSTOM_FORMAT, m)).collect();
+        (BakedMaps { maps, custom }, self.report)
     }
 }
 
 /// Saves a finished bake in the background: the maps are read back from the
 /// GPU once the bake's work completes, then compressed and written. Failures
 /// only cost the cache entry, so they are ignored.
-pub fn store(key: Key, maps: &[Tex; MAP_TEXTURES], report: Arc<BakeReport>, device: &wgpu::Device, queue: &wgpu::Queue) {
+pub fn store(key: Key, baked: &BakedMaps, report: Arc<BakeReport>, device: &wgpu::Device, queue: &wgpu::Queue) {
     let Some(path) = path(&key) else { return };
-    let textures = maps.each_ref().map(|m| m.texture.clone());
+    let textures: Vec<wgpu::Texture> = baked.maps.iter().map(|m| m.texture.clone()).collect();
+    let custom: Vec<wgpu::Texture> = baked.custom.iter().map(|m| m.texture.clone()).collect();
     let (device, queue) = (device.clone(), queue.clone());
     let spawned = std::thread::Builder::new().name("bake cache".into()).spawn(move || {
-        let bytes = encode(&textures, &report, &device, &queue);
+        let bytes = encode(&textures, &custom, &report, &device, &queue);
         if write_atomic(&path, &bytes).is_ok() {
             evict(MAX_BYTES);
         }
@@ -218,15 +225,23 @@ pub fn store(key: Key, maps: &[Tex; MAP_TEXTURES], report: Arc<BakeReport>, devi
 
 /// Reads the maps back (blocking until the bake's GPU work is done) and
 /// serializes them with the report.
-fn encode(textures: &[wgpu::Texture; MAP_TEXTURES], report: &BakeReport, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
+fn encode(textures: &[wgpu::Texture], custom: &[wgpu::Texture], report: &BakeReport, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
     // Map by map, so only one uncompressed map is in memory at a time.
     let mut body = Vec::new();
-    for tex in textures {
+    let put = |body: &mut Vec<u8>, tex: &wgpu::Texture| {
         let raw = gpu::read_wgpu_texture(device, queue, tex);
         let packed = lz4_flex::compress_prepend_size(&raw);
         body.extend_from_slice(&tex.width().to_le_bytes());
         body.extend_from_slice(&(packed.len() as u32).to_le_bytes());
         body.extend_from_slice(&packed);
+    };
+    for tex in textures {
+        put(&mut body, tex);
+    }
+    // The custom map textures, after their count.
+    body.extend_from_slice(&(custom.len() as u32).to_le_bytes());
+    for tex in custom {
+        put(&mut body, tex);
     }
     // The readback waited for the bake to finish, so the report is final.
     let json = serde_json::to_vec(&report.cache_json()).expect("report serializes");
@@ -315,12 +330,19 @@ mod tests {
         let gpu_mesh = crate::gpu::GpuMesh::new(&device, &mesh);
         let mut settings = BakeSettings::default();
         settings.apply_quality(crate::bake::Quality::Draft);
-        let (maps, report, _) = crate::bake::tests::run_bake(&device, &queue, &mesh, &gpu_mesh, &settings, 256);
+        // Five custom maps: two custom textures.
+        for kind in [crate::bake::CustomKind::Flow, crate::bake::CustomKind::Exposure, crate::bake::CustomKind::Contact, crate::bake::CustomKind::Point, crate::bake::CustomKind::Flow] {
+            settings.add_custom(kind);
+        }
+        let (baked, report, _) = crate::bake::tests::run_bake(&device, &queue, &mesh, &gpu_mesh, &settings, 256);
+        assert_eq!(baked.custom.len(), 2);
 
-        let textures = maps.each_ref().map(|m| m.texture.clone());
+        let textures: Vec<wgpu::Texture> = baked.maps.iter().map(|m| m.texture.clone()).collect();
+        let custom: Vec<wgpu::Texture> = baked.custom.iter().map(|m| m.texture.clone()).collect();
         let t = std::time::Instant::now();
-        let bytes = encode(&textures, &report, &device, &queue);
-        let raw: usize = maps.iter().map(|m| (m.width * m.height * gpu::bytes_per_texel(m.format)) as usize).sum();
+        let bytes = encode(&textures, &custom, &report, &device, &queue);
+        let all: Vec<&Tex> = baked.maps.iter().chain(&baked.custom).collect();
+        let raw: usize = all.iter().map(|m| (m.width * m.height * gpu::bytes_per_texel(m.format)) as usize).sum();
         println!("  encoded {} KB ({} KB raw) in {:.0} ms", bytes.len() / 1024, raw / 1024, t.elapsed().as_secs_f32() * 1000.0);
 
         let entry = decode(&bytes).expect("decodes");
@@ -330,7 +352,9 @@ mod tests {
         assert_eq!(r.id_regions.len(), report.id_regions.len());
         assert_eq!(r.edge_max_distance, report.edge_max_distance);
         assert_eq!(r.missed_percent(), report.missed_percent());
-        for (a, b) in maps.iter().zip(&restored) {
+        assert_eq!(r.custom, report.custom);
+        assert_eq!(restored.custom.len(), baked.custom.len());
+        for (a, b) in all.iter().zip(restored.maps.iter().chain(&restored.custom)) {
             assert_eq!(a.format, b.format);
             assert!(gpu::read_texture(&device, &queue, a) == gpu::read_texture(&device, &queue, b), "map data matches");
         }

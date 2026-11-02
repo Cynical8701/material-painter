@@ -244,7 +244,9 @@ fn half_to_f32(b: [u8; 2]) -> f32 {
 
 /// The editor for one node parameter; true when it changed. `salt` keeps
 /// widget ids apart between nodes.
-pub(super) fn param_widget(ui: &mut egui::Ui, p: &graph::def::Param, v: &mut Value, salt: u64) -> bool {
+/// A node parameter's editor; `custom` lists the custom bake maps a Mesh
+/// Map parameter can pick.
+pub(super) fn param_widget(ui: &mut egui::Ui, p: &graph::def::Param, v: &mut Value, salt: u64, custom: &[crate::bake::CustomMap]) -> bool {
     // Seeds get a button that rolls a new one.
     if let (ParamKind::Int { min, max }, Value::Int(i)) = (&p.kind, &mut *v) {
         if p.name.contains("seed") {
@@ -273,9 +275,21 @@ pub(super) fn param_widget(ui: &mut egui::Ui, p: &graph::def::Param, v: &mut Val
                     }
                     (ParamKind::MeshMap, Value::MeshMap(i)) => {
                         let mut ch = false;
-                        egui::ComboBox::from_id_salt(("param map", salt, p.name.as_str())).selected_text(MAPS[*i].name).show_ui(ui, |ui| {
+                        let base = crate::engine::CUSTOM_MAP_VALUE;
+                        let current = match MAPS.get(*i) {
+                            Some(m) => m.name.to_string(),
+                            None => custom.iter().find(|c| *i == base + c.id as usize).map_or("(removed map)".to_string(), |c| c.name.clone()),
+                        };
+                        egui::ComboBox::from_id_salt(("param map", salt, p.name.as_str())).selected_text(current).height(400.0).show_ui(ui, |ui| {
                             for (k, m) in MAPS.iter().enumerate() {
                                 ch |= ui.selectable_value(i, k, m.name).on_hover_text(m.desc).changed();
+                            }
+                            if !custom.is_empty() {
+                                ui.separator();
+                                ui.label(egui::RichText::new("CUSTOM MAPS").small().color(theme::TEXT_DIM));
+                            }
+                            for c in custom {
+                                ch |= ui.selectable_value(i, base + c.id as usize, &c.name).on_hover_text(c.kind.name()).changed();
                             }
                         });
                         ch
@@ -442,7 +456,7 @@ impl PainterApp {
             }
             if d.dirty || d.maps_seen != maps_version {
                 let engine = &self.engine;
-                let maps = |t: usize| engine.map_tex(t);
+                let maps = |m: usize| engine.mesh_map(m);
                 if d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, &self.graphs.lib, &maps, maps_version) {
                     d.push = true;
                 }
@@ -480,6 +494,7 @@ impl PainterApp {
 
     /// The graph's exposed parameters as controls (layer properties).
     pub(super) fn exposed_controls(&mut self, ui: &mut egui::Ui, id: u64) {
+        let custom = self.bake_settings.custom.clone();
         let lib = &self.graphs.lib;
         let Some(d) = self.graphs.docs.iter_mut().find(|d| d.id == id) else { return };
         if d.graph.exposed.is_empty() {
@@ -493,7 +508,7 @@ impl PainterApp {
             let Some(p) = def.params.iter().find(|p| p.name == name) else { continue };
             let mut v = lib.value(node, &name).unwrap_or_else(|| p.default.clone());
             let label = format!("{} {}", def.name, name.replace('_', " "));
-            if labeled(ui, &label, |ui| param_widget(ui, p, &mut v, nid)) {
+            if labeled(ui, &label, |ui| param_widget(ui, p, &mut v, nid, &custom)) {
                 node.params.insert(name.clone(), v);
                 changed = true;
             }
@@ -1223,6 +1238,7 @@ impl PainterApp {
     // ------------------------------------------------------------------ side panel
 
     fn node_panel(&mut self, ui: &mut egui::Ui, doc: u64) {
+        let custom = self.bake_settings.custom.clone();
         let Some(sel) = self.graphs.editor.selected else {
             ui.label(egui::RichText::new("Select a node to edit it.").color(theme::TEXT_DIM));
             ui.add_space(8.0);
@@ -1259,7 +1275,7 @@ impl PainterApp {
                 let c = labeled(ui, &label, |ui| {
                     let star = egui::RichText::new(if exposed { "◆" } else { "◇" }).color(if exposed { Color32::from_rgb(255, 220, 120) } else { theme::TEXT_DIM });
                     toggle = ui.add(egui::Button::new(star).frame(false)).on_hover_text("Show this parameter in the layer properties (Material Paint)").clicked();
-                    param_widget(ui, p, &mut v, sel)
+                    param_widget(ui, p, &mut v, sel, &custom)
                 });
                 if toggle {
                     if exposed {

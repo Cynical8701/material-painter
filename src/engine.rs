@@ -7,7 +7,7 @@
 //! * Fill layers and mask generators are procedural: zero texture memory.
 //! * Stroke history lives compressed in system RAM (see `undo.rs`).
 
-use crate::bake::{BakeReport, MAP_FORMATS, MAP_TEXTURES};
+use crate::bake::{BakeReport, BakedMaps, CUSTOM_FORMAT, CUSTOM_PER_TEXTURE, MAP_FORMATS, MAP_TEXTURES};
 use crate::gpu::{self, GpuMesh, LAYER_USAGE, Tex};
 use crate::undo::{DocProps, Edit, LayerProps, Snapshot, StrokeTarget, UndoEntry, UndoStack};
 use eframe::{egui, egui_wgpu, wgpu};
@@ -126,13 +126,24 @@ pub const GEN_INPUTS: [(&str, &str); GEN_INPUT_COUNT] = [
     ("Wood grain", "Rings and fibers running along the planks (the long axis, vertical on end faces)"),
     ("Cells", "Distance to the nearest cell center: pits, hammer dents, leather pebbling, cracks (invert)"),
     ("Scratches", "Fine scratches in random directions"),
-    ("Custom 1", "Custom bake map 1 (set it up in the bake window: flow, exposure, deposits, contact...)"),
-    ("Custom 2", "Custom bake map 2 (set it up in the bake window)"),
-    ("Custom 3", "Custom bake map 3 (set it up in the bake window)"),
-    ("Custom 4", "Custom bake map 4 (set it up in the bake window)"),
 ];
 
-pub const GEN_INPUT_COUNT: usize = 23;
+pub const GEN_INPUT_COUNT: usize = 19;
+
+/// Custom bake maps one smart mask can mix (any of the project's, by id).
+pub const MAX_CUSTOM_INPUTS: usize = 4;
+
+/// A smart mask input reading a custom bake map.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct CustomInput {
+    /// The map's `bake::CustomMap::id` (0: unused).
+    pub id: u32,
+    pub weight: f32,
+}
+
+/// Mesh Map values (graph nodes) from here on are custom bake maps: the
+/// value minus this is the map's id. Below it they index [`MAPS`].
+pub const CUSTOM_MAP_VALUE: usize = 1000;
 
 /// Indices into [`GEN_INPUTS`].
 mod thumbs;
@@ -157,8 +168,6 @@ pub mod gin {
     pub const GRAIN: usize = 16;
     pub const CELLS: usize = 17;
     pub const SCRATCHES: usize = 18;
-    /// The first custom bake map; the four slots follow in order.
-    pub const CUSTOM: usize = 19;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -280,10 +289,8 @@ impl GenKind {
                 w[ID] = 1.0;
                 (0.5, 0.05, 3.0, 0.0)
             }
-            GenKind::CustomMap => {
-                w[CUSTOM] = 1.0;
-                (0.35, 0.15, 3.0, 0.3)
-            }
+            // Reads a custom map the user picks (see `Generator::custom`).
+            GenKind::CustomMap => (0.35, 0.15, 3.0, 0.3),
         };
         Generator {
             kind: self,
@@ -297,6 +304,7 @@ impl GenKind {
             edge_width: 0.04,
             id_color: [1.0, 0.0, 0.0],
             id_tolerance: 0.15,
+            custom: [CustomInput::default(); MAX_CUSTOM_INPUTS],
         }
     }
 }
@@ -317,9 +325,16 @@ pub struct Generator {
     pub edge_width: f32,
     pub id_color: [f32; 3],
     pub id_tolerance: f32,
+    /// Custom bake maps mixed in, by id.
+    pub custom: [CustomInput; MAX_CUSTOM_INPUTS],
 }
 
 impl Generator {
+    /// The custom bake maps this generator reads (by id).
+    pub fn custom_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.custom.iter().filter(|c| c.id != 0 && c.weight.abs() > 1e-4).map(|c| c.id)
+    }
+
     /// The baked maps this generator reads (a bit per `MAPS` index).
     pub fn needs_maps(&self) -> u32 {
         // Generator input -> the map it comes from.
@@ -335,10 +350,7 @@ impl Generator {
             (gin::PART_GRADIENT, 8),
             (gin::PART_RANDOM, 7),
         ];
-        let custom = (0..crate::bake::CUSTOM_SLOTS)
-            .filter(|k| self.weights[gin::CUSTOM + k].abs() > 1e-4)
-            .fold(0, |acc, k| acc | 1 << (crate::bake::CUSTOM_BASE + k));
-        FROM.iter().filter(|(i, _)| self.weights[*i].abs() > 1e-4).fold(custom, |acc, (_, m)| acc | (1 << m))
+        FROM.iter().filter(|(i, _)| self.weights[*i].abs() > 1e-4).fold(0, |acc, (_, m)| acc | (1 << m))
     }
 }
 
@@ -371,12 +383,12 @@ const fn map(name: &'static str, tex: usize, comp: usize, kind: MapKind, desc: &
     MapInfo { name, tex, comp, kind, desc }
 }
 
-/// How many baked maps there are (see [`MAPS`]).
-pub const MAP_COUNT: usize = 17;
+/// How many built-in baked maps there are (see [`MAPS`]).
+pub const MAP_COUNT: usize = 13;
 
-/// Every baked map, packed into six textures (`bake::MAP_TEXTURES`); the
-/// custom slots start at `bake::CUSTOM_BASE`. See `ViewMode::index` for how
-/// the views display them.
+/// Every built-in baked map, packed into five textures
+/// (`bake::MAP_TEXTURES`). View mode `6 + index` displays map `index`.
+/// Custom bake maps come on top, any number (see `Engine::custom_index`).
 pub const MAPS: [MapInfo; MAP_COUNT] = [
     map("Ambient Occlusion", 0, 0, MapKind::Scalar, "How much ambient light reaches each point."),
     map("Curvature", 0, 1, MapKind::Scalar, "Per-texel convex (bright) / concave (dark); includes high-poly detail."),
@@ -391,10 +403,6 @@ pub const MAPS: [MapInfo; MAP_COUNT] = [
     map("Normal", 3, 0, MapKind::Normal, "Tangent-space normal from the high poly."),
     map("Height", 3, 2, MapKind::Scalar, "High-poly displacement relative to the low poly."),
     map("ID", 4, 0, MapKind::Info, "Color per material or mesh part, for ID masks."),
-    map("Custom 1", 5, 0, MapKind::Scalar, "Custom bake map 1: flow, exposure, deposits, contact or distance (bake window)."),
-    map("Custom 2", 5, 1, MapKind::Scalar, "Custom bake map 2 (bake window)."),
-    map("Custom 3", 5, 2, MapKind::Scalar, "Custom bake map 3 (bake window)."),
-    map("Custom 4", 5, 3, MapKind::Scalar, "Custom bake map 4 (bake window)."),
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -805,7 +813,10 @@ struct LayerUniform {
     var1: [f32; 4],
     bmin: [f32; 4],
     bsize: [f32; 4],
-    gw: [[f32; 4]; 6],
+    gw: [[f32; 4]; 5],
+    /// Custom map inputs: their index among the baked custom maps (-1 none), and weights.
+    gc: [f32; 4],
+    gcw: [f32; 4],
     gp0: [f32; 4],
     gp1: [f32; 4],
     gid: [f32; 4],
@@ -904,6 +915,12 @@ pub struct Engine {
     snap_mask: Option<Tex>,
     /// Baked mesh maps as produced by the baker (see [`MAPS`]).
     maps: [Tex; MAP_TEXTURES],
+    /// The baked custom map textures (four maps each), at the texture set's
+    /// size, and the same copied into one array for the shaders.
+    custom: Vec<Tex>,
+    custom_array: (wgpu::Texture, wgpu::TextureView),
+    /// The custom maps' ids, in baked order (map `i`: channel `i % 4` of layer `i / 4`).
+    custom_ids: Vec<u32>,
     /// Maps with levels and painted fixes applied; `None` when unchanged.
     resolved: [Option<Tex>; MAP_TEXTURES],
     pub map_fix: [Option<Tex>; MAP_COUNT],
@@ -1003,6 +1020,9 @@ impl Engine {
             snap: [None, None, None, None],
             snap_mask: None,
             maps,
+            custom: Vec::new(),
+            custom_array: Self::custom_array_texture(&device, 1, 1),
+            custom_ids: Vec::new(),
             resolved: Default::default(),
             map_fix: Default::default(),
             map_levels: [Levels::default(); MAP_COUNT],
@@ -1224,7 +1244,21 @@ impl Engine {
             entries.push(gpu::tex_entry(b, (5..=8).contains(&b)));
         }
         for b in 12..=16 {
-            entries.push(gpu::tex_entry(b, true));
+            // 15: the custom maps, an array.
+            entries.push(if b == 15 {
+                wgpu::BindGroupLayoutEntry {
+                    binding: b,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                }
+            } else {
+                gpu::tex_entry(b, true)
+            });
         }
         entries.push(gpu::sampler_entry(17));
         entries.push(gpu::sampler_entry(18));
@@ -1416,14 +1450,12 @@ impl Engine {
         // f16 bit patterns: 0.0 = 0x0000, 0.5 = 0x3800, 1.0 = 0x3C00.
         let map_b: [u16; 4] = [0x3C00, 0x3C00, 0x3C00, 0x3800];
         let half: [u16; 4] = [0, 0, 0x3800, 0];
-        let zero: [u16; 4] = [0; 4];
         let data: [&[u8]; MAP_TEXTURES] = [
             &[255, 128, 255, 255],
             bytemuck::cast_slice(&map_b),
             &[128, 255, 128, 128],
             bytemuck::cast_slice(&half),
             &[128, 128, 128, 255],
-            bytemuck::cast_slice(&zero),
         ];
         for (t, d) in maps.iter().zip(data) {
             queue.write_texture(t.copy_info(), d, Default::default(), t.extent());
@@ -1441,13 +1473,94 @@ impl Engine {
     }
 
     /// The baked maps on screen and their report (`None` before the first bake).
-    pub fn current_maps(&self) -> Option<([Tex; MAP_TEXTURES], Arc<BakeReport>)> {
+    pub fn current_maps(&self) -> Option<(BakedMaps, Arc<BakeReport>)> {
         let report = self.bake_report.clone().filter(|_| self.has_bake)?;
-        Some((self.maps.clone(), report))
+        Some((BakedMaps { maps: self.maps.clone(), custom: self.custom.clone() }, report))
+    }
+
+    /// A texture array of `layers` custom map textures (zeros: nothing baked).
+    fn custom_array_texture(device: &wgpu::Device, res: u32, layers: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("custom maps"),
+            size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: layers.max(1) },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: CUSTOM_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        (texture, view)
+    }
+
+    /// Copies the custom map textures into the array the shaders read.
+    fn build_custom_array(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let res = self.custom.first().map_or(1, |t| t.width);
+        self.custom_array = Self::custom_array_texture(&self.device, res, self.custom.len() as u32);
+        for (layer, tex) in self.custom.iter().enumerate() {
+            let dst = wgpu::TexelCopyTextureInfo {
+                texture: &self.custom_array.0,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                aspect: wgpu::TextureAspect::All,
+            };
+            encoder.copy_texture_to_texture(tex.copy_info(), dst, tex.extent());
+        }
+    }
+
+    /// Where custom map `id` is among the baked ones (`None`: not baked).
+    pub fn custom_index(&self, id: u32) -> Option<usize> {
+        self.custom_ids.iter().position(|&c| c == id).filter(|_| self.has_bake)
+    }
+
+    /// The custom maps a generator reads that the bake didn't make (none
+    /// before the first bake).
+    pub fn missing_custom(&self, g: &Generator) -> Vec<u32> {
+        if !self.has_bake {
+            return Vec::new();
+        }
+        g.custom_ids().filter(|&id| self.custom_index(id).is_none()).collect()
+    }
+
+    /// The texture and channel a Mesh Map value reads (built-in maps by
+    /// [`MAPS`] index, custom maps from [`CUSTOM_MAP_VALUE`]).
+    pub fn mesh_map(&self, value: usize) -> Option<(&Tex, usize)> {
+        if value < CUSTOM_MAP_VALUE {
+            let m = MAPS.get(value)?;
+            return Some((self.map_tex(m.tex), m.comp));
+        }
+        let i = self.custom_index((value - CUSTOM_MAP_VALUE) as u32)?;
+        Some((&self.custom[i / CUSTOM_PER_TEXTURE], i % CUSTOM_PER_TEXTURE))
+    }
+
+    /// The custom maps' array for the shaders.
+    pub fn custom_maps_view(&self) -> &wgpu::TextureView {
+        &self.custom_array.1
+    }
+
+    /// A generator's custom inputs as the composite shader reads them: each
+    /// map's index among the baked ones (-1: unused or not baked) and weight.
+    fn custom_refs(&self, g: &Generator) -> ([f32; 4], [f32; 4]) {
+        let mut idx = [-1.0; 4];
+        let mut w = [0.0; 4];
+        for (k, c) in g.custom.iter().enumerate() {
+            if let Some(i) = (c.id != 0).then(|| self.custom_index(c.id)).flatten() {
+                idx[k] = i as f32;
+                w[k] = c.weight;
+            }
+        }
+        (idx, w)
     }
 
     /// Back to the neutral maps of a document that was never baked.
     pub fn clear_maps(&mut self) {
+        self.custom.clear();
+        self.custom_ids.clear();
+        self.custom_array = Self::custom_array_texture(&self.device, 1, 1);
         self.maps = Self::default_maps(&self.device, &self.queue);
         self.bake_report = None;
         self.has_bake = false;
@@ -1457,16 +1570,21 @@ impl Engine {
 
     /// Adopts freshly baked maps. Painted fixes and levels are kept, so artists
     /// can re-bake with new settings without losing their corrections.
-    pub fn set_maps(&mut self, maps: [Tex; MAP_TEXTURES], report: Arc<BakeReport>) {
+    pub fn set_maps(&mut self, baked: BakedMaps, report: Arc<BakeReport>) {
         // Bakes stop at `bake::MAX_BAKE_RES`; bigger texture sets get them upscaled.
-        let maps = if maps[0].width < self.res {
-            let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let BakedMaps { maps, custom } = baked;
+        let (maps, custom) = if maps[0].width < self.res {
             let up = maps.each_ref().map(|m| self.resample(&mut encoder, m, self.res));
-            self.queue.submit([encoder.finish()]);
-            up
+            let custom = custom.iter().map(|m| self.resample(&mut encoder, m, self.res)).collect();
+            (up, custom)
         } else {
-            maps
+            (maps, custom)
         };
+        self.custom = custom;
+        self.custom_ids = report.custom.clone();
+        self.build_custom_array(&mut encoder);
+        self.queue.submit([encoder.finish()]);
         if maps[0].width != self.res {
             self.map_fix = Default::default();
         }
@@ -2839,6 +2957,7 @@ impl Engine {
                 for (i, w) in g.weights.iter().enumerate() {
                     u.gw[i / 4][i % 4] = *w;
                 }
+                (u.gc, u.gcw) = self.custom_refs(g);
                 u.gp0 = [g.level, g.contrast, g.scale, g.noise];
                 u.gp1 = [if g.invert { 1.0 } else { 0.0 }, g.seed, 1.0, g.edge_width];
                 u.gid = [g.id_color[0], g.id_color[1], g.id_color[2], g.id_tolerance];
@@ -2964,6 +3083,7 @@ impl Engine {
                             for (i, w) in g.weights.iter().enumerate() {
                                 iu.gw[i / 4][i % 4] = *w;
                             }
+                            (iu.gc, iu.gcw) = self.custom_refs(&g);
                             iu.gp0 = [g.level, g.contrast, g.scale, g.noise];
                             iu.gp1 = [if g.invert { 1.0 } else { 0.0 }, g.seed, 1.0, g.edge_width];
                             iu.gid = [g.id_color[0], g.id_color[1], g.id_color[2], g.id_tolerance];
@@ -3164,9 +3284,8 @@ impl Engine {
                     wgpu::BindGroupEntry { binding: 12, resource: view(Some(self.map_tex(0))) },
                     wgpu::BindGroupEntry { binding: 13, resource: view(Some(self.map_tex(1))) },
                     wgpu::BindGroupEntry { binding: 14, resource: view(Some(self.map_tex(2))) },
-                    // Composite never reads map D; its slot holds map F
-                    // (the custom maps) instead.
-                    wgpu::BindGroupEntry { binding: 15, resource: view(Some(self.map_tex(5))) },
+                    // Composite never reads map D; its slot holds the custom maps.
+                    wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(&self.custom_array.1) },
                     wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                     wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
@@ -3287,6 +3406,8 @@ impl Engine {
         if self.has_bake {
             let maps = std::array::from_fn(|t| self.resample(&mut encoder, &self.maps[t], res));
             self.maps = maps;
+            self.custom = self.custom.iter().map(|t| self.resample(&mut encoder, t, res)).collect();
+            self.build_custom_array(&mut encoder);
         }
         let fixes: Vec<Option<Tex>> =
             self.map_fix.iter().map(|f| f.as_ref().map(|t| self.resample(&mut encoder, t, res))).collect();

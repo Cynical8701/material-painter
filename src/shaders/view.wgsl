@@ -10,7 +10,7 @@ struct Globals {
     params: vec4<f32>,   // view mode, height strength, texel size, texture resolution
     view2d: vec4<f32>,   // zoom (px per uv), pan x, pan y, unused
     size: vec4<f32>,     // viewport width, height, unused, unused
-    extra: vec4<f32>,    // use baked normal, has bake, edge max distance, unused
+    extra: vec4<f32>,    // use baked normal, has bake, custom map shown (view mode 22), wireframe opacity
     bmin: vec4<f32>,
     bsize: vec4<f32>,
     bg: vec4<f32>,       // background color (linear), background intensity
@@ -30,7 +30,7 @@ struct Globals {
 @group(0) @binding(7) var map_c: texture_2d<f32>;  // bent normal, part gradient
 @group(0) @binding(8) var map_d: texture_2d<f32>;  // baked normal xy, height, missed
 @group(0) @binding(9) var map_e: texture_2d<f32>;  // ID
-@group(0) @binding(19) var map_f: texture_2d<f32>;  // custom maps 1-4
+@group(0) @binding(19) var custom_maps: texture_2d_array<f32>;  // custom map i: channel i % 4 of layer i / 4
 @group(0) @binding(10) var samp: sampler;
 @group(0) @binding(11) var t_wnrm: texture_2d<f32>;
 @group(0) @binding(12) var t_wpos: texture_2d<f32>;
@@ -108,7 +108,8 @@ fn sample_surface(uv: vec2<f32>) -> Surface {
     s.c = textureSampleLevel(map_c, samp, uv, 0.0);
     s.d = textureSampleLevel(map_d, samp, uv, 0.0);
     s.e = textureSampleLevel(map_e, samp, uv, 0.0);
-    s.f = textureSampleLevel(map_f, samp, uv, 0.0);
+    let ci = max(i32(g.extra.z), 0);
+    s.f = vec4<f32>(textureSampleLevel(custom_maps, samp, uv, ci / 4, 0.0)[ci % 4]);
     s.wnrm = textureSampleLevel(t_wnrm, samp, uv, 0.0).xyz * 2.0 - 1.0;
     s.wpos = textureSampleLevel(t_wpos, samp, uv, 0.0).xyz;
     let tx = g.params.z;
@@ -222,9 +223,6 @@ fn shade(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
             return mix(base, vec3<f32>(1.0, 0.02, 0.02), s.d.w);
         }
         case 22: { return lin(s.f.r); }
-        case 23: { return lin(s.f.g); }
-        case 24: { return lin(s.f.b); }
-        case 25: { return lin(s.f.a); }
         default: {}
     }
     return shade_pbr(s, n, v, shadow);

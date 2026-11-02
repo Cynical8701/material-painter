@@ -26,20 +26,28 @@ use wgpu::util::DeviceExt;
 pub const MAX_BAKE_RES: u32 = 4096;
 
 /// How many packed map textures a bake makes (see `engine::MAPS`).
-pub const MAP_TEXTURES: usize = 6;
+pub const MAP_TEXTURES: usize = 5;
 
 /// Formats of the packed map textures (see `engine::MAPS`).
 /// Map B (sky, edge distance, crease distance, part random) is 16-bit: narrow
 /// edge masks read only a small slice of the distance range, which 8 bits
-/// would band into stripes running along every edge. Map F holds the custom
-/// maps, 16-bit for smooth flow and exposure gradients.
-pub const MAP_FORMATS: [F; MAP_TEXTURES] =
-    [F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm, F::Rgba16Float];
+/// would band into stripes running along every edge.
+pub const MAP_FORMATS: [F; MAP_TEXTURES] = [F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm, F::Rgba16Float, F::Rgba8Unorm];
 
-/// Custom map slots: user-defined maps baked into map F, one per channel.
-pub const CUSTOM_SLOTS: usize = 4;
-/// `engine::MAPS` index of the first custom slot.
-pub const CUSTOM_BASE: usize = 13;
+/// Custom maps bake four to a texture, one per channel, 16-bit for smooth
+/// flow and exposure gradients: map `i` is channel `i % 4` of texture `i / 4`.
+pub const CUSTOM_FORMAT: F = F::Rgba16Float;
+pub const CUSTOM_PER_TEXTURE: usize = 4;
+/// Most custom maps a bake makes (the views and masks read them from one
+/// texture array; this keeps it within every GPU's layer limit).
+pub const MAX_CUSTOM_MAPS: usize = 64;
+
+/// A bake's maps: the packed built-in maps and the custom map textures.
+#[derive(Clone)]
+pub struct BakedMaps {
+    pub maps: [Tex; MAP_TEXTURES],
+    pub custom: Vec<Tex>,
+}
 
 /// What a custom map bakes (see `cs_custom` in bake.wgsl).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,8 +107,12 @@ impl CustomKind {
         matches!(self, CustomKind::Flow | CustomKind::Exposure | CustomKind::Deposit)
     }
 
+    /// A new map of this kind with its usual settings (`id` and `name` to
+    /// fill in, see [`BakeSettings::add_custom`]).
     pub fn default_map(self) -> CustomMap {
         let base = CustomMap {
+            id: 0,
+            name: self.name().to_string(),
             kind: self,
             azimuth: 0.0,
             elevation: 90.0,
@@ -131,10 +143,14 @@ impl CustomKind {
     }
 }
 
-/// A custom map slot's settings. Distances are in mesh units (the mesh is
+/// A custom map's settings. Distances are in mesh units (the mesh is
 /// normalized to a 2-unit box).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq)]
 pub struct CustomMap {
+    /// Masks refer to the map by this (never reused within a project), so
+    /// renaming, reordering or removing maps doesn't mix them up.
+    pub id: u32,
+    pub name: String,
     pub kind: CustomKind,
     /// Where the fluid or wind comes from: compass angle around the up axis
     /// (0 = +Z, 90 = +X) and height above the horizon (90 = straight above),
@@ -153,6 +169,24 @@ pub struct CustomMap {
     pub wander: f32,
     /// Distance from point: the point.
     pub point: [f32; 3],
+}
+
+/// Everything but the name, which doesn't change what's baked (the bake
+/// cache and the live preview key on this).
+impl std::fmt::Debug for CustomMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomMap")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("azimuth", &self.azimuth)
+            .field("elevation", &self.elevation)
+            .field("spread", &self.spread)
+            .field("distance", &self.distance)
+            .field("strength", &self.strength)
+            .field("wander", &self.wander)
+            .field("point", &self.point)
+            .finish()
+    }
 }
 
 impl CustomMap {
@@ -224,23 +258,20 @@ pub struct BakeSettings {
     /// rays start on the cage and travel toward the low poly.
     pub cage: Option<PathBuf>,
     /// Which maps to bake: a bit per `engine::MAPS` index. Maps left out are
-    /// written neutral and their passes skipped where they can be. Custom
-    /// maps are baked for every slot that has one (`custom`).
+    /// written neutral and their passes skipped where they can be.
     pub maps: u32,
-    /// The custom map slots (`engine::MAPS` from [`CUSTOM_BASE`]).
-    pub custom: [Option<CustomMap>; CUSTOM_SLOTS],
+    /// The custom maps, baked in this order (at most [`MAX_CUSTOM_MAPS`]).
+    pub custom: Vec<CustomMap>,
 }
 
-/// Every map (a bit per `engine::MAPS` index), custom slots included.
-pub const ALL_MAPS: u32 = (1 << (CUSTOM_BASE + CUSTOM_SLOTS)) - 1;
-/// The custom map slots' bits.
-pub const CUSTOM_MAPS: u32 = ALL_MAPS & !((1 << CUSTOM_BASE) - 1);
+/// Every built-in map (a bit per `engine::MAPS` index).
+pub const ALL_MAPS: u32 = (1 << 13) - 1;
 /// The maps a bake can leave out (the rest are cheap and always baked):
 /// ambient occlusion, curvature, cavity, thickness, sky exposure, edge and
 /// crease distance.
 pub const OPTIONAL_MAPS: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
 /// Map bits always baked.
-const ALWAYS_MAPS: u32 = ((1 << CUSTOM_BASE) - 1) & !0b111_1111;
+const ALWAYS_MAPS: u32 = ALL_MAPS & !0b111_1111;
 
 impl Default for BakeSettings {
     fn default() -> Self {
@@ -267,7 +298,7 @@ impl Default for BakeSettings {
             match_by_name: true,
             cage: None,
             maps: ALL_MAPS,
-            custom: [None; CUSTOM_SLOTS],
+            custom: Vec::new(),
         };
         s.apply_quality(Quality::Standard);
         s
@@ -277,9 +308,28 @@ impl Default for BakeSettings {
 impl BakeSettings {
     /// The maps this bake makes (the chosen ones plus the always-baked).
     pub fn baked_maps(&self) -> u32 {
-        let custom = self.custom.iter().enumerate().filter(|(_, c)| c.is_some()).fold(0, |acc, (k, _)| acc | 1 << (CUSTOM_BASE + k));
-        (self.maps & ALL_MAPS & !CUSTOM_MAPS) | ALWAYS_MAPS | custom
+        (self.maps & ALL_MAPS) | ALWAYS_MAPS
     }
+
+    /// The custom maps this bake makes (the first [`MAX_CUSTOM_MAPS`]).
+    pub fn baked_custom(&self) -> &[CustomMap] {
+        &self.custom[..self.custom.len().min(MAX_CUSTOM_MAPS)]
+    }
+
+    /// Adds a custom map of this kind with a fresh id and a name not yet
+    /// taken ("Fluid Flow 2"); returns its index.
+    pub fn add_custom(&mut self, kind: CustomKind) -> usize {
+        let mut c = kind.default_map();
+        c.id = self.custom.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        let taken = |n: &str| self.custom.iter().any(|c| c.name == n);
+        if taken(&c.name) {
+            let base = c.name.clone();
+            c.name = (2..).map(|k| format!("{base} {k}")).find(|n| !taken(n)).expect("a free name");
+        }
+        self.custom.push(c);
+        self.custom.len() - 1
+    }
+
 
     /// Rays per texel a custom map traces (flow: upstream walks).
     fn custom_rays(&self, kind: CustomKind) -> u32 {
@@ -290,11 +340,10 @@ impl BakeSettings {
         }
     }
 
-    /// The custom slots as the shader reads them (see `BakeU.cust`).
-    fn custom_uniform(&self) -> [[f32; 4]; CUSTOM_SLOTS * 3] {
-        let mut u = [[0.0; 4]; CUSTOM_SLOTS * 3];
-        for (k, c) in self.custom.iter().enumerate() {
-            let Some(c) = c else { continue };
+    /// Custom maps `4g..4g+4` as the shader reads them (see `BakeU.cust`).
+    fn custom_uniform(&self, g: usize) -> [[f32; 4]; CUSTOM_PER_TEXTURE * 3] {
+        let mut u = [[0.0; 4]; CUSTOM_PER_TEXTURE * 3];
+        for (k, c) in self.baked_custom().iter().skip(g * CUSTOM_PER_TEXTURE).take(CUSTOM_PER_TEXTURE).enumerate() {
             let d = c.direction();
             u[k * 3] = [c.kind.code(), c.distance.max(1e-4), c.spread.clamp(0.0, 89.0).to_radians().cos(), self.custom_rays(c.kind) as f32];
             u[k * 3 + 1] = [d.x, d.y, d.z, c.strength.max(0.0)];
@@ -377,9 +426,8 @@ impl BakeSettings {
         let projection = if self.high_poly.is_some() { self.aa * self.aa } else { 1 };
         // A flow walk traces about two rays per step.
         let custom: u32 = self
-            .custom
+            .baked_custom()
             .iter()
-            .flatten()
             .map(|c| self.custom_rays(c.kind) * if c.kind == CustomKind::Flow { 64 } else { 1 })
             .sum();
         projection + self.ao_rays + self.thickness_rays + self.sky_rays + custom
@@ -1114,7 +1162,7 @@ struct BakeUniform {
     e: [f32; 4],
     f: [f32; 4],
     g: [f32; 4],
-    cust: [[f32; 4]; CUSTOM_SLOTS * 3],
+    cust: [[f32; 4]; CUSTOM_PER_TEXTURE * 3],
 }
 
 pub struct BakeReport {
@@ -1132,6 +1180,9 @@ pub struct BakeReport {
     pub used_cage: bool,
     /// Which maps were baked (a bit per `engine::MAPS` index).
     pub baked: u32,
+    /// The custom maps baked, by id, in texture order (map `i` is channel
+    /// `i % 4` of custom texture `i / 4`).
+    pub custom: Vec<u32>,
     /// Loaded from the bake cache instead of baked.
     pub from_cache: bool,
     started: Instant,
@@ -1173,6 +1224,7 @@ impl BakeReport {
             "matched_names": self.matched_names,
             "used_cage": self.used_cage,
             "baked": self.baked,
+            "custom": self.custom,
             "gpu_seconds": self.seconds().unwrap_or(0.0),
             "valid_texels": self.valid_texels.load(Ordering::Relaxed),
             "missed_texels": self.missed_texels.load(Ordering::Relaxed),
@@ -1205,6 +1257,7 @@ impl BakeReport {
             matched_names: u("matched_names")? as usize,
             used_cage: v["used_cage"].as_bool()?,
             baked: v["baked"].as_u64().map_or(ALL_MAPS, |b| b as u32),
+            custom: v["custom"].as_array().map_or(Vec::new(), |a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect()),
             from_cache: true,
             started: Instant::now(),
             gpu_seconds: AtomicU32::new(f("gpu_seconds")?.to_bits()),
@@ -1264,6 +1317,8 @@ pub struct BakeRun {
     occ: Tex,
     bent: Tex,
     maps: Option<[Tex; MAP_TEXTURES]>,
+    /// The custom map textures, four maps each, and each one's settings.
+    custom: Vec<(Tex, [[f32; 4]; CUSTOM_PER_TEXTURE * 3])>,
     nodes: wgpu::Buffer,
     tri_pos: wgpu::Buffer,
     tri_nrm: wgpu::Buffer,
@@ -1687,7 +1742,7 @@ impl GpuBaker {
             // Random ray sets are picked per world cell of about two texels
             // (see `world_seed` in bake.wgsl).
             g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), s.baked_maps() as f32, 2.0 * scene.uv_scale / res as f32, 0.0],
-            cust: s.custom_uniform(),
+            cust: [[0.0; 4]; CUSTOM_PER_TEXTURE * 3],
         };
         let ubuf = Self::uniform_buffer(device, &uniform);
         let nodes = Self::storage(device, "bvh nodes", &scene.nodes);
@@ -1713,8 +1768,9 @@ impl GpuBaker {
             t("map C", MAP_FORMATS[2]),
             t("map D", MAP_FORMATS[3]),
             t("map E", MAP_FORMATS[4]),
-            t("map F", MAP_FORMATS[5]),
         ];
+        let groups = settings.baked_custom().len().div_ceil(CUSTOM_PER_TEXTURE);
+        let custom: Vec<_> = (0..groups).map(|g| (t("custom maps", CUSTOM_FORMAT), settings.custom_uniform(g))).collect();
         let group = Self::group(
             device,
             &self.surface.1,
@@ -1762,6 +1818,7 @@ impl GpuBaker {
             matched_names: scene.matched_names,
             used_cage: scene.cage.is_some(),
             baked: settings.baked_maps(),
+            custom: settings.baked_custom().iter().map(|c| c.id).collect(),
             from_cache: false,
             started: Instant::now(),
             gpu_seconds: AtomicU32::new(0),
@@ -1790,11 +1847,11 @@ impl GpuBaker {
                 tiles.push([x, y, 0]);
             }
         }
-        // Map F stays zero (nothing baked) when no slot has a custom map.
-        if settings.custom.iter().any(Option::is_some) {
+        // Custom maps, a texture (four maps) at a time: pass 1 + texture index.
+        for g in 0..custom.len() as u32 {
             for y in (0..res).step_by(CUSTOM_TILE as usize) {
                 for x in (0..res).step_by(CUSTOM_TILE as usize) {
-                    tiles.push([x, y, 1]);
+                    tiles.push([x, y, 1 + g]);
                 }
             }
         }
@@ -1809,6 +1866,7 @@ impl GpuBaker {
             occ: t("occlusion", F::Rgba8Unorm),
             bent: t("bent normal", F::Rgba8Unorm),
             maps: Some(maps),
+            custom,
             nodes,
             tri_pos,
             tri_nrm,
@@ -1831,7 +1889,7 @@ impl GpuBaker {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         ctx: &egui::Context,
-    ) -> Option<[Tex; MAP_TEXTURES]> {
+    ) -> Option<BakedMaps> {
         while run.next_tile < run.tiles.len() && run.in_flight.load(Ordering::Acquire) < MAX_IN_FLIGHT {
             let [x, y, pass] = run.tiles[run.next_tile];
             run.next_tile += 1;
@@ -1859,7 +1917,9 @@ impl GpuBaker {
                 );
                 Self::dispatch(&mut encoder, &self.occlusion.0, &group, TILE.min(run.res - x), TILE.min(run.res - y));
             } else {
-                let map_f = &run.maps.as_ref().expect("maps until the bake finishes")[5];
+                let (target, settings) = &run.custom[pass as usize - 1];
+                u.cust = *settings;
+                let ubuf = Self::uniform_buffer(device, &u);
                 let group = Self::group(
                     device,
                     &self.custom.1,
@@ -1873,7 +1933,7 @@ impl GpuBaker {
                         (14, v(&run.surf_nrm)),
                         (28, v(&run.surf_geo)),
                         (35, v(&run.surf_curv)),
-                        (36, v(map_f)),
+                        (36, v(target)),
                     ],
                 );
                 Self::dispatch(&mut encoder, &self.custom.0, &group, CUSTOM_TILE.min(run.res - x), CUSTOM_TILE.min(run.res - y));
@@ -2021,10 +2081,11 @@ impl GpuBaker {
             &[(&run.occ, &scratch[0], 21, 15), (&run.bent, &scratch[1], 22, 16)],
             6,
         );
-        if run.uniform.cust.iter().step_by(3).any(|a| a[0] > 0.0) {
-            let map_f = &run.maps.as_ref().expect("maps until the bake finishes")[5];
-            let scratch = Tex::new(device, "custom maps 2", res, res, MAP_FORMATS[5], usage);
-            Self::smooth_passes(device, &mut encoder, &self.cust_smooth, run, &[(map_f, &scratch, 37, 36)], 4);
+        if !run.custom.is_empty() {
+            let scratch = Tex::new(device, "custom maps 2", res, res, CUSTOM_FORMAT, usage);
+            for (target, _) in &run.custom {
+                Self::smooth_passes(device, &mut encoder, &self.cust_smooth, run, &[(target, &scratch, 37, 36)], 4);
+            }
         }
 
         let maps = run.maps.take().unwrap();
@@ -2055,7 +2116,7 @@ impl GpuBaker {
             ctx.request_repaint();
         });
         Self::poll_until_done(device);
-        Some(maps)
+        Some(BakedMaps { maps, custom: run.custom.iter().map(|(t, _)| t.clone()).collect() })
     }
 
     /// wgpu runs completion callbacks only while the device is polled, which
@@ -2288,7 +2349,7 @@ pub(crate) mod tests {
         gpu_mesh: &GpuMesh,
         settings: &BakeSettings,
         res: u32,
-    ) -> ([Tex; MAP_TEXTURES], Arc<BakeReport>, Tex) {
+    ) -> (BakedMaps, Arc<BakeReport>, Tex) {
         let scene = prepare(mesh, settings).expect("bake source");
         let baker = GpuBaker::new(device);
         let ctx = egui::Context::default();
@@ -2332,7 +2393,8 @@ pub(crate) mod tests {
 
     fn bake(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, settings: &BakeSettings, res: u32) -> Baked {
         let gpu_mesh = GpuMesh::new(device, mesh);
-        let (maps, _, low_pos) = run_bake(device, queue, mesh, &gpu_mesh, settings, res);
+        let (baked, _, low_pos) = run_bake(device, queue, mesh, &gpu_mesh, settings, res);
+        let maps = baked.maps;
         let inside = read_texture(device, queue, &low_pos)
             .chunks_exact(16)
             .map(|b| f32::from_le_bytes([b[12], b[13], b[14], b[15]]) > 0.75)
@@ -2457,7 +2519,8 @@ pub(crate) mod tests {
         let mut s = BakeSettings::default();
         s.apply_quality(Quality::Draft);
         s.maps = (1 << 0) | (1 << 1);
-        let (maps, report, _) = run_bake(&device, &queue, &mesh, &gpu_mesh, &s, 128);
+        let (baked, report, _) = run_bake(&device, &queue, &mesh, &gpu_mesh, &s, 128);
+        let maps = baked.maps;
         assert_eq!(report.baked & 0b111_1111, 0b11, "AO and curvature baked");
         let a = read_texture(&device, &queue, &maps[0]);
         let b = read_texture(&device, &queue, &maps[1]);

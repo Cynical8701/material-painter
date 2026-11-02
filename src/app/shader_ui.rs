@@ -333,7 +333,7 @@ impl PainterApp {
         }
         let rt = sm.rt.get_or_insert_with(|| Runtime::new(&self.rs.device, &self.rs.queue));
         let engine = &self.engine;
-        let maps = |t: usize| engine.map_tex(t);
+        let maps = |m: usize| engine.mesh_map(m);
         rt.evaluate(&self.rs.device, &self.rs.queue, &sm.preview, &lib, &maps, engine.maps_version);
         sm.error = rt.errors.get(&node).map(|e| def.map_error(e));
     }
@@ -616,6 +616,7 @@ impl PainterApp {
     }
 
     fn shader_preview(&mut self, ui: &mut egui::Ui) {
+        let custom = self.bake_settings.custom.clone();
         // Keep the preview's egui texture current.
         let sm = &mut self.graphs.shader;
         if let Some(t) = sm.rt.as_ref().and_then(|rt| rt.thumb(sm.node)) {
@@ -697,7 +698,7 @@ impl PainterApp {
             for p in &def.params {
                 let Some(n) = sm.preview.node_mut(node) else { break };
                 let mut v = n.params.get(&p.name).filter(|v| std::mem::discriminant(*v) == std::mem::discriminant(&p.default)).cloned().unwrap_or_else(|| p.default.clone());
-                if labeled(ui, &p.name.replace('_', " "), |ui| param_widget(ui, p, &mut v, 0)) {
+                if labeled(ui, &p.name.replace('_', " "), |ui| param_widget(ui, p, &mut v, 0, &custom)) {
                     n.params.insert(p.name.clone(), v);
                     changed = true;
                 }

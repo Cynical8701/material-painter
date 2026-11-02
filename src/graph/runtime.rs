@@ -81,8 +81,9 @@ pub(crate) fn validation_scope<T>(device: &wgpu::Device, f: impl FnOnce() -> T) 
     (value, err)
 }
 
-/// The mesh maps a graph can read: the packed textures, by `MAPS[i].tex`.
-pub type MeshMaps<'a> = &'a dyn Fn(usize) -> &'a Tex;
+/// The mesh maps a graph can read: a Mesh Map value's texture and channel
+/// (see `Engine::mesh_map`), `None` when it isn't baked.
+pub type MeshMaps<'a> = &'a dyn Fn(usize) -> Option<(&'a Tex, usize)>;
 
 impl Runtime {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Runtime {
@@ -264,9 +265,10 @@ impl Runtime {
             match v {
                 Value::Image(Some(path)) => slots[slot] = Some(self.image(device, queue, path)?),
                 Value::MeshMap(m) => {
-                    let info = &crate::engine::MAPS[(*m).min(crate::engine::MAPS.len() - 1)];
-                    map_slots[slot] = Some(info.tex);
-                    comp_bits |= (info.comp as u32) << (slot * 2);
+                    if let Some((_, comp)) = maps(*m) {
+                        map_slots[slot] = Some(*m);
+                        comp_bits |= (comp as u32) << (slot * 2);
+                    }
                 }
                 _ => {}
             }
@@ -308,7 +310,7 @@ impl Runtime {
             for i in 0..MAX_IMAGES {
                 let view = match (&slots[i], map_slots[i]) {
                     (Some(t), _) => &t.view,
-                    (None, Some(m)) => &maps(m).view,
+                    (None, Some(m)) => maps(m).map_or(&self.dummy.view, |(t, _)| &t.view),
                     _ => &self.dummy.view,
                 };
                 entries.push(wgpu::BindGroupEntry {

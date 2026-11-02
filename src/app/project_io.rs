@@ -143,6 +143,8 @@ fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 
 fn custom_map_json(c: &crate::bake::CustomMap) -> Value {
     json!({
+        "id": c.id,
+        "name": c.name,
         "kind": format!("{:?}", c.kind),
         "azimuth": c.azimuth, "elevation": c.elevation, "spread": c.spread,
         "distance": c.distance, "strength": c.strength, "wander": c.wander,
@@ -150,8 +152,10 @@ fn custom_map_json(c: &crate::bake::CustomMap) -> Value {
     })
 }
 
-/// A custom bake map slot; `None` for an empty slot or an unknown kind.
-fn custom_map_from(v: &Value) -> Option<crate::bake::CustomMap> {
+/// A custom bake map; `None` for an empty slot (older projects had four
+/// fixed slots) or an unknown kind. Maps saved without an id (those slots)
+/// get `fallback_id`, the slot's number, which older masks refer to.
+fn custom_map_from(v: &Value, fallback_id: u32) -> Option<crate::bake::CustomMap> {
     let name = s(v, "kind")?;
     let kind = crate::bake::CustomKind::ALL.into_iter().find(|k| format!("{k:?}") == name)?;
     let d = kind.default_map();
@@ -160,6 +164,8 @@ fn custom_map_from(v: &Value) -> Option<crate::bake::CustomMap> {
         *dst = x.as_f64().unwrap_or(0.0) as f32;
     }
     Some(crate::bake::CustomMap {
+        id: v["id"].as_u64().map_or(fallback_id, |id| id as u32),
+        name: s(v, "name").unwrap_or(kind.name()).to_string(),
         kind,
         azimuth: f(v, "azimuth", d.azimuth),
         elevation: f(v, "elevation", d.elevation),
@@ -235,6 +241,7 @@ pub(super) fn generator_json(g: &Generator) -> Value {
         "edge_width": g.edge_width,
         "id_color": g.id_color,
         "id_tolerance": g.id_tolerance,
+        "custom": g.custom.iter().filter(|c| c.id != 0).map(|c| json!({"id": c.id, "weight": c.weight})).collect::<Vec<_>>(),
     })
 }
 
@@ -299,11 +306,22 @@ pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
     let kind = GenKind::ALL.into_iter().find(|k| k.name() == name).ok_or(format!("unknown generator '{name}'"))?;
     let d = kind.default_generator();
     let mut weights = [0.0; crate::engine::GEN_INPUT_COUNT];
+    let mut custom = [crate::engine::CustomInput::default(); crate::engine::MAX_CUSTOM_INPUTS];
     if let Some(a) = v.get("weights").and_then(Value::as_array) {
         // Older projects have fewer inputs; new ones default to 0.
         for (w, x) in weights.iter_mut().zip(a) {
             *w = x.as_f64().unwrap_or(0.0) as f32;
         }
+        // Projects from the four fixed custom slots kept their weights after
+        // the built-in inputs: slot k is the map with id k + 1.
+        let old = a.iter().skip(crate::engine::GEN_INPUT_COUNT).map(|x| x.as_f64().unwrap_or(0.0) as f32);
+        let used = old.enumerate().filter(|(_, w)| *w != 0.0).take(crate::engine::MAX_CUSTOM_INPUTS);
+        for (slot, (k, w)) in custom.iter_mut().zip(used) {
+            *slot = crate::engine::CustomInput { id: k as u32 + 1, weight: w };
+        }
+    }
+    for (slot, c) in custom.iter_mut().zip(v["custom"].as_array().into_iter().flatten()) {
+        *slot = crate::engine::CustomInput { id: c["id"].as_u64().unwrap_or(0) as u32, weight: c["weight"].as_f64().unwrap_or(0.0) as f32 };
     }
     Ok(Generator {
         kind,
@@ -317,6 +335,7 @@ pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
         edge_width: f(v, "edge_width", d.edge_width),
         id_color: arr(v, "id_color", d.id_color),
         id_tolerance: f(v, "id_tolerance", d.id_tolerance),
+        custom,
     })
 }
 
@@ -442,7 +461,7 @@ impl PainterApp {
             "match_by_name": bs.match_by_name,
             "cage": bs.cage.as_ref().map(|p| p.display().to_string()),
             "maps": bs.maps,
-            "custom": bs.custom.iter().map(|c| c.as_ref().map(custom_map_json)).collect::<Vec<_>>(),
+            "custom": bs.custom.iter().map(custom_map_json).collect::<Vec<_>>(),
         });
         let v = &self.view;
         let p = &v.post;
@@ -583,9 +602,13 @@ impl PainterApp {
         bs.cage = s(bv, "cage").map(PathBuf::from).filter(|p| p.is_file());
         // Projects from before map selection baked everything.
         bs.maps = bv["maps"].as_u64().map_or(crate::bake::ALL_MAPS, |m| m as u32);
-        for (slot, cv) in bs.custom.iter_mut().zip(bv["custom"].as_array().into_iter().flatten()) {
-            *slot = custom_map_from(cv);
-        }
+        bs.custom = bv["custom"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(k, cv)| custom_map_from(cv, k as u32 + 1))
+            .collect();
         bs.id_source = match s(bv, "id_source") {
             Some("Materials") => IdSource::Materials,
             Some("VertexColors") => IdSource::VertexColors,
@@ -777,5 +800,32 @@ impl PainterApp {
 
     pub(super) fn open_dialog() -> Option<PathBuf> {
         rfd::FileDialog::new().add_filter("Material Painter project", &[EXTENSION]).pick_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Projects from the four fixed custom slots load as maps with ids 1-4
+    /// (empty slots skipped), and their masks' extra weights as inputs on
+    /// those ids.
+    #[test]
+    fn old_custom_slots_migrate() {
+        let slots = json!([{"kind": "Flow", "elevation": 90.0}, null, {"kind": "Deposit"}, null]);
+        let maps: Vec<_> = slots.as_array().unwrap().iter().enumerate().filter_map(|(k, v)| custom_map_from(v, k as u32 + 1)).collect();
+        assert_eq!(maps.iter().map(|c| (c.id, c.name.as_str())).collect::<Vec<_>>(), vec![(1, "Fluid Flow"), (3, "Wind Deposits")]);
+
+        let mut weights = vec![0.0; crate::engine::GEN_INPUT_COUNT];
+        weights[crate::engine::gin::OCCLUSION] = 0.4;
+        weights.extend([0.0, 0.0, 1.0, 0.0]);
+        let g = generator_from(&json!({"kind": "Custom Bake Map", "weights": weights})).unwrap();
+        assert_eq!(g.weights[crate::engine::gin::OCCLUSION], 0.4);
+        assert_eq!((g.custom[0].id, g.custom[0].weight), (3, 1.0), "old slot 3 reads the map with id 3");
+        assert!(g.custom[1..].iter().all(|c| c.id == 0));
+
+        // And the new format round-trips.
+        let back = generator_from(&generator_json(&g)).unwrap();
+        assert_eq!(back, g);
     }
 }
