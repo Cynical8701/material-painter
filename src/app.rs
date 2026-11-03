@@ -3098,6 +3098,7 @@ impl PainterApp {
     }
 
     fn bake_window(&mut self, ctx: &egui::Context) {
+        const BAKE_WIDTH: f32 = 520.0;
         let mut open = self.show_bake;
         // Against the right edge, so the 3D view (and the gizmos in it) stays visible.
         let screen = ctx.content_rect();
@@ -3105,11 +3106,19 @@ impl PainterApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(470.0)
-            .max_width(740.0)
-            .default_pos(egui::pos2((screen.max.x - 760.0).max(screen.min.x), screen.min.y + 60.0))
+            // A fixed width (text wraps to it), so nothing inside can widen the window or
+            // leave the bars above narrower than what's below them.
+            .min_width(BAKE_WIDTH)
+            .max_width(BAKE_WIDTH)
+            .default_pos(egui::pos2((screen.max.x - BAKE_WIDTH - 30.0).max(screen.min.x), screen.min.y + 60.0))
             .show(ctx, |ui| {
+            ui.set_width(BAKE_WIDTH);
             self.preview_bar(ui);
+            // The settings scroll within the screen; the Bake button stays below them.
+            let settings_height = (screen.height() - 260.0).max(200.0);
+            egui::ScrollArea::vertical().max_height(settings_height).auto_shrink([false, true]).show(ui, |ui| {
+            // Inside the scroll area too: text wraps here instead of running past the window.
+            ui.set_max_width(BAKE_WIDTH - 14.0);
             let s = &mut self.bake_settings;
             section(ui, "Source");
             ui.horizontal(|ui| {
@@ -3203,7 +3212,7 @@ impl PainterApp {
                     }
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("All").clicked() {
                     s.maps = crate::bake::ALL_MAPS;
                 }
@@ -3269,8 +3278,10 @@ impl PainterApp {
                 ui.label(egui::RichText::new("Distances are in mesh units; the mesh is normalized to a 2-unit box.").small().color(theme::TEXT_DIM));
             });
 
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            });
+
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
                 let busy = self.bake_job.is_some();
                 if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(theme::with_icon(icons::FIRE, "Bake")).strong()).fill(theme::ACCENT_DIM).min_size(vec2(120.0, 30.0))).clicked() {
                     self.pending.push(Action::Bake);
