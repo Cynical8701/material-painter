@@ -311,6 +311,9 @@ enum Prepared {
 struct Shelf {
     cat: ShelfCat,
     search: String,
+    /// Only materials of this type (smart, plain and downloaded materials); `None`: all,
+    /// grouped by type.
+    kind: Option<presets::MaterialType>,
     /// Thumbnail edge in points (Ctrl+scroll over the shelf, or the slider).
     icon_size: f32,
     smart: Vec<egui::TextureHandle>,
@@ -1069,6 +1072,13 @@ impl PainterApp {
         self.view.show_seams_3d = true;
     }
 
+    /// Shows the plain materials on the shelf, every type (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn test_shelf_materials(&mut self) {
+        self.shelf.cat = ShelfCat::Materials;
+        self.shelf.kind = None;
+    }
+
     /// Closes the welcome window (offscreen UI tests).
     #[cfg(test)]
     pub(crate) fn test_close_welcome(&mut self) {
@@ -1337,7 +1347,7 @@ impl PainterApp {
             bake_job: None,
             baker,
             show_bake: false,
-            shelf: Shelf { cat: ShelfCat::SmartMaterials, search: String::new(), icon_size: 72.0, smart, materials, generators, brushes, textures },
+            shelf: Shelf { cat: ShelfCat::SmartMaterials, search: String::new(), kind: None, icon_size: 72.0, smart, materials, generators, brushes, textures },
             shelf_previews: Some(shelf_previews),
             export: ExportDialog::new("MaterialBall".into()),
             prefs_applied: prefs.clone(),
@@ -3953,10 +3963,23 @@ impl PainterApp {
                         ShelfCat::Graphs => "Material graphs you saved or downloaded. Double-click or drag onto a view to add as a graph fill layer. Right-click to share.",
                         ShelfCat::Downloaded => "Free materials from the asset library. Double-click or drag onto a view to add as a fill layer.",
                     };
-                    ui.label(egui::RichText::new(hint).small().color(theme::TEXT_DIM));
+                    if matches!(self.shelf.cat, ShelfCat::SmartMaterials | ShelfCat::Materials | ShelfCat::Downloaded) {
+                        let text = self.shelf.kind.map_or("All types", |k| k.name());
+                        egui::ComboBox::from_id_salt("shelf type").selected_text(text).width(130.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.shelf.kind, None, "All types").on_hover_text("Everything, grouped by type");
+                            for k in presets::MaterialType::ALL {
+                                ui.selectable_value(&mut self.shelf.kind, Some(k), k.name());
+                            }
+                        });
+                    }
+                    // The size slider at the right edge first; the hint fits in what's left,
+                    // shortened with an ellipsis (whole on hover) instead of running under it.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(egui::Slider::new(&mut self.shelf.icon_size, ICON_MIN..=ICON_MAX).show_value(false))
                             .on_hover_text("Thumbnail size (Ctrl+scroll over the shelf)");
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(hint).small().color(theme::TEXT_DIM)).truncate()).on_hover_text(hint);
+                        });
                     });
                 });
                 ui.add_space(2.0);
@@ -3969,6 +3992,19 @@ impl PainterApp {
                 }
                 let icon = self.shelf.icon_size;
                 let search = self.shelf.search.to_lowercase();
+                let kind = self.shelf.kind;
+                let wanted = |k: presets::MaterialType| kind.is_none_or(|f| f == k);
+                // Starts a new row with the type's name when the type changes (all types shown).
+                let group = |ui: &mut egui::Ui, last: &mut Option<presets::MaterialType>, k: presets::MaterialType| {
+                    if kind.is_none() && *last != Some(k) {
+                        if last.is_some() {
+                            ui.end_row();
+                        }
+                        ui.label(egui::RichText::new(k.name().to_uppercase()).small().strong().color(theme::TEXT_DIM));
+                        ui.end_row();
+                        *last = Some(k);
+                    }
+                };
                 let mut share = None;
                 let mut share_smart = None;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -4010,11 +4046,15 @@ impl PainterApp {
                                     );
                                 }
                                 let fallback = self.shelf.materials.first().map(|t| t.id());
-                                for i in 0..self.library.local.len() {
+                                let kinds: Vec<presets::MaterialType> = self.library.local.iter().map(|m| presets::MaterialType::of(&m.name, None)).collect();
+                                let mut order: Vec<usize> = (0..self.library.local.len())
+                                    .filter(|&i| self.library.local[i].name.to_lowercase().contains(&search) && wanted(kinds[i]))
+                                    .collect();
+                                order.sort_by_key(|&i| kinds[i]);
+                                let mut last = None;
+                                for i in order {
+                                    group(ui, &mut last, kinds[i]);
                                     let m = &self.library.local[i];
-                                    if !m.name.to_lowercase().contains(&search) {
-                                        continue;
-                                    }
                                     let thumb = self.library.local_thumbs.get(i).and_then(|t| t.as_ref()).map(|t| t.id());
                                     let Some(tex) = thumb.or(fallback) else { continue };
                                     let resp = Self::swatch(ui, tex, &m.name.clone(), icon).on_hover_text(format!("{}, from {}", m.name, m.source));
@@ -4030,7 +4070,7 @@ impl PainterApp {
                                 let fallback = self.shelf.smart.first().map(|t| t.id());
                                 for i in 0..self.user_smarts.len() {
                                     let s = &self.user_smarts[i];
-                                    if !s.name.to_lowercase().contains(&search) {
+                                    if !s.name.to_lowercase().contains(&search) || !wanted(presets::MaterialType::of(&s.name, None)) {
                                         continue;
                                     }
                                     let Some(tex) = s.thumb.as_ref().map(|t| t.id()).or(fallback) else { continue };
@@ -4046,10 +4086,14 @@ impl PainterApp {
                                     }
                                     resp.context_menu(|ui| self.user_smart_menu(ui, i, &mut share_smart));
                                 }
-                                for (i, s) in presets::SMART_MATERIALS.iter().enumerate() {
-                                    if !s.name.to_lowercase().contains(&search) {
-                                        continue;
-                                    }
+                                let mut order: Vec<usize> = (0..presets::SMART_MATERIALS.len())
+                                    .filter(|&i| presets::SMART_MATERIALS[i].name.to_lowercase().contains(&search) && wanted(presets::SMART_MATERIALS[i].kind()))
+                                    .collect();
+                                order.sort_by_key(|&i| presets::SMART_MATERIALS[i].kind());
+                                // Your own stay first, apart from the groups.
+                                let mut last = None;
+                                for (i, s) in order.into_iter().map(|i| (i, &presets::SMART_MATERIALS[i])) {
+                                    group(ui, &mut last, s.kind());
                                     let tex = self.shelf.smart[i].id();
                                     let resp = Self::swatch(ui, tex, s.name, icon);
                                     if s.is_scanned() {
@@ -4069,10 +4113,12 @@ impl PainterApp {
                                 }
                             }
                             ShelfCat::Materials => {
-                                for (i, m) in presets::MATERIALS.iter().enumerate() {
-                                    if !m.name.to_lowercase().contains(&search) {
-                                        continue;
-                                    }
+                                let mut order: Vec<usize> =
+                                    (0..presets::MATERIALS.len()).filter(|&i| presets::MATERIALS[i].name.to_lowercase().contains(&search) && wanted(presets::MATERIALS[i].kind())).collect();
+                                order.sort_by_key(|&i| presets::MATERIALS[i].kind());
+                                let mut last = None;
+                                for (i, m) in order.into_iter().map(|i| (i, &presets::MATERIALS[i])) {
+                                    group(ui, &mut last, m.kind());
                                     let tex = self.shelf.materials[i].id();
                                     let resp = Self::swatch(ui, tex, m.name, icon);
                                     resp.dnd_set_drag_payload(ShelfItem::Material(i));

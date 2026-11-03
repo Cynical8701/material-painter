@@ -1836,3 +1836,127 @@ pub fn render_generator_preview(kind: GenKind) -> egui::ColorImage {
     };
     render_preview(&[black, white])
 }
+
+/// What a material is, for sorting and filtering the shelf.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum MaterialType {
+    Paint,
+    Metal,
+    Wood,
+    Stone,
+    Fabric,
+    Plastic,
+    Glass,
+    Nature,
+    Other,
+}
+
+impl MaterialType {
+    pub const ALL: [MaterialType; 9] = [
+        MaterialType::Paint,
+        MaterialType::Metal,
+        MaterialType::Wood,
+        MaterialType::Stone,
+        MaterialType::Fabric,
+        MaterialType::Plastic,
+        MaterialType::Glass,
+        MaterialType::Nature,
+        MaterialType::Other,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MaterialType::Paint => "Paint & coatings",
+            MaterialType::Metal => "Metal",
+            MaterialType::Wood => "Wood",
+            MaterialType::Stone => "Stone & concrete",
+            MaterialType::Fabric => "Fabric, leather & paper",
+            MaterialType::Plastic => "Plastic, rubber & wax",
+            MaterialType::Glass => "Glass & ceramic",
+            MaterialType::Nature => "Nature & ground",
+            MaterialType::Other => "Other",
+        }
+    }
+
+    /// From a material's name (painted surfaces count as paint: "Painted Steel" is paint
+    /// first); `metal` (its metallic value) decides for names that say nothing.
+    pub fn of(name: &str, metal: Option<f32>) -> MaterialType {
+        const WORDS: [(MaterialType, &[&str]); 8] = [
+            (MaterialType::Paint, &["paint", "lacquer", "enamel", "coating", "powder coat"]),
+            (
+                MaterialType::Metal,
+                &["metal", "steel", "iron", "rust ", "rusty", "rusted", "copper", "brass", "bronze", "gold", "silver", "alumin", "chrome", "tin ", "zinc", "nickel", "titanium", "galvan", "pewter"],
+            ),
+            (MaterialType::Wood, &["wood", "oak", "pine", "walnut", "plank", "bark", "birch", "maple", "bamboo", "plywood", "mahogany", "ebony", "teak", "cedar", "cherry"]),
+            (
+                MaterialType::Stone,
+                &["stone", "concrete", "brick", "marble", "granite", "rock", "cobble", "tile", "slate", "asphalt", "plaster", "cement", "terrazzo", "pavement", "gravel", "clay", "obsidian", "jade"],
+            ),
+            (MaterialType::Fabric, &["fabric", "cloth", "leather", "denim", "cotton", "wool", "silk", "carpet", "canvas", "felt", "velvet", "linen", "suede", "paper", "cardboard"]),
+            (MaterialType::Plastic, &["plastic", "rubber", "vinyl", "silicone", "acrylic", "polymer", "foam", "carbon fiber", "wax"]),
+            (MaterialType::Glass, &["glass", "ceramic", "porcelain", "crystal", "terracotta"]),
+            (MaterialType::Nature, &["ground", "soil", "dirt", "mud", "sand", "grass", "moss", "snow", "ice", "leaf", "leaves", "bone", "skin", "organic", "forest", "rock"]),
+        ];
+        let n = format!("{} ", name.to_lowercase());
+        for (kind, words) in WORDS {
+            if words.iter().any(|w| n.contains(w)) {
+                return kind;
+            }
+        }
+        match metal {
+            Some(m) if m > 0.5 => MaterialType::Metal,
+            _ => MaterialType::Other,
+        }
+    }
+}
+
+impl MaterialPreset {
+    pub fn kind(&self) -> MaterialType {
+        MaterialType::of(self.name, Some(self.metal))
+    }
+}
+
+impl SmartMaterial {
+    /// From its name, or else from the material its first layer is made of.
+    pub fn kind(&self) -> MaterialType {
+        match MaterialType::of(self.name, None) {
+            MaterialType::Other => self
+                .layers
+                .first()
+                .and_then(|l| MATERIALS.iter().find(|m| m.name == l.material))
+                .map_or(MaterialType::Other, |m| m.kind()),
+            k => k,
+        }
+    }
+}
+
+#[cfg(test)]
+mod type_tests {
+    use super::*;
+
+    /// Shelf types read from names: a few known ones, and the whole list printed for review.
+    #[test]
+    fn material_types() {
+        assert_eq!(MaterialType::of("Painted Steel Worn", None), MaterialType::Paint);
+        assert_eq!(MaterialType::of("Rusty Sheet Metal", None), MaterialType::Metal);
+        assert_eq!(MaterialType::of("Oak Aged", None), MaterialType::Wood);
+        assert_eq!(MaterialType::of("Concrete Smooth", None), MaterialType::Stone);
+        assert_eq!(MaterialType::of("Mystery", Some(1.0)), MaterialType::Metal);
+        assert_eq!(MaterialType::of("Rustic Stone Wall", None), MaterialType::Stone, "rustic isn't rust");
+        assert_eq!(MaterialType::of("Walnut Varnished", None), MaterialType::Wood, "varnished wood is wood");
+        let mut other = Vec::new();
+        for m in MATERIALS {
+            println!("  material {:<28} {:?}", m.name, m.kind());
+            if m.kind() == MaterialType::Other {
+                other.push(m.name);
+            }
+        }
+        for s in SMART_MATERIALS {
+            println!("  smart    {:<28} {:?}", s.name, s.kind());
+            if s.kind() == MaterialType::Other {
+                other.push(s.name);
+            }
+        }
+        println!("  other: {other:?}");
+    }
+}

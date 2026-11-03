@@ -637,6 +637,11 @@ fn ui_screenshots() {
         harness.run_steps(6);
         harness.render().expect("renders").save(dir.join(format!("{name}.png"))).unwrap();
     }
+    // The shelf's plain materials, grouped by type.
+    harness.state_mut().set_workspace(Workspace::Paint);
+    harness.state_mut().test_shelf_materials();
+    harness.run_steps(6);
+    harness.render().expect("renders").save(dir.join("shelf_types.png")).unwrap();
     // A graph open on the canvas, and the paint workspace showing its layer.
     harness.state_mut().set_workspace(Workspace::Designer);
     harness.state_mut().test_add_preset(1);
