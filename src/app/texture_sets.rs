@@ -223,4 +223,16 @@ impl PainterApp {
     pub(crate) fn test_ray_trace(&mut self, on: bool) {
         self.rt.enabled = on;
     }
+
+    /// The path-traced preview has all its samples (offscreen tests).
+    pub(crate) fn test_ray_trace_done(&self) -> bool {
+        self.raytracer.converged(&self.rt)
+    }
+
+    /// Closes the import report and the autosave prompt (offscreen screenshots).
+    pub(crate) fn test_close_dialogs(&mut self) {
+        self.show_welcome = false;
+        self.recovery = None;
+        self.spp.report = None;
+    }
 }

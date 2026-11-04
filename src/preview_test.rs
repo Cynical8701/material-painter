@@ -1666,3 +1666,49 @@ fn texture_sets_paint_apart() {
     assert!(bluish > 5000, "the right set draws with its own textures ({bluish})");
     assert!(reddish > 500, "the stroke shows ({reddish})");
 }
+
+/// A clean picture of a Painter project opened in Material Painter (`MP_SPP_SHOT=a.spp`): no
+/// dialogs, the bakes done, rasterized and fully path traced, in `target/bake_test/spp/shot*.png`.
+#[test]
+#[ignore]
+fn spp_screenshot() {
+    use crate::app::PainterApp;
+    let Ok(path) = std::env::var("MP_SPP_SHOT") else {
+        println!("set MP_SPP_SHOT to a .spp file of your own");
+        return;
+    };
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().test_open_spp(Path::new(&path), &ctx);
+    let mut steps = 0;
+    while !(harness.state().test_spp_done() && !harness.state().test_baking()) && steps < 50_000 {
+        harness.run_steps(1);
+        steps += 1;
+    }
+    assert!(harness.state().test_spp_done() && !harness.state().test_baking(), "imported and baked");
+    harness.state_mut().test_close_dialogs();
+    harness.run_steps(3);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/spp");
+    std::fs::create_dir_all(&dir).unwrap();
+    harness.render().expect("renders").save(dir.join("shot.png")).unwrap();
+    harness.state_mut().test_ray_trace(true);
+    let mut steps = 0;
+    while !harness.state().test_ray_trace_done() && steps < 20_000 {
+        harness.run_steps(1);
+        steps += 1;
+    }
+    harness.run_steps(1);
+    harness.render().expect("renders").save(dir.join("shot_raytraced.png")).unwrap();
+}
