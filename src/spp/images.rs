@@ -231,7 +231,6 @@ pub struct CacheImage {
     pub plane: Plane,
 }
 
-/// Decode a `texture-cache/<uid>/<n>/<flag>` blob, reduced to at most `max_size`.
 /// Decode an imported image resource (`resources/<sha1>.image`: mesh maps baked elsewhere, bitmap
 /// fills, stencils): a property header, then either JPEG 2000 tiles as in the baked maps or one raw
 /// LZ4 block of `dataSizeLZ4` bytes holding `height` rows of `pitch` bytes, top row first (unlike
@@ -287,6 +286,9 @@ pub fn image_resource_is_8bit(blob: &[u8]) -> bool {
     qt::read_properties(blob, 0).and_then(|(p, _)| p.get("format").and_then(|v| v.as_str()).map(|f| f.ends_with('8'))).unwrap_or(false)
 }
 
+/// Decode a `texture-cache/<uid>/<n>/<flag>` blob, reduced to at most `max_size`. The cache holds
+/// OpenGL texture memory, bottom row first (on a real project the face in a head's texture
+/// meets the head's UVs only this way); returned top row first, like every [`Plane`].
 pub fn decode_cache_image(blob: &[u8], max_size: u32) -> Result<CacheImage, ImageError> {
     let Some((props, pos)) = qt::read_properties(blob, 0) else { return corrupt("property header") };
     if props.get("compression").and_then(|v| v.as_str()) != Some("lz4") {
@@ -323,7 +325,7 @@ pub fn decode_cache_image(blob: &[u8], max_size: u32) -> Result<CacheImage, Imag
                     }
                 }
             }
-            red.add(x, y, &px);
+            red.add(x, height - 1 - y, &px);
         }
     }
     Ok(CacheImage { format, plane: red.finish() })
