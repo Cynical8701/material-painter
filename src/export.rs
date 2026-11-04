@@ -160,7 +160,7 @@ impl Layout {
 /// One file of a template.
 #[derive(Clone, PartialEq, Debug)]
 pub struct OutputMap {
-    /// File name without extension; `$mesh` and `$project` are replaced.
+    /// File name without extension; `$mesh`, `$set` and `$project` are replaced.
     pub name: String,
     pub layout: Layout,
     /// R, G, B, A (only the first `layout.channels()` are used; Gray uses R).
@@ -427,6 +427,11 @@ pub struct Settings {
     pub mesh_name: String,
     /// `$project` in file names.
     pub project_name: String,
+    /// `$set` in file names: the texture set exported.
+    pub set_name: String,
+    /// Texture sets in the document. With more than one, names without
+    /// `$set` get it after `$mesh`, so sets don't overwrite each other.
+    pub set_count: usize,
     pub format: Format,
     pub depth: Depth,
     /// Output size; `None` is the document resolution.
@@ -445,7 +450,11 @@ impl Settings {
     }
 
     pub fn file_name(&self, map: &OutputMap) -> String {
-        let stem = map.name.replace("$mesh", &self.mesh_name).replace("$project", &self.project_name);
+        let mut name = map.name.clone();
+        if self.set_count > 1 && !name.contains("$set") {
+            name = if name.contains("$mesh") { name.replace("$mesh", "$mesh_$set") } else { format!("$set_{name}") };
+        }
+        let stem = name.replace("$mesh", &self.mesh_name).replace("$set", &self.set_name).replace("$project", &self.project_name);
         let stem: String = stem.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
         format!("{stem}.{}", self.format.ext())
     }
@@ -572,6 +581,8 @@ pub struct Snapshot {
     has_bake: bool,
     /// UV triangles, for the island coverage that padding needs.
     uvs: Arc<Mesh>,
+    /// The texture set's range in `uvs.indices`.
+    tris: std::ops::Range<u32>,
 }
 
 /// Reads the document's maps back from the GPU (call after compositing).
@@ -594,6 +605,7 @@ pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mes
         bounds: engine.bounds(),
         has_bake: engine.has_bake,
         uvs: mesh,
+        tris: engine.triangles(),
     }
 }
 
@@ -719,10 +731,11 @@ fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool) -> Ve
 // ------------------------------------------------------------------ padding
 
 /// Texels inside a UV triangle (sampled at texel centers, both windings).
-fn coverage(mesh: &Mesh, res: u32) -> Vec<bool> {
+fn coverage(mesh: &Mesh, tris: std::ops::Range<u32>, res: u32) -> Vec<bool> {
     let r = res as usize;
     let mut out = vec![false; r * r];
-    for tri in mesh.indices.chunks_exact(3) {
+    let indices = mesh.indices.get(tris.start as usize..tris.end as usize).unwrap_or(&mesh.indices);
+    for tri in indices.chunks_exact(3) {
         let p = [0, 1, 2].map(|k| Vec2::from_array(mesh.vertices[tri[k] as usize].uv) * res as f32);
         let lo = p[0].min(p[1]).min(p[2]).floor().max(Vec2::ZERO);
         let hi = p[0].max(p[1]).max(p[2]).ceil().min(Vec2::splat(res as f32));
@@ -794,7 +807,7 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
         Padding::Dilate(px) => Some(px),
         Padding::Infinite | Padding::Transparent => Some(u32::MAX),
     };
-    let cover = padding.map(|_| coverage(&s.uvs, res));
+    let cover = padding.map(|_| coverage(&s.uvs, s.tris.clone(), res));
     let nearest = padding.zip(cover.as_ref()).map(|(limit, c)| nearest_covered(c, res, limit));
 
     // Evaluate every needed source once, then build the maps in parallel.
@@ -935,6 +948,8 @@ mod tests {
             folder: PathBuf::new(),
             mesh_name: "M".into(),
             project_name: "P".into(),
+            set_name: "S".into(),
+            set_count: 1,
             format: Format::Png,
             depth: Depth::U8,
             size: None,

@@ -54,7 +54,7 @@ impl ShelfPreviews {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let settings = BakeSettings { quality: Quality::Draft, ..Default::default() };
-            let _ = tx.send(bake::prepare(&mesh, &settings));
+            let _ = tx.send(bake::prepare(&mesh, &settings, 0));
             ctx.request_repaint();
         });
         ShelfPreviews {
@@ -155,7 +155,7 @@ fn render(
     let mut settings = ViewSettings { show_wire: false, background: Background::Transparent, ..ViewSettings::default() };
     settings.post.vignette = 0.0;
     settings.post.bloom = 0.0;
-    views.render_3d(rs, [THUMB, THUMB], engine, env, mesh, &cam, &settings, None);
+    views.render_3d(rs, [THUMB, THUMB], &[engine], env, mesh, &cam, &settings, None);
     let img = views.view3d.image();
     let rgba = crate::gpu::read_texture(&rs.device, &rs.queue, img);
     // MSAA resolve averages edge samples with the transparent clear, so the

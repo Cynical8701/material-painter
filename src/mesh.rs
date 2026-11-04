@@ -7,6 +7,27 @@
 use glam::{Mat3, Vec2, Vec3};
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::ops::Range;
+
+/// A texture set: the triangles of one material, which get their own layer
+/// stack and textures. A set's triangles are contiguous in `Mesh::indices`,
+/// and its UV edges and seams contiguous in `uv_edges` and `seam_edges`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshSet {
+    pub name: String,
+    /// Triangles (not indices).
+    pub tris: Range<u32>,
+    /// Index ranges into `uv_edges` and `seam_edges`.
+    pub edges: Range<u32>,
+    pub seams: Range<u32>,
+}
+
+impl MeshSet {
+    /// The set's range in `Mesh::indices`.
+    pub fn index_range(&self) -> Range<u32> {
+        self.tris.start * 3..self.tris.end * 3
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,6 +60,8 @@ pub struct Mesh {
     pub objects: Vec<String>,
     /// Vertex colors per triangle (sRGB), for color ID maps.
     pub tri_color: Option<Vec<[u8; 3]>>,
+    /// Texture sets, one per material, in triangle order; never empty.
+    pub sets: Vec<MeshSet>,
 }
 
 /// A detail mesh used only as a bake source; it needs no UVs.
@@ -161,14 +184,12 @@ impl Mesh {
                 tangent,
             })
             .collect();
-        let uv_edges = polygon_edges(&vertices, &indices);
-        let seam_edges = seam_edges(&vertices, &indices);
-        Mesh {
+        let mut mesh = Mesh {
             name,
             vertices,
             indices,
-            uv_edges,
-            seam_edges,
+            uv_edges: Vec::new(),
+            seam_edges: Vec::new(),
             bounds_min,
             bounds_max,
             center,
@@ -176,7 +197,10 @@ impl Mesh {
             tri_object: Vec::new(),
             objects: Vec::new(),
             tri_color: None,
-        }
+            sets: Vec::new(),
+        };
+        mesh.set_ranges(Vec::new());
+        mesh
     }
 
     /// Rebuilds a mesh saved in a project, already normalized.
@@ -186,14 +210,12 @@ impl Mesh {
             lo = lo.min(Vec3::from_array(v.pos));
             hi = hi.max(Vec3::from_array(v.pos));
         }
-        let uv_edges = polygon_edges(&vertices, &indices);
-        let seam_edges = seam_edges(&vertices, &indices);
-        Mesh {
+        let mut mesh = Mesh {
             name,
             vertices,
             indices,
-            uv_edges,
-            seam_edges,
+            uv_edges: Vec::new(),
+            seam_edges: Vec::new(),
             bounds_min: lo,
             bounds_max: hi,
             center,
@@ -201,7 +223,85 @@ impl Mesh {
             tri_object: Vec::new(),
             objects: Vec::new(),
             tri_color: None,
+            sets: Vec::new(),
+        };
+        mesh.set_ranges(Vec::new());
+        mesh
+    }
+
+    /// Splits the mesh into texture sets, one per material: triangles are
+    /// reordered (stably) so each material's are contiguous. `tri_material`
+    /// has one entry per triangle; `names` names the materials. Materials
+    /// without triangles get no set.
+    pub fn split_by_material(&mut self, tri_material: &[u32], names: &[String]) {
+        let tris = self.triangle_count();
+        if tri_material.len() != tris {
+            return;
         }
+        let mut order: Vec<usize> = (0..tris).collect();
+        order.sort_by_key(|&t| tri_material[t]);
+        let mut indices = Vec::with_capacity(self.indices.len());
+        for &t in &order {
+            indices.extend_from_slice(&self.indices[t * 3..t * 3 + 3]);
+        }
+        self.indices = indices;
+        if self.tri_object.len() == tris {
+            self.tri_object = order.iter().map(|&t| self.tri_object[t]).collect();
+        }
+        if let Some(c) = &self.tri_color {
+            self.tri_color = Some(order.iter().map(|&t| c[t]).collect());
+        }
+        let mut ranges: Vec<(String, Range<u32>)> = Vec::new();
+        for (k, &t) in order.iter().enumerate() {
+            let m = tri_material[t];
+            let name = names.get(m as usize).filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| format!("Material {}", m + 1));
+            match ranges.last_mut() {
+                Some((n, r)) if *n == name && r.end == k as u32 => r.end += 1,
+                _ => ranges.push((name, k as u32..k as u32 + 1)),
+            }
+        }
+        // Two materials with one name share a set only when adjacent; keep
+        // names unique so sets can be told apart (and exported) by name.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (n, _) in &mut ranges {
+            let count = seen.entry(n.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                *n = format!("{n} {count}");
+            }
+        }
+        self.set_ranges(ranges);
+    }
+
+    /// Sets the texture sets from `(name, triangle range)` pairs covering
+    /// the triangles in order (one set named after the mesh when empty or
+    /// invalid), and rebuilds the per-set UV edges and seams.
+    pub fn set_ranges(&mut self, ranges: Vec<(String, Range<u32>)>) {
+        let tris = self.triangle_count() as u32;
+        let valid = !ranges.is_empty()
+            && ranges[0].1.start == 0
+            && ranges.last().is_some_and(|r| r.1.end == tris)
+            && ranges.windows(2).all(|w| w[0].1.end == w[1].1.start)
+            && ranges.iter().all(|r| r.1.start < r.1.end);
+        let ranges = if valid { ranges } else { vec![(self.name.clone(), 0..tris)] };
+        self.uv_edges.clear();
+        self.seam_edges.clear();
+        self.sets = ranges
+            .into_iter()
+            .map(|(name, tris)| {
+                let idx = &self.indices[tris.start as usize * 3..tris.end as usize * 3];
+                let e0 = self.uv_edges.len() as u32;
+                self.uv_edges.extend(polygon_edges(&self.vertices, idx));
+                let s0 = self.seam_edges.len() as u32;
+                self.seam_edges.extend(seam_edges(&self.vertices, idx));
+                MeshSet { name, tris, edges: e0..self.uv_edges.len() as u32, seams: s0..self.seam_edges.len() as u32 }
+            })
+            .collect();
+    }
+
+    /// The texture set a triangle belongs to.
+    pub fn set_of(&self, tri: u32) -> usize {
+        self.sets.iter().position(|s| s.tris.contains(&tri)).unwrap_or(0)
     }
 
     /// Loads an OBJ or FBX as the paintable mesh. Every object needs UVs.
@@ -216,6 +316,7 @@ impl Mesh {
         mesh.tri_object = raw.tri_object;
         mesh.objects = raw.objects;
         mesh.tri_color = raw.tri_color;
+        mesh.split_by_material(&raw.tri_material, &raw.material_names);
         Ok(mesh)
     }
 
@@ -720,5 +821,67 @@ mod edge_tests {
         assert!(cube.uv_edges.len() < unique_edges(&cube.indices).len());
         // Every seam edge's ends share positions with another island's edge (or a border).
         assert_eq!(cube.seam_edges.len() % 2, 0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod set_tests {
+    use super::*;
+
+    /// A plane split by material: left half "Left", right half "Right".
+    pub(crate) fn split_plane() -> Mesh {
+        let mut m = Primitive::Plane.build();
+        let side: Vec<u32> = m
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let u = t.iter().map(|&i| m.vertices[i as usize].uv[0]).sum::<f32>() / 3.0;
+                if u < 0.5 { 0 } else { 1 }
+            })
+            .collect();
+        m.split_by_material(&side, &["Left".into(), "Right".into()]);
+        m
+    }
+
+    #[test]
+    fn materials_become_contiguous_sets() {
+        let plain = Primitive::Plane.build();
+        let m = split_plane();
+        assert_eq!(m.sets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Left", "Right"]);
+        assert_eq!(m.sets[0].tris.start, 0);
+        assert_eq!(m.sets[0].tris.end, m.sets[1].tris.start);
+        assert_eq!(m.sets[1].tris.end as usize, m.triangle_count());
+        // The same triangles, reordered: each set's lie on its side of the UV square.
+        let key = |idx: &[u32]| {
+            let mut t: Vec<[u32; 3]> = idx.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+            t.sort();
+            t
+        };
+        assert_eq!(key(&plain.indices), key(&m.indices));
+        for (k, s) in m.sets.iter().enumerate() {
+            for t in m.indices[s.index_range().start as usize..s.index_range().end as usize].chunks_exact(3) {
+                let u = t.iter().map(|&i| m.vertices[i as usize].uv[0]).sum::<f32>() / 3.0;
+                assert_eq!(u >= 0.5, k == 1);
+            }
+            assert!(!s.edges.is_empty() && !s.seams.is_empty(), "{} has its own UV edges", s.name);
+            assert_eq!(m.set_of(s.tris.start), k);
+        }
+        assert_eq!(m.sets[1].edges.end as usize, m.uv_edges.len());
+    }
+
+    #[test]
+    fn set_names_are_unique_and_ranges_validated() {
+        let mut m = Primitive::Plane.build();
+        let tris = m.triangle_count();
+        // Materials 0 and 2 share a name; material 1 has none.
+        let mat: Vec<u32> = (0..tris).map(|t| (t % 3) as u32).collect();
+        m.split_by_material(&mat, &["Body".into(), String::new(), "Body".into()]);
+        let names: Vec<&str> = m.sets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Body", "Material 2", "Body 2"]);
+        // Gaps fall back to one set.
+        let n = m.triangle_count() as u32;
+        m.set_ranges(vec![("A".into(), 0..2), ("B".into(), 3..n)]);
+        assert_eq!(m.sets.len(), 1);
+        assert_eq!(m.sets[0].tris, 0..n);
     }
 }

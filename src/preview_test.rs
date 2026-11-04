@@ -93,7 +93,7 @@ fn preview_mesh() {
     for (cname, cam) in &cams {
         for (mname, mode) in &modes {
             let settings = ViewSettings { mode: *mode, ..Default::default() };
-            views.render_3d(&rs, size, &engine, &env, &gpu_mesh, cam, &settings, None);
+            views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, cam, &settings, None);
             let img = views.view3d.image();
             let bytes = read_texture(&rs.device, &rs.queue, img);
             let file = dir.join(format!("{cname}_{mname}.png"));
@@ -207,6 +207,8 @@ fn export_templates() {
                 folder: root.join(format.ext()).join(format!("{ti}")),
                 mesh_name: "Cube".into(),
                 project_name: "Test".into(),
+                set_name: "Cube".into(),
+                set_count: 1,
                 format,
                 depth: *format.depths().last().unwrap(),
                 size: (fi % 2 == 1).then_some(256),
@@ -288,7 +290,7 @@ fn paint_projections() {
             let px = crate::textures::TEXTURES[0].render(256);
             engine.set_brush_grain(Some((&px, 256)));
         }
-        views.render_3d(&rs, size, &engine, &env, &gpu_mesh, &cam, &settings, None);
+        views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
         assert!(engine.begin_stroke(0, StrokeTarget::Content, [true, false, false, false], false));
         let radius = 28.0;
         let raw: Vec<([f32; 4], f32)> = (0..60).map(|i| ([180.0 + i as f32 * 5.0, 250.0, 1.0, 0.0], 1.0)).collect();
@@ -314,7 +316,7 @@ fn paint_projections() {
         engine.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
         engine.end_stroke();
         engine.composite();
-        views.render_3d(&rs, size, &engine, &env, &gpu_mesh, &cam, &settings, None);
+        views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
         save(&views, name);
         let n = red_texels(&engine);
         println!("  {name}: {} stamps, {n} painted texels", stamps.len());
@@ -345,7 +347,7 @@ fn paint_projections() {
         let idx = engine.add_fill_layer(0, None, p.name().into(), fill, &mut undo);
         engine.set_fill_image(idx, 0, Some(img.clone()), &mut undo);
         engine.composite();
-        views.render_3d(&rs, size, &engine, &env, &gpu_mesh, &cam, &settings, None);
+        views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
         save(&views, &format!("fill_{}", p.key()));
         let bytes = read_texture(&rs.device, &rs.queue, engine.final_tex(0));
         let lit = bytes.chunks(4).filter(|px| px[0] > 20).count();
@@ -395,7 +397,7 @@ fn perf_4k() {
     let cam = OrbitCam { target: (mesh.bounds_min + mesh.bounds_max) * 0.5, ..Default::default() };
     let size = [1600u32, 1000u32];
     let settings = ViewSettings::default();
-    views.render_3d(&rs, size, &engine, &env, &gpu_mesh, &cam, &settings, None);
+    views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
     wait(&rs);
 
     let fsize = Vec2::new(size[0] as f32, size[1] as f32);
@@ -432,7 +434,7 @@ fn perf_4k() {
         wait(&rs);
         t_comp += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        views.render_3d(&rs, size, &engine, &env, &gpu_mesh, &cam, &settings, None);
+        views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
         wait(&rs);
         t_view += t.elapsed().as_secs_f64();
     }
@@ -839,7 +841,7 @@ fn preview_shaders_compile_and_render() {
             }
             None => views.set_custom_shader(&rs.device, None).unwrap(),
         }
-        views.render_3d(&rs, [640, 640], &engine, &env, &gpu_mesh, &cam, &settings, None);
+        views.render_3d(&rs, [640, 640], &[&engine], &env, &gpu_mesh, &cam, &settings, None);
         let img = views.view3d.image();
         let bytes = read_texture(&rs.device, &rs.queue, img);
         let file = dir.join(format!("{}.png", name.replace(' ', "_").replace('+', "and")));
@@ -973,7 +975,7 @@ fn project_bake() {
         let cam = OrbitCam { target: center, dist: 3.0, yaw, pitch: 0.15, ..Default::default() };
         for mname in ["Ambient Occlusion", "Curvature", "Normal", "Cavity", "Edge Distance", "Thickness"] {
             let mode = ViewMode::all().into_iter().find(|v| v.name() == mname).unwrap_or(ViewMode::Material);
-            views.render_3d(&rs, [900, 900], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode, ..Default::default() }, None);
+            views.render_3d(&rs, [900, 900], &[&engine], &env, &gpu_mesh, &cam, &ViewSettings { mode, ..Default::default() }, None);
             let img = views.view3d.image();
             let bytes = read_texture(&rs.device, &rs.queue, img);
             let file = dir.join(format!("view_{cname}_{}.png", mname.to_lowercase().replace(' ', "_")));
@@ -1086,7 +1088,7 @@ fn custom_maps_bake() {
     let cam = OrbitCam { target: center, dist: 3.2, yaw: 0.35, pitch: 0.25, ..Default::default() };
     let mut sheet = image::RgbaImage::new(4 * 300, 4 * 300);
     for (k, (mname, mode)) in modes.iter().enumerate() {
-        views.render_3d(&rs, [600, 600], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode: *mode, ..Default::default() }, None);
+        views.render_3d(&rs, [600, 600], &[&engine], &env, &gpu_mesh, &cam, &ViewSettings { mode: *mode, ..Default::default() }, None);
         let img = views.view3d.image();
         let px = read_texture(&rs.device, &rs.queue, img);
         image::save_buffer(dir.join(format!("many_{k:02}_{mname}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
@@ -1217,7 +1219,7 @@ fn custom_map_seams() {
         for (cname, yaw, pitch) in [("right", 0.9f32, 0.35f32), ("left", -0.6, 0.35)] {
             let cam = OrbitCam { target: center - Vec3::Y * 0.4, dist: 2.2, yaw, pitch, ..Default::default() };
             for (slot, map) in [(0, "deposit"), (1, "flow")] {
-                views.render_3d(&rs, [900, 700], &engine, &env, &gpu_mesh, &cam, &ViewSettings { mode: ViewMode::Custom(ids[slot]), ..Default::default() }, None);
+                views.render_3d(&rs, [900, 700], &[&engine], &env, &gpu_mesh, &cam, &ViewSettings { mode: ViewMode::Custom(ids[slot]), ..Default::default() }, None);
                 let img = views.view3d.image();
                 let px = read_texture(&rs.device, &rs.queue, img);
                 image::save_buffer(dir.join(format!("seams_{map}_{name}_{cname}.png")), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
@@ -1369,7 +1371,7 @@ fn custom_map_closeups() {
     ] {
         for seams in [false, true] {
             let settings = ViewSettings { mode, show_seams_3d: seams, ..Default::default() };
-            views.render_3d(&rs, [800, 800], &engine, &env, &gpu_mesh, &cam, &settings, None);
+            views.render_3d(&rs, [800, 800], &[&engine], &env, &gpu_mesh, &cam, &settings, None);
             let img = views.view3d.image();
             let px = read_texture(&rs.device, &rs.queue, img);
             let file = dir.join(format!("closeup_{name}{}.png", if seams { "_seams" } else { "" }));
@@ -1485,7 +1487,7 @@ fn viewport_crevices() {
         let mut s = ViewSettings::default();
         s.key.on = key;
         s.ao_strength = ao;
-        views.render_3d(&rs, [900, 900], engine, &env, &gpu_mesh, &cam, &s, None);
+        views.render_3d(&rs, [900, 900], &[engine], &env, &gpu_mesh, &cam, &s, None);
         let img = views.view3d.image();
         let px = read_texture(&rs.device, &rs.queue, img);
         let mean = px.chunks(4).map(|p| p[0] as f32).sum::<f32>() / (px.len() / 4) as f32;
@@ -1540,10 +1542,127 @@ fn open_spp_projects() {
         if let Some(folder) = layers.iter().find(|(n, ..)| n == "Painter layers (rebuilt)") {
             assert!(!folder.2, "the rebuilt stack starts hidden");
         }
-        // Let the bake land, then picture it with the report.
-        for _ in 0..60 {
-            harness.run_steps(1);
+        // Every texture set came in, each with its flattened result.
+        let sets = harness.state().test_sets();
+        for (name, res, layers) in &sets {
+            println!("    set {name}: {res}², {} layers", layers.len());
+            assert!(layers.iter().any(|l| l == "Painter result (flattened)"), "{name} has its flattened layer");
         }
+        // Let the bakes land (every set's, one after another), then picture it with the report.
+        let mut steps = 0;
+        while harness.state().test_baking() && steps < 20_000 {
+            harness.run_steps(1);
+            steps += 1;
+        }
+        assert!(!harness.state().test_baking(), "{path}: the bakes finished");
+        harness.run_steps(2);
         harness.render().expect("renders").save(dir.join(format!("spp_{k}.png"))).unwrap();
+        // The path tracer reads every set.
+        harness.state_mut().test_ray_trace(true);
+        harness.run_steps(8);
+        harness.render().expect("renders").save(dir.join(format!("spp_{k}_raytraced.png"))).unwrap();
+        harness.state_mut().test_ray_trace(false);
+        // Saved and opened again, every set keeps its size and layers.
+        let ctx = harness.ctx.clone();
+        let project = dir.join(format!("spp_{k}.mpp"));
+        harness.state_mut().test_save_and_reopen(&project, &ctx).expect("saves and reopens");
+        harness.run_steps(2);
+        assert_eq!(harness.state().test_sets(), sets, "{path}: the project round-trips");
+        let _ = std::fs::remove_file(&project);
     }
+}
+
+/// Two texture sets on one plane (left and right halves of the UV square):
+/// a stroke across the whole plane paints only the edited set's half, and
+/// the 3D view draws each half with its own set. The frame goes to
+/// `target/bake_test/texture_sets.png`.
+#[test]
+#[ignore]
+fn texture_sets_paint_apart() {
+    use crate::app::{BrushProjection, resolve_stamps};
+    use crate::engine::{BrushPaint, FillParams, MatValues, StampUniform};
+    use crate::undo::{StrokeTarget, UndoStack};
+    use glam::Vec2;
+
+    let mesh = crate::mesh::set_tests::split_plane();
+    let bvh = crate::bvh::Bvh::from_mesh(&mesh);
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 256;
+    let mut left = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    left.set_triangles(mesh.sets[0].index_range(), &gpu_mesh);
+    let mut right = left.sibling(&gpu_mesh, mesh.sets[1].index_range(), res);
+    let mut undo = UndoStack::default();
+    left.add_paint_layer(0, None, None, &mut undo);
+    let blue = MatValues { color: [0.05, 0.1, 0.9], ..Default::default() };
+    right.add_fill_layer(0, None, "Blue".into(), FillParams { mat: blue, ..Default::default() }, &mut undo);
+
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    // Looking straight down at the plane.
+    let cam = OrbitCam { pitch: 1.5, dist: 3.2, ..Default::default() };
+    let size = [512u32, 512u32];
+    let settings = ViewSettings::default();
+    views.render_3d(&rs, size, &[&left, &right], &env, &gpu_mesh, &cam, &settings, None);
+
+    // A stroke across the middle of the view, over both halves.
+    assert!(left.begin_stroke(0, StrokeTarget::Content, [true, false, false, false], false));
+    let radius = 40.0;
+    let raw: Vec<([f32; 4], f32)> = (0..90).map(|i| ([30.0 + i as f32 * 5.0, 256.0, 1.0, 0.0], 1.0)).collect();
+    let fsize = Vec2::new(size[0] as f32, size[1] as f32);
+    let stamps = resolve_stamps(&mesh, &bvh, &cam, fsize, BrushProjection::Screen, 0, radius, &raw);
+    assert!(!stamps.is_empty(), "the stroke hits the plane");
+    let su = StampUniform {
+        view_proj: cam.view_proj(fsize.x / fsize.y).to_cols_array_2d(),
+        cam_pos: cam.eye().extend(1.0).to_array(),
+        view: [fsize.x, fsize.y, 0.0, 0.0],
+        view2d: [0.0; 4],
+        // No mirroring (brush.w).
+        brush: [radius, 0.6, 1.0, 0.0],
+        clip: [crate::viewport::NEAR, crate::viewport::FAR, 0.0, 0.0],
+        proj: [BrushProjection::Screen as u32 as f32, 0.0, 85f32.to_radians().cos(), 0.0],
+    };
+    let paint = BrushPaint {
+        mat: MatValues { enabled: [true, false, false, false], color: [0.9, 0.1, 0.05], ..Default::default() },
+        mask_value: 1.0,
+        opacity: 1.0,
+        erase: false,
+        grain: [0.0; 4],
+    };
+    left.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
+    left.end_stroke();
+    left.composite();
+    right.composite();
+
+    // Red texels of the left set, by side of the UV square (past the
+    // dilation margin on the right).
+    let bytes = read_texture(&rs.device, &rs.queue, left.final_tex(0));
+    let (mut on_left, mut on_right) = (0, 0);
+    for (i, p) in bytes.chunks(4).enumerate() {
+        let x = (i as u32 % res) as f32 / res as f32;
+        if p[0] > 150 && p[1] < 90 {
+            if x < 0.5 {
+                on_left += 1;
+            } else if x > 0.5 + 16.0 / res as f32 {
+                on_right += 1;
+            }
+        }
+    }
+    println!("  painted texels: {on_left} in the left set's half, {on_right} past it");
+    assert!(on_left > 500, "the left set took paint ({on_left})");
+    assert_eq!(on_right, 0, "paint stays in the edited set");
+
+    views.render_3d(&rs, size, &[&left, &right], &env, &gpu_mesh, &cam, &settings, None);
+    let img = views.view3d.image();
+    let px = read_texture(&rs.device, &rs.queue, img);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    image::save_buffer(dir.join("texture_sets.png"), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
+    let rgb = |p: &[u8]| (p[0] as i32, p[1] as i32, p[2] as i32);
+    let bluish = px.chunks(4).map(rgb).filter(|&(r, g, b)| b > r + 40 && b > g + 40).count();
+    let reddish = px.chunks(4).map(rgb).filter(|&(r, g, b)| r > g + 60 && r > b + 60).count();
+    println!("  view: {bluish} blue pixels (right set), {reddish} red (the stroke)");
+    assert!(bluish > 5000, "the right set draws with its own textures ({bluish})");
+    assert!(reddish > 500, "the stroke shows ({reddish})");
 }

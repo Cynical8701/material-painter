@@ -24,11 +24,12 @@ struct RtU {
 @group(0) @binding(5) var<storage, read> tri_nrm: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> tri_uv: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> tri_tan: array<vec4<f32>>;
-@group(0) @binding(8) var t_color: texture_2d<f32>;
-@group(0) @binding(9) var t_rough: texture_2d<f32>;
-@group(0) @binding(10) var t_metal: texture_2d<f32>;
-@group(0) @binding(11) var t_height: texture_2d<f32>;
-@group(0) @binding(12) var t_baked: texture_2d<f32>;
+// One layer per texture set; a triangle's set rides in its tri_uv.z.
+@group(0) @binding(8) var t_color: texture_2d_array<f32>;
+@group(0) @binding(9) var t_rough: texture_2d_array<f32>;
+@group(0) @binding(10) var t_metal: texture_2d_array<f32>;
+@group(0) @binding(11) var t_height: texture_2d_array<f32>;
+@group(0) @binding(12) var t_baked: texture_2d_array<f32>;
 @group(0) @binding(13) var samp: sampler;
 @group(0) @binding(14) var env_rad: texture_2d<f32>;
 @group(0) @binding(15) var env_samp: sampler;
@@ -287,6 +288,7 @@ fn mesh_surface(h: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     var rn = tri_nrm[i].xyz * w0 + tri_nrm[i + 1u].xyz * h.b1 + tri_nrm[i + 2u].xyz * h.b2;
     var n = normalize(rn);
     let uv = tri_uv[i].xy * w0 + tri_uv[i + 1u].xy * h.b1 + tri_uv[i + 2u].xy * h.b2;
+    let layer = i32(tri_uv[i].z);
     let tg = tri_tan[i] * w0 + tri_tan[i + 1u] * h.b1 + tri_tan[i + 2u] * h.b2;
     // Face toward the incoming ray (open meshes, backfaces).
     if (dot(s.ng, d) > 0.0) {
@@ -297,22 +299,22 @@ fn mesh_surface(h: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         rn = -rn;
     }
 
-    s.m.albedo = textureSampleLevel(t_color, samp, uv, 0.0).rgb;
-    s.m.rough = clamp(textureSampleLevel(t_rough, samp, uv, 0.0).r, 0.03, 1.0);
-    s.m.metal = textureSampleLevel(t_metal, samp, uv, 0.0).r;
+    s.m.albedo = textureSampleLevel(t_color, samp, uv, layer, 0.0).rgb;
+    s.m.rough = clamp(textureSampleLevel(t_rough, samp, uv, layer, 0.0).r, 0.03, 1.0);
+    s.m.metal = textureSampleLevel(t_metal, samp, uv, layer, 0.0).r;
 
     // Same normal composition as the raster view: baked normal + painted height.
     let tx = u.params.z;
-    let hl = textureSampleLevel(t_height, samp, uv - vec2<f32>(tx, 0.0), 0.0).r;
-    let hr = textureSampleLevel(t_height, samp, uv + vec2<f32>(tx, 0.0), 0.0).r;
-    let hd = textureSampleLevel(t_height, samp, uv - vec2<f32>(0.0, tx), 0.0).r;
-    let hb = textureSampleLevel(t_height, samp, uv + vec2<f32>(0.0, tx), 0.0).r;
+    let hl = textureSampleLevel(t_height, samp, uv - vec2<f32>(tx, 0.0), layer, 0.0).r;
+    let hr = textureSampleLevel(t_height, samp, uv + vec2<f32>(tx, 0.0), layer, 0.0).r;
+    let hd = textureSampleLevel(t_height, samp, uv - vec2<f32>(0.0, tx), layer, 0.0).r;
+    let hb = textureSampleLevel(t_height, samp, uv + vec2<f32>(0.0, tx), layer, 0.0).r;
     let k = u.params.y * u.params.w / 256.0;
     let hu = (hr - hl) * 0.5 * k;
     let ht = (hb - hd) * 0.5 * k;
     var base = vec3<f32>(0.0, 0.0, 1.0);
     if (u.params.x > 0.5) {
-        let b = textureSampleLevel(t_baked, samp, uv, 0.0).xy;
+        let b = textureSampleLevel(t_baked, samp, uv, layer, 0.0).xy;
         base = vec3<f32>(b, sqrt(max(1.0 - dot(b, b), 0.0)));
     }
     let ts = normalize(vec3<f32>(base.xy + vec2<f32>(-hu, ht), base.z));

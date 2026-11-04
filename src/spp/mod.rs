@@ -82,6 +82,13 @@ impl<R: Read + Seek> SppFile<R> {
         Ok(assbin::parse(&self.bytes("paint/scene.assbin")?)?)
     }
 
+    /// The meshes and the scene's material names (`DumpMesh::material` indexes them; each is
+    /// the name of a texture set).
+    pub fn meshes_and_materials(&mut self) -> Result<(Vec<DumpMesh>, Vec<String>), SppError> {
+        let bytes = self.bytes("paint/scene.assbin")?;
+        Ok((assbin::parse(&bytes)?, assbin::material_names(&bytes)))
+    }
+
     /// Texture sets, channels and layer stack.
     pub fn project(&mut self) -> Result<ProjectInfo, SppError> {
         let root = document::parse(&self.bytes("paint/document.bin")?)?;

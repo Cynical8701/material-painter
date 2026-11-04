@@ -50,6 +50,27 @@ struct Scene {
     ground_y: f32,
 }
 
+/// Largest size the texture sets are copied at for path tracing several.
+const MAX_SET_COPY: u32 = 2048;
+
+/// The formats of the five textures the path tracer reads per set: final
+/// color (sRGB-encoded), roughness, metallic, height, and the baked normal map.
+const SET_FORMATS: [wgpu::TextureFormat; 5] = [
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::R8Unorm,
+    wgpu::TextureFormat::R8Unorm,
+    wgpu::TextureFormat::R16Float,
+    crate::bake::MAP_FORMATS[3],
+];
+
+/// Several texture sets' textures, one array layer per set, at one size.
+struct SetCopies {
+    res: u32,
+    textures: Vec<wgpu::Texture>,
+    /// What each layer was copied from: (composite generation, maps version).
+    copied: Vec<Option<(u64, u64)>>,
+}
+
 struct Target {
     accum: wgpu::Buffer,
     /// Scene-linear average of the samples so far.
@@ -69,6 +90,7 @@ pub struct RayTracer {
     sampler: wgpu::Sampler,
     scene: Option<Scene>,
     target: Option<Target>,
+    copies: Option<SetCopies>,
     pub egui_id: Option<egui::TextureId>,
     /// Samples accumulated for the current view.
     pub samples: u32,
@@ -104,16 +126,13 @@ impl RayTracer {
             },
             count: None,
         };
-        let texture = |binding| wgpu::BindGroupLayoutEntry {
+        let texture_of = |binding, view_dimension| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension, multisampled: false },
             count: None,
         };
+        let texture = |binding| texture_of(binding, wgpu::TextureViewDimension::D2Array);
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("path trace"),
             entries: &[
@@ -154,7 +173,7 @@ impl RayTracer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                texture(14),
+                texture_of(14, wgpu::TextureViewDimension::D2),
                 wgpu::BindGroupLayoutEntry {
                     binding: 15,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -181,6 +200,7 @@ impl RayTracer {
             sampler: gpu::linear_sampler(device, wgpu::AddressMode::ClampToEdge),
             scene: None,
             target: None,
+            copies: None,
             egui_id: None,
             samples: 0,
             key: Vec::new(),
@@ -194,11 +214,12 @@ impl RayTracer {
         let mut tri_uv = Vec::with_capacity(bvh.order.len() * 3);
         let mut tri_tan = Vec::with_capacity(bvh.order.len() * 3);
         for &t in &bvh.order {
+            let set = mesh.set_of(t) as f32;
             for k in 0..3 {
                 let v = &mesh.vertices[mesh.indices[t as usize * 3 + k] as usize];
                 tri_pos.push([v.pos[0], v.pos[1], v.pos[2], 0.0]);
                 tri_nrm.push([v.normal[0], v.normal[1], v.normal[2], 0.0]);
-                tri_uv.push([v.uv[0], v.uv[1], 0.0, 0.0]);
+                tri_uv.push([v.uv[0], v.uv[1], set, 0.0]);
                 tri_tan.push(v.tangent);
             }
         }
@@ -216,6 +237,60 @@ impl RayTracer {
             ground_y: mesh.bounds_min.y - 1e-3,
         });
         self.key.clear();
+        self.copies = None;
+    }
+
+    /// Copies the sets that changed into one array layer each (path
+    /// tracing several sets); the copies are freed when one set remains.
+    fn update_copies(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, engines: &[&Engine]) {
+        if engines.len() < 2 {
+            self.copies = None;
+            return;
+        }
+        let res = engines.iter().map(|e| e.res).max().unwrap_or(1).min(MAX_SET_COPY);
+        let layers = engines.len() as u32;
+        if self.copies.as_ref().is_none_or(|c| c.res != res || c.copied.len() != engines.len()) {
+            let textures = SET_FORMATS
+                .iter()
+                .map(|&format| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("path trace sets"),
+                        size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: layers },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: if format == wgpu::TextureFormat::Rgba8Unorm { &[wgpu::TextureFormat::Rgba8UnormSrgb] } else { &[] },
+                    })
+                })
+                .collect();
+            self.copies = Some(SetCopies { res, textures, copied: vec![None; engines.len()] });
+        }
+        let copies = self.copies.as_mut().expect("made above");
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut any = false;
+        for (k, e) in engines.iter().enumerate() {
+            let stamp = (e.generation, e.maps_version);
+            if copies.copied[k] == Some(stamp) {
+                continue;
+            }
+            copies.copied[k] = Some(stamp);
+            any = true;
+            let sources = [e.final_tex(0), e.final_tex(1), e.final_tex(2), e.final_tex(3), e.map_tex(3)];
+            for ((src, dst), &format) in sources.iter().zip(&copies.textures).zip(&SET_FORMATS) {
+                let view = dst.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: k as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                });
+                e.resample_to_view(&mut encoder, src, &view, format);
+            }
+        }
+        if any {
+            queue.submit([encoder.finish()]);
+        }
     }
 
     fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2]) {
@@ -252,7 +327,7 @@ impl RayTracer {
         &mut self,
         rs: &egui_wgpu::RenderState,
         size: [u32; 2],
-        engine: &Engine,
+        engines: &[&Engine],
         env: &Environment,
         cam: &OrbitCam,
         view: &ViewSettings,
@@ -260,12 +335,14 @@ impl RayTracer {
     ) -> bool {
         let size = [size[0].clamp(16, 8192), size[1].clamp(16, 8192)];
         self.ensure_target(rs, size);
-        let Some(scene) = &self.scene else { return false };
+        let Some(&engine) = engines.first() else { return false };
+        let Some(ground_y) = self.scene.as_ref().map(|s| s.ground_y) else { return false };
 
         let vp = cam.view_proj(size[0] as f32 / size[1] as f32);
         let eye: Vec3 = cam.eye();
-        let use_baked = view.use_baked_normal && engine.has_bake;
-        let res = engine.res as f32;
+        let use_baked = view.use_baked_normal && engines.iter().any(|e| e.has_bake);
+        // Several sets are read from copies at one size (see `update_copies`).
+        let res = if engines.len() > 1 { engines.iter().map(|e| e.res).max().unwrap_or(1).min(MAX_SET_COPY) } else { engine.res } as f32;
         let key: Vec<u32> = vp
             .to_cols_array()
             .iter()
@@ -293,7 +370,8 @@ impl RayTracer {
                 size[1] as f32,
             ])
             .map(|f| f.to_bits())
-            .chain([engine.generation as u32, (engine.generation >> 32) as u32, env.id as u32, (env.id >> 32) as u32])
+            .chain(engines.iter().flat_map(|e| [e.generation as u32, (e.generation >> 32) as u32, e.maps_version as u32]))
+            .chain([env.id as u32, (env.id >> 32) as u32])
             .collect();
         if key != self.key {
             self.key = key;
@@ -317,13 +395,15 @@ impl RayTracer {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: eye.extend(1.0).to_array(),
             frame: [size[0] as f32, size[1] as f32, self.samples as f32, settings.bounces as f32],
-            light: [view.env_rotation, 0.0, scene.ground_y, if settings.ground { 1.0 } else { 0.0 }],
+            light: [view.env_rotation, 0.0, ground_y, if settings.ground { 1.0 } else { 0.0 }],
             params: [if use_baked { 1.0 } else { 0.0 }, view.height_strength, 1.0 / res, res],
             env: [view.env_intensity, (RADIANCE_MIPS - 1) as f32, view.bg_blur, view.background as u32 as f32],
             bg: [view.bg_color[0], view.bg_color[1], view.bg_color[2], view.bg_intensity],
             sun: view.key.direction(view.env_rotation).extend(view.key.intensity).to_array(),
             sun_c: [view.key.color[0], view.key.color[1], view.key.color[2], if view.key.on { 1.0 } else { 0.0 }],
         };
+        self.update_copies(&rs.device, &rs.queue, engines);
+        let Some(scene) = &self.scene else { return false };
         let device = &rs.device;
         let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("rt uniform"),
@@ -331,6 +411,24 @@ impl RayTracer {
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let target = self.target.as_ref().unwrap();
+        // One set: its own textures, seen as one-layer arrays. Several: the copies.
+        let array_view = |t: &wgpu::Texture, format: wgpu::TextureFormat| {
+            t.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(format),
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        };
+        let textures: Vec<&wgpu::Texture> = match &self.copies {
+            Some(c) => c.textures.iter().collect(),
+            None => [engine.final_tex(0), engine.final_tex(1), engine.final_tex(2), engine.final_tex(3), engine.map_tex(3)]
+                .into_iter()
+                .map(|t| &t.texture)
+                .collect(),
+        };
+        // Color holds sRGB-encoded values: read through an sRGB view.
+        let srgb = array_view(textures[0], wgpu::TextureFormat::Rgba8UnormSrgb);
+        let set_views: Vec<wgpu::TextureView> = textures.iter().map(|t| array_view(t, t.format())).collect();
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: target.accum.as_entire_binding() },
@@ -340,11 +438,11 @@ impl RayTracer {
             wgpu::BindGroupEntry { binding: 5, resource: scene.tri_nrm.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: scene.tri_uv.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: scene.tri_tan.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(engine.final_tex(0).srgb()) },
-            wgpu::BindGroupEntry { binding: 9, resource: tex(engine.final_tex(1)) },
-            wgpu::BindGroupEntry { binding: 10, resource: tex(engine.final_tex(2)) },
-            wgpu::BindGroupEntry { binding: 11, resource: tex(engine.final_tex(3)) },
-            wgpu::BindGroupEntry { binding: 12, resource: tex(engine.map_tex(3)) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&srgb) },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&set_views[1]) },
+            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&set_views[2]) },
+            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&set_views[3]) },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&set_views[4]) },
             wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&env.radiance) },
             wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::Sampler(&self.env_sampler) },

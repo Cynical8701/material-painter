@@ -248,6 +248,8 @@ pub struct Entry {
     /// Unique per recorded step; the top serial identifies the document
     /// state, so "unsaved changes" survives undo and redo correctly.
     pub serial: u64,
+    /// The texture set the step edits (see `app::texture_sets`).
+    pub set: usize,
 }
 
 /// Linear history. Removed layers, masks and cleared paint live here (still
@@ -261,11 +263,13 @@ pub struct UndoStack {
     next_serial: u64,
     /// Steps kept; older ones are dropped (Preferences > General).
     pub max_entries: usize,
+    /// The texture set being edited: new steps belong to it.
+    pub set: usize,
 }
 
 impl Default for UndoStack {
     fn default() -> Self {
-        Self { undo: Vec::new(), redo: Vec::new(), group: None, group_depth: 0, next_serial: 0, max_entries: 64 }
+        Self { undo: Vec::new(), redo: Vec::new(), group: None, group_depth: 0, next_serial: 0, max_entries: 64, set: 0 }
     }
 }
 
@@ -277,7 +281,7 @@ impl UndoStack {
         }
         self.redo.clear();
         self.next_serial += 1;
-        self.undo.push(Entry { label: label.into(), edit, serial: self.next_serial });
+        self.undo.push(Entry { label: label.into(), edit, serial: self.next_serial, set: self.set });
         if self.undo.len() > self.max_entries.max(1) {
             let excess = self.undo.len() - self.max_entries.max(1);
             self.undo.drain(..excess);
@@ -289,7 +293,7 @@ impl UndoStack {
     /// group, so composite operations can be built from smaller ones.
     pub fn begin_group(&mut self, label: impl Into<String>) {
         if self.group_depth == 0 {
-            self.group = Some(Entry { label: label.into(), edit: Edit::Group(Vec::new()), serial: 0 });
+            self.group = Some(Entry { label: label.into(), edit: Edit::Group(Vec::new()), serial: 0, set: self.set });
         }
         self.group_depth += 1;
     }

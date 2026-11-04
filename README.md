@@ -27,6 +27,8 @@ maps, build materials in a node graph and write your own node shaders.
   modes and opacity; brushes with tips, grain, pen pressure, stabilizer,
   symmetry and screen, surface or UV projection; polygon fill by triangle,
   quad, loose part, object or UV island.
+- **Texture sets**: a mesh with several materials gets one texture set per
+  material, each with its own layers, size, baked maps and exported files.
 - **Smart materials and masks**: dozens of ready-made materials, smart mask
   generators (edge wear, dirt, dust, rain streaks, drips, cavity grime...),
   mask layers with blend modes, and mask filters (levels, blur, warp, noise
@@ -53,9 +55,10 @@ maps, build materials in a node graph and write your own node shaders.
   ambientCG, one click from the shelf, plus a community library of material
   graphs and nodes that users share from inside the app. Downloads are plain
   image files with a `meta.json`, so nothing is locked into Material Painter.
-- **Open Substance 3D Painter projects** (`.spp`): the model, the final look
-  of base color, roughness, metallic and height, and as much of the layer
-  stack as maps onto Material Painter's layers. Procedural materials, brush
+- **Open Substance 3D Painter projects** (`.spp`): the model and every
+  texture set, with the final look of base color, roughness, metallic and
+  height, and as much of each layer stack as maps onto Material Painter's
+  layers. Procedural materials, brush
   strokes and Painter-only channels don't come across; the import report
   says exactly what did. Details and limits:
   [docs/substance-painter-import.md](docs/substance-painter-import.md).

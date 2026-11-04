@@ -8,12 +8,16 @@
 //! of 512 bytes, a node tree, then one record per mesh. All numbers are little endian.
 //!
 //! Mesh record: `u32 count-or-0`, `u32 record length` (counted from the start of the record),
-//! `u32 0`, `u32 name length` + name, `u32 primitive type` (4 = triangles), a `u32` that this
-//! reader ignores, and a `u32` of format bits: `0x1` positions, `0x2` normals, `0x4` tangents and
+//! `u32 0`, `u32 name length` + name, `u32 primitive type` (4 = triangles), `u32` material
+//! index, and a `u32` of format bits: `0x1` positions, `0x2` normals, `0x4` tangents and
 //! bitangents, `0x100 << n` UV channel n, `0x10000 << n` colour channel n. Then, in that order,
 //! `u32 n` + `n*3` f32 for positions, normals, tangents and bitangents, `u32 n` + `n*4` f32 per
 //! colour channel, and per UV channel `u32 components` + `u32 n` + `n*3` f32 (u, v, 0). Finally
 //! `u32 faces` followed by `faces` entries of `u32 flag, u32 3, u32 i0, u32 i1, u32 i2`.
+//!
+//! The materials follow the meshes, as Assimp property lists; a material's name (its
+//! `?mat.name` property: `u32 semantic, u32 index, u32 data length, u32 type`, then the string
+//! as `u32 length` + bytes) is the name of the Painter texture set its meshes belong to.
 
 use glam::{Vec2, Vec3};
 
@@ -35,6 +39,8 @@ pub struct DumpMesh {
     /// Texture coordinates with the origin at the bottom-left (v up).
     pub uvs: Vec<Vec2>,
     pub triangles: Vec<[u32; 3]>,
+    /// Index into the scene's materials (see [`material_names`]).
+    pub material: u32,
 }
 
 struct Reader<'a> {
@@ -74,6 +80,42 @@ impl Reader<'_> {
     }
 }
 
+/// The scene's material names, by material index: each `?mat.name` property after the meshes,
+/// in order. Empty when there are none or the dump isn't readable.
+pub fn material_names(b: &[u8]) -> Vec<String> {
+    let Some(end) = meshes_end(b) else { return Vec::new() };
+    let tail = &b[end..];
+    let key = b"?mat.name";
+    let mut names = Vec::new();
+    let mut at = 0;
+    while let Some(k) = tail[at..].windows(key.len()).position(|w| w == key) {
+        let mut r = Reader { b: tail, p: at + k + key.len() };
+        let name = (|| {
+            for what in ["semantic", "index", "data length", "type"] {
+                r.u32(what).ok()?;
+            }
+            let len = r.u32("name").ok()? as usize;
+            let bytes = tail.get(r.p..r.p + len)?;
+            Some(String::from_utf8_lossy(bytes).trim_end_matches('\0').to_string())
+        })();
+        let Some(name) = name else { break };
+        names.push(name);
+        at = r.p;
+    }
+    names
+}
+
+/// Where the mesh records end.
+fn meshes_end(b: &[u8]) -> Option<usize> {
+    let word = |at: usize| b.get(at..at + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize);
+    let mut pos = 524 + word(524)?;
+    let count = word(pos)?;
+    for _ in 0..count.min(100_000) {
+        pos = pos.checked_add(word(pos + 4)?)?;
+    }
+    (pos <= b.len()).then_some(pos)
+}
+
 /// Parse every mesh in a `scene.assbin` dump.
 pub fn parse(b: &[u8]) -> Result<Vec<DumpMesh>, AssbinError> {
     if !b.starts_with(b"ASSIMP.binary-dump") || b.len() < 540 {
@@ -103,7 +145,7 @@ pub fn parse(b: &[u8]) -> Result<Vec<DumpMesh>, AssbinError> {
         if primitive != 4 {
             return Err(AssbinError::Unsupported(format!("primitive type {primitive} in '{name}'")));
         }
-        r.u32("record")?;
+        let material = r.u32("material index")?;
         let bits = r.u32("format bits")?;
         if bits & 1 == 0 {
             return Err(AssbinError::Unsupported(format!("mesh '{name}' has no positions")));
@@ -146,8 +188,38 @@ pub fn parse(b: &[u8]) -> Result<Vec<DumpMesh>, AssbinError> {
         if r.p != pos + len {
             return Err(AssbinError::Unsupported(format!("record '{name}' has {} unread bytes", (pos + len) as i64 - r.p as i64)));
         }
-        meshes.push(DumpMesh { name, positions, normals, uvs, triangles });
+        meshes.push(DumpMesh { name, positions, normals, uvs, triangles, material });
         pos += len;
     }
     Ok(meshes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `?mat.name` property, as Assimp writes it.
+    fn material(name: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(9u32.to_le_bytes());
+        b.extend(b"?mat.name");
+        for v in [0u32, 0, name.len() as u32 + 4, 3] {
+            b.extend(v.to_le_bytes());
+        }
+        b.extend((name.len() as u32).to_le_bytes());
+        b.extend(name.as_bytes());
+        b
+    }
+
+    #[test]
+    fn reads_material_names_after_the_meshes() {
+        let mut b = crate::spp::fixture::assbin_quad();
+        assert!(material_names(&b).is_empty());
+        b.extend(1234u32.to_le_bytes());
+        b.extend(material("Body"));
+        b.extend([0u8; 12]);
+        b.extend(material("Glass"));
+        assert_eq!(material_names(&b), ["Body", "Glass"]);
+        assert_eq!(parse(&b).unwrap()[0].material, 0);
+    }
 }

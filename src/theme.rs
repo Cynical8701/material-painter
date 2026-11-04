@@ -267,3 +267,11 @@ pub fn donate_button(ui: &mut egui::Ui, text: &str, min_size: egui::Vec2) -> egu
 pub fn with_icon(icon: &str, text: &str) -> String {
     format!("{icon}  {text}")
 }
+
+/// One line of text cut to `width` with "…" when it doesn't fit. Check
+/// `Galley::elided` to show the full text on hover.
+pub fn elided(painter: &egui::Painter, text: &str, font: egui::FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(font, color));
+    job.wrap = egui::text::TextWrapping { max_width: width.max(8.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    painter.layout_job(job)
+}

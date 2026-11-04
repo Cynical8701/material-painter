@@ -51,6 +51,19 @@ pub(super) struct Rebuilt {
     other_blends: usize,
 }
 
+impl Rebuilt {
+    /// Adds another texture set's counts.
+    fn add(&mut self, o: Rebuilt) {
+        self.folders += o.folders;
+        self.fills += o.fills;
+        self.approximate += o.approximate;
+        self.masks += o.masks;
+        self.placeholders.extend(o.placeholders);
+        self.mask_steps_left += o.mask_steps_left;
+        self.other_blends += o.other_blends;
+    }
+}
+
 fn linear_to_srgb(v: f32) -> f32 {
     let v = v.clamp(0.0, 1.0);
     if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
@@ -198,29 +211,34 @@ impl PainterApp {
         self.spp.job.is_some()
     }
 
-    /// A new project from an imported Painter project.
+    /// A new project from an imported Painter project: the model, then each texture set's
+    /// size, flattened result and rebuilt stack.
     fn apply_spp(&mut self, path: &std::path::Path, imported: Imported, ctx: &egui::Context) {
-        let Imported { mesh, set_name, resolution, channels, layers, came, left } = imported;
-        while !self.engine.layers.is_empty() {
-            self.engine.delete_layer(0, &mut self.undo);
-        }
+        let Imported { mesh, sets, came, left } = imported;
         self.graphs.clear(&self.rs);
-        if self.engine.res != resolution {
-            self.engine.set_resolution(resolution, &self.gpu_mesh, &mut self.undo);
-        }
         self.apply_project_defaults();
-        let flat = self.engine.add_paint_layer_from(0, None, FLATTENED.into(), channels, &mut self.undo);
-        let stack = self.rebuild_spp_stack(&layers);
+        self.load_mesh(mesh, ctx);
+        let mut stack = Rebuilt::default();
+        for (k, set) in sets.into_iter().enumerate() {
+            self.switch_set(k);
+            while !self.engine.layers.is_empty() {
+                self.engine.delete_layer(0, &mut self.undo);
+            }
+            if self.engine.res != set.resolution {
+                self.engine.set_resolution(set.resolution, &self.gpu_mesh, &mut self.undo);
+            }
+            let flat = self.engine.add_paint_layer_from(0, None, FLATTENED.into(), set.channels, &mut self.undo);
+            stack.add(self.rebuild_spp_stack(&set.layers));
+            self.selected = self.engine.layers.iter().position(|l| l.name == FLATTENED).unwrap_or(flat);
+            self.target = StrokeTarget::Content;
+        }
+        self.switch_set(0);
         self.undo.clear();
         self.saved_serial = self.undo.state_serial();
         self.project_path = None;
-        self.load_mesh(mesh, ctx);
-        if !self.prefs.bake_on_load {
-            self.start_bake(ctx);
-        }
-        self.selected = self.engine.layers.iter().position(|l| l.name == FLATTENED).unwrap_or(flat);
-        self.target = StrokeTarget::Content;
-        let name = path.file_name().map_or(set_name, |n| n.to_string_lossy().into_owned());
+        // Every set at its own size (set above), so after the sizes.
+        self.start_bake_all(ctx);
+        let name = path.file_name().map_or_else(|| self.mesh.name.clone(), |n| n.to_string_lossy().into_owned());
         self.status = format!("Opened {name} from Substance 3D Painter: see the report for what came across.");
         self.spp.report = Some(Report { name, came, left, stack });
     }

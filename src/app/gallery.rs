@@ -159,10 +159,13 @@ pub(super) fn card(ui: &mut egui::Ui, tex: Option<egui::TextureId>, title: &str,
             p.text(img.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(size * 0.3), Color32::from_gray(90));
         }
     }
-    p.text(pos2(rect.min.x + 10.0, img.max.y + 6.0), egui::Align2::LEFT_TOP, title, egui::FontId::new(14.0, theme::heading_family()), Color32::WHITE);
+    let t = theme::elided(p, title, egui::FontId::new(14.0, theme::heading_family()), Color32::WHITE, size - 20.0);
+    let cut = t.elided;
+    p.galley(pos2(rect.min.x + 10.0, img.max.y + 6.0), t, Color32::WHITE);
     let galley = p.layout(desc.to_string(), egui::FontId::proportional(10.5), theme::TEXT_DIM, size - 16.0);
     p.galley(pos2(rect.min.x + 10.0, img.max.y + 25.0), galley, theme::TEXT_DIM);
-    resp.on_hover_text(desc)
+    // A cut title shows in full on hover, above the description.
+    if cut { resp.on_hover_text(format!("{title}\n{desc}")) } else { resp.on_hover_text(desc) }
 }
 
 /// A section heading for start pages.

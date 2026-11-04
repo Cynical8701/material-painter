@@ -43,6 +43,7 @@ mod mcp_tools;
 pub(crate) mod prefs;
 mod project_io;
 mod shelf_previews;
+mod texture_sets;
 
 use export_ui::{ExportDialog, open_in_file_browser};
 use graph_ui::GraphStore;
@@ -378,7 +379,10 @@ enum Action {
     /// Puts the selected layer into a new folder.
     GroupIntoFolder,
     SetResolution(u32),
+    /// Bakes the texture set being edited.
     Bake,
+    /// Bakes every texture set.
+    BakeAll,
     /// Selects a brush tip (`None`: round) and switches to painting.
     SetBrushTip(Option<usize>),
     /// Puts a shelf texture on a channel of the selected fill layer.
@@ -390,7 +394,9 @@ pub struct PainterApp {
     mesh: Arc<Mesh>,
     bvh: Arc<Bvh>,
     gpu_mesh: GpuMesh,
+    /// The texture set being edited (see `texture_sets`).
     engine: Engine,
+    sets: texture_sets::TextureSets,
     views: ViewRenderer,
     raytracer: RayTracer,
     rt: RtSettings,
@@ -1399,6 +1405,7 @@ impl PainterApp {
             },
             uploaded_tip: None,
             uploaded_grain: None,
+            sets: Default::default(),
             pressure: 1.0,
             line_anchor: None,
         };
@@ -1415,25 +1422,53 @@ impl PainterApp {
 
     // ------------------------------------------------------------------ jobs
 
+    /// Bakes the texture set being edited.
     fn start_bake(&mut self, ctx: &egui::Context) {
-        self.preview_full_bake_started();
+        self.sets.bake_queue.clear();
+        self.start_bake_set(self.sets.active, ctx);
+    }
+
+    /// Bakes every texture set, the edited one first.
+    fn start_bake_all(&mut self, ctx: &egui::Context) {
+        let active = self.sets.active;
+        self.sets.bake_queue = (0..self.mesh.sets.len()).filter(|&k| k != active).collect();
+        self.start_bake_set(active, ctx);
+    }
+
+    fn start_bake_set(&mut self, set: usize, ctx: &egui::Context) {
+        if set == self.sets.active {
+            self.preview_full_bake_started();
+        }
+        let Some(res) = self.set_engine_mut(set).map(|e| e.res.min(bake::MAX_BAKE_RES)) else { return };
+        self.sets.baking = set;
         let mesh = self.mesh.clone();
         let settings = self.bake_settings.clone();
-        let res = self.engine.res.min(bake::MAX_BAKE_RES);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let key = bake_cache::key(&mesh, &settings, res);
+            let key = bake_cache::key(&mesh, &settings, res, set);
             let prepared = match bake_cache::load(&key) {
                 Some(entry) => Ok(Prepared::Cached(entry)),
-                None => bake::prepare(&mesh, &settings).map(|scene| Prepared::Scene(scene, key)),
+                None => bake::prepare(&mesh, &settings, set).map(|scene| Prepared::Scene(scene, key)),
             };
             let _ = tx.send(prepared);
             ctx.request_repaint();
         });
         // A newer job replaces any running one; its results are dropped.
         self.bake_job = Some(BakeJob::Preparing(rx));
-        self.status = "Preparing bake…".into();
+        self.status = if self.mesh.sets.len() > 1 {
+            format!("Preparing bake of {}…", self.mesh.sets[set].name)
+        } else {
+            "Preparing bake…".into()
+        };
+    }
+
+    /// A bake finished (or failed): the next queued set starts.
+    fn bake_next(&mut self, ctx: &egui::Context) {
+        self.bake_job = None;
+        if let Some(set) = self.sets.bake_queue.pop_front() {
+            self.start_bake_set(set, ctx);
+        }
     }
 
     fn poll_bake(&mut self, ctx: &egui::Context) {
@@ -1445,17 +1480,20 @@ impl PainterApp {
                     match out_of_memory_guard(&rs.device, || entry.upload(&rs.device, &rs.queue)) {
                         Ok((maps, report)) => {
                             self.status = format!("Loaded {} cached mesh maps ({}², from {}).", report.baked.count_ones(), report.resolution, report.source);
-                            self.engine.set_maps(maps, Arc::new(report));
+                            if let Some(e) = self.set_engine_mut(self.sets.baking) {
+                                e.set_maps(maps, Arc::new(report));
+                            }
                         }
                         Err(e) => {
                             self.fail_mcp_bake(&e);
                             self.status = e;
                         }
                     }
-                    self.bake_job = None;
+                    self.bake_next(ctx);
                 }
                 Ok(Ok(Prepared::Scene(scene, key))) => {
-                    let (baker, rs, mesh, settings, res) = (&self.baker, &self.rs, &self.gpu_mesh, &self.bake_settings, self.engine.res);
+                    let res = self.set_engines().get(self.sets.baking).map_or(self.engine.res, |e| e.res);
+                    let (baker, rs, mesh, settings) = (&self.baker, &self.rs, &self.gpu_mesh, &self.bake_settings);
                     match out_of_memory_guard(&rs.device, || baker.start(&rs.device, &rs.queue, mesh, &scene, settings, res)) {
                         Ok(run) => {
                             self.bake_job = Some(BakeJob::Running(run, key));
@@ -1496,13 +1534,14 @@ impl PainterApp {
                         0 => String::new(),
                         n => format!(", {n} parts matched by name"),
                     };
-                    let upscaled = if report.resolution < self.engine.res {
-                        format!(", upscaled to {}²", self.engine.res)
-                    } else {
-                        String::new()
+                    let set_res = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len()).get(self.sets.baking).map_or(self.engine.res, |e| e.res);
+                    let upscaled = if report.resolution < set_res { format!(", upscaled to {set_res}²") } else { String::new() };
+                    let set_name = match self.mesh.sets.get(self.sets.baking) {
+                        Some(s) if self.mesh.sets.len() > 1 => format!(" for {}", s.name),
+                        _ => String::new(),
                     };
                     self.status = format!(
-                        "Baked {} mesh maps from {} ({} tris, {} parts{matched}{}) at {}²{upscaled}.",
+                        "Baked {} mesh maps{set_name} from {} ({} tris, {} parts{matched}{}) at {}²{upscaled}.",
                         report.baked.count_ones(),
                         report.source,
                         report.triangles,
@@ -1511,8 +1550,10 @@ impl PainterApp {
                         report.resolution
                     );
                     bake_cache::store(key.clone(), &maps, report.clone(), &self.rs.device, &self.rs.queue);
-                    self.engine.set_maps(maps, report);
-                    self.bake_job = None;
+                    if let Some(e) = self.set_engine_mut(self.sets.baking) {
+                        e.set_maps(maps, report);
+                    }
+                    self.bake_next(ctx);
                 }
             }
         }
@@ -1530,21 +1571,27 @@ impl PainterApp {
         if self.stroke.is_some() {
             return;
         }
+        // A bake of the old mesh can't land on the new one.
+        self.bake_job = None;
+        self.end_preview(false);
         self.gpu_mesh = GpuMesh::new(&self.rs.device, &mesh);
         self.bvh = Arc::new(Bvh::from_mesh(&mesh));
         self.raytracer.set_mesh(&self.rs.device, &mesh, &self.bvh);
-        self.engine.set_bounds((mesh.bounds_min, mesh.bounds_max));
-        self.engine.bake_uv(&self.gpu_mesh);
         self.export.mesh_name = mesh.name.replace(' ', "");
-        self.status = format!("Loaded '{}' ({} triangles).", mesh.name, mesh.triangle_count());
+        self.status = match mesh.sets.len() {
+            1 => format!("Loaded '{}' ({} triangles).", mesh.name, mesh.triangle_count()),
+            n => format!("Loaded '{}' ({} triangles, {n} texture sets).", mesh.name, mesh.triangle_count()),
+        };
+        let old_names: Vec<String> = self.mesh.sets.iter().map(|s| s.name.clone()).collect();
         self.mesh = Arc::new(mesh);
+        self.rebuild_sets(&old_names);
         // Mesh-dependent helpers rebuild for the new mesh on demand.
         self.poly.topo = None;
         self.poly.shown = None;
         self.overlays.clear(OverlaySlot::Selection);
         self.cam = OrbitCam { fov_y: self.cam.fov_y, ..OrbitCam::default() };
         if self.prefs.bake_on_load {
-            self.start_bake(ctx);
+            self.start_bake_all(ctx);
         }
     }
 
@@ -1583,10 +1630,12 @@ impl PainterApp {
                     }
                 }
                 Action::Undo => {
+                    self.switch_for_history(false);
                     self.engine.undo(&mut self.undo);
                     self.after_history_step();
                 }
                 Action::Redo => {
+                    self.switch_for_history(true);
                     self.engine.redo(&mut self.undo);
                     self.after_history_step();
                 }
@@ -1752,6 +1801,7 @@ impl PainterApp {
                     self.status = format!("Texture set resolution: {r}x{r}.");
                 }
                 Action::Bake => self.start_bake(ctx),
+                Action::BakeAll => self.start_bake_all(ctx),
             }
         }
     }
@@ -1777,6 +1827,8 @@ impl PainterApp {
     fn run_unchecked(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::NewProject(p) => {
+                // The first set is the one cleared below and kept for the new mesh.
+                self.switch_set(0);
                 while !self.engine.layers.is_empty() {
                     self.engine.delete_layer(0, &mut self.undo);
                 }
@@ -2186,7 +2238,11 @@ impl PainterApp {
             ui.separator();
             for ws in Workspace::ALL {
                 let resp = theme::pill(ui, &theme::with_icon(ws.icon(), ws.name()), self.workspace == ws);
-                if resp.on_hover_text("Ctrl+PageUp / PageDown").clicked() {
+                let keys = match ws {
+                    Workspace::Designer => "Ctrl+G opens the selected layer's graph; Ctrl+PageUp / PageDown switch workspaces",
+                    _ => "Ctrl+PageUp / PageDown switch workspaces",
+                };
+                if resp.on_hover_text(keys).clicked() {
                     self.workspace = ws;
                 }
             }
@@ -2297,7 +2353,9 @@ impl PainterApp {
                         for c in &self.bake_settings.custom {
                             ui.selectable_value(&mut self.view.mode, ViewMode::Custom(c.id), &c.name);
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("What the views show (M: material, C: next channel)");
                 ui.label(egui::RichText::new("Display").color(theme::TEXT_DIM));
                 ui.separator();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -2359,19 +2417,23 @@ impl PainterApp {
                     } else {
                     let s = |ui: &mut egui::Ui, label: &str, v: &mut f32, r: std::ops::RangeInclusive<f32>, pct: bool| {
                         ui.label(egui::RichText::new(label).color(theme::TEXT_DIM));
-                        if pct {
+                        let resp = if pct {
                             let mut p = *v * 100.0;
                             let lo = *r.start() * 100.0;
                             let hi = *r.end() * 100.0;
-                            if ui.add(egui::Slider::new(&mut p, lo..=hi).max_decimals(0).suffix("%")).changed() {
+                            let resp = ui.add(egui::Slider::new(&mut p, lo..=hi).max_decimals(0).suffix("%"));
+                            if resp.changed() {
                                 *v = p / 100.0;
                             }
+                            resp
                         } else {
-                            ui.add(egui::Slider::new(v, r).max_decimals(0));
-                        }
+                            ui.add(egui::Slider::new(v, r).max_decimals(0))
+                        };
                         ui.add_space(6.0);
+                        resp
                     };
-                    s(ui, "Size", &mut self.brush.size, 2.0..=800.0, false);
+                    s(ui, "Size", &mut self.brush.size, 2.0..=800.0, false)
+                        .on_hover_text("Brush size ([ and ] to shrink / grow, Ctrl+right-drag in the view)");
                     s(ui, "Flow", &mut self.brush.flow, 0.01..=1.0, true);
                     s(ui, "Stroke opacity", &mut self.brush.opacity, 0.01..=1.0, true);
                     s(ui, "Hardness", &mut self.brush.hardness, 0.0..=0.99, true);
@@ -2458,6 +2520,30 @@ impl PainterApp {
     // ------------------------------------------------------------------ layers
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
+        // Which texture set the stack below belongs to.
+        if self.mesh.sets.len() > 1 {
+            let mut pick = None;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Texture set").color(theme::TEXT_DIM));
+                let current = self.mesh.sets[self.sets.active].name.clone();
+                egui::ComboBox::from_id_salt("texture set")
+                    .selected_text(current)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for (k, set) in self.mesh.sets.iter().enumerate() {
+                            if ui.selectable_label(k == self.sets.active, &set.name).clicked() {
+                                pick = Some(k);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Each material of the mesh has its own layers, size and mesh maps");
+            });
+            if let Some(k) = pick {
+                self.switch_set(k);
+            }
+            ui.add_space(2.0);
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let mut btn = |ui: &mut egui::Ui, icon: &str, tip: &str, action: Option<Action>| {
@@ -2607,7 +2693,9 @@ impl PainterApp {
 
         // Name and blend info.
         let text_col = if visible { Color32::WHITE } else { theme::TEXT_DIM };
-        painter.text(pos2(x, rect.min.y + 13.0), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.5), text_col);
+        let title = theme::elided(&painter, &name, egui::FontId::proportional(12.5), text_col, rect.max.x - x - 8.0);
+        let name_cut = title.elided;
+        painter.galley(pos2(x, rect.min.y + 13.0 - title.size().y * 0.5), title, text_col);
         let mb = self.engine.layer_vram_bytes(idx) as f64 / (1024.0 * 1024.0);
         let info = match &layer.content {
             Content::Folder(_) => {
@@ -2619,6 +2707,7 @@ impl PainterApp {
         };
         painter.text(pos2(x, rect.min.y + 31.0), egui::Align2::LEFT_CENTER, info, egui::FontId::proportional(10.5), theme::TEXT_DIM);
         painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::BORDER));
+        let resp = if name_cut { resp.on_hover_text(&name) } else { resp };
 
         // Interaction.
         if eye.clicked() {
@@ -2713,9 +2802,17 @@ impl PainterApp {
 
     fn texture_set_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if self.mesh.sets.len() > 1 {
+                section(ui, "Texture sets");
+                self.texture_set_list(ui);
+            }
             section(ui, "Texture set");
             labeled(ui, "Mesh", |ui| ui.label(&self.mesh.name));
-            labeled(ui, "Triangles", |ui| ui.label(self.mesh.triangle_count().to_string()));
+            let set = &self.mesh.sets[self.sets.active.min(self.mesh.sets.len() - 1)];
+            if self.mesh.sets.len() > 1 {
+                labeled(ui, "Material", |ui| ui.label(&set.name));
+            }
+            labeled(ui, "Triangles", |ui| ui.label((set.tris.end - set.tris.start).to_string()));
             let res = self.engine.res;
             labeled(ui, "Size", |ui| {
                 egui::ComboBox::from_id_salt("res").selected_text(format!("{res} x {res}")).show_ui(ui, |ui| {
@@ -3293,11 +3390,24 @@ impl PainterApp {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 let busy = self.bake_job.is_some();
-                if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(theme::with_icon(icons::FIRE, "Bake")).strong()).fill(theme::ACCENT_DIM).min_size(vec2(120.0, 30.0))).clicked() {
+                let sets = self.mesh.sets.len();
+                let label = if sets > 1 { format!("Bake {}", self.mesh.sets[self.sets.active].name) } else { "Bake".into() };
+                let bake = egui::Button::new(egui::RichText::new(theme::with_icon(icons::FIRE, &label)).strong()).fill(theme::ACCENT_DIM).min_size(vec2(120.0, 30.0));
+                if ui.add_enabled(!busy, bake).on_hover_text("Bake the texture set being painted").clicked() {
                     self.pending.push(Action::Bake);
                 }
+                if sets > 1 {
+                    let all = egui::Button::new(format!("Bake all {sets} sets")).min_size(vec2(0.0, 30.0));
+                    if ui.add_enabled(!busy, all).on_hover_text("Bake every texture set, one after another").clicked() {
+                        self.pending.push(Action::BakeAll);
+                    }
+                }
                 if let Some((p, what)) = self.bake_progress() {
-                    ui.add(egui::ProgressBar::new(p).text(format!("{what} {:.0}%", p * 100.0)));
+                    let set = match self.mesh.sets.get(self.sets.baking) {
+                        Some(s) if sets > 1 => format!(" {}", s.name),
+                        _ => String::new(),
+                    };
+                    ui.add(egui::ProgressBar::new(p).text(format!("{what}{set} {:.0}%", p * 100.0)));
                 } else if self.engine.has_bake {
                     ui.label(egui::RichText::new("Painted fixes and levels are kept when you re-bake.").small().color(theme::TEXT_DIM));
                 }
@@ -3994,14 +4104,23 @@ impl PainterApp {
                 let search = self.shelf.search.to_lowercase();
                 let kind = self.shelf.kind;
                 let wanted = |k: presets::MaterialType| kind.is_none_or(|f| f == k);
-                // Starts a new row with the type's name when the type changes (all types shown).
+                // The type's name as a heading of its own when the type changes
+                // (all types shown). It takes the full width, so the wrapped
+                // layout puts it on a fresh row and starts the next items below it.
                 let group = |ui: &mut egui::Ui, last: &mut Option<presets::MaterialType>, k: presets::MaterialType| {
                     if kind.is_none() && *last != Some(k) {
-                        if last.is_some() {
-                            ui.end_row();
-                        }
-                        ui.label(egui::RichText::new(k.name().to_uppercase()).small().strong().color(theme::TEXT_DIM));
-                        ui.end_row();
+                        let width = ui.max_rect().width();
+                        let h = if last.is_some() { 30.0 } else { 20.0 };
+                        let (r, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
+                        let base = r.left_bottom() + vec2(2.0, -5.0);
+                        let g = ui.painter().layout_no_wrap(k.name().to_uppercase(), egui::FontId::new(11.0, theme::heading_family()), theme::TEXT_DIM);
+                        let line_y = base.y - g.size().y * 0.5;
+                        let text_w = g.size().x;
+                        ui.painter().galley(pos2(base.x, base.y - g.size().y), g, theme::TEXT_DIM);
+                        ui.painter().line_segment(
+                            [pos2(base.x + text_w + 8.0, line_y), pos2(r.right() - 4.0, line_y)],
+                            Stroke::new(1.0, theme::OUTLINE),
+                        );
                         *last = Some(k);
                     }
                 };
@@ -4209,15 +4328,16 @@ impl PainterApp {
     /// A shelf thumbnail `size` points wide with its name below; hovering
     /// shows it at twice the size.
     fn swatch(ui: &mut egui::Ui, tex: egui::TextureId, name: &str, size: f32) -> egui::Response {
-        let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 28.0), Sense::click_and_drag());
+        let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 22.0), Sense::click_and_drag());
         let p = ui.painter();
         if resp.hovered() {
             p.rect_filled(rect, 0.0, theme::WIDGET_HOVER);
         }
         let img = Rect::from_min_size(rect.min + vec2(6.0, 4.0), vec2(size, size));
         p.image(tex, img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-        let galley = p.layout(name.to_string(), egui::FontId::proportional(10.5), theme::TEXT, size + 8.0);
-        let pos = pos2(rect.center().x - galley.size().x * 0.5, img.max.y + 2.0);
+        // One line, cut with "…"; the hover shows the full name.
+        let galley = theme::elided(p, name, egui::FontId::proportional(10.5), theme::TEXT, size + 8.0);
+        let pos = pos2(rect.center().x - galley.size().x * 0.5, img.max.y + 3.0);
         p.galley(pos, galley, theme::TEXT);
         if resp.dragged() {
             // The thumbnail follows the pointer while it's dragged to a view.
@@ -4502,6 +4622,10 @@ impl PainterApp {
                 tris.extend(topo.select(self.poly.mode, s).into_iter().filter(|t| self.poly.filled.insert(*t)));
             }
         }
+        // Only the edited texture set takes paint.
+        if let Some(set) = self.mesh.sets.get(self.sets.active) {
+            tris.retain(|t| set.tris.contains(t));
+        }
         if tris.is_empty() {
             return;
         }
@@ -4633,6 +4757,7 @@ impl PainterApp {
     /// Eyedropper: copies the final color, roughness and metallic under the
     /// cursor into the brush, then goes back to painting.
     fn pick_material(&mut self, kind: ViewKind, at: Vec2) {
+        let mut set = self.sets.active;
         let uv = match kind {
             ViewKind::V3d => {
                 let size = Vec2::new(self.views.view3d.size[0] as f32, self.views.view3d.size[1] as f32);
@@ -4642,6 +4767,7 @@ impl PainterApp {
                     return;
                 };
                 let corner = |k: usize| Vec2::from_array(self.mesh.vertices[self.mesh.indices[hit.tri as usize * 3 + k] as usize].uv);
+                set = self.mesh.set_of(hit.tri);
                 corner(0) * hit.bary.x + corner(1) * hit.bary.y + corner(2) * hit.bary.z
             }
             ViewKind::V2d => {
@@ -4654,7 +4780,8 @@ impl PainterApp {
             self.status = "Pick inside the texture.".into();
             return;
         }
-        let (color, rough, metal) = self.engine.sample_final(uv);
+        let engines = self.set_engines();
+        let (color, rough, metal) = engines.get(set).unwrap_or(&&self.engine).sample_final(uv);
         self.brush.mat.color = color;
         self.brush.mat.rough = rough;
         self.brush.mat.metal = metal;
@@ -4964,16 +5091,19 @@ impl PainterApp {
         if self.engine.dirty {
             self.engine.composite();
         }
+        self.composite_parked();
         let size = [(rect.width() * self.ppp).round() as u32, (rect.height() * self.ppp).round() as u32];
         let mut rt_view = None;
         match kind {
             ViewKind::V3d => {
-                self.views.render_3d(&self.rs, size, &self.engine, &self.env, &self.gpu_mesh, &self.cam, &self.view, Some(&self.overlays));
+                let engines = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+                self.views.render_3d(&self.rs, size, &engines, &self.env, &self.gpu_mesh, &self.cam, &self.view, Some(&self.overlays));
                 self.drew_3d = true;
                 // Path tracing replaces the 3D view while it's idle. Painting and
                 // the map display modes use the raster view, which reacts instantly.
                 if self.rt.enabled && self.stroke.is_none() && self.view.mode == ViewMode::Material {
-                    if self.raytracer.render(&self.rs, size, &self.engine, &self.env, &self.cam, &self.view, &self.rt) {
+                    let engines = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+                    if self.raytracer.render(&self.rs, size, &engines, &self.env, &self.cam, &self.view, &self.rt) {
                         ui.ctx().request_repaint();
                     }
                     rt_view = self.raytracer.egui_id;
@@ -4984,7 +5114,7 @@ impl PainterApp {
                     self.cam2d.zoom = size[0].min(size[1]) as f32 * 0.9;
                     self.cam2d.pan = Vec2::ZERO;
                 }
-                self.views.render_2d(&self.rs, size, &self.engine, &self.env, &self.gpu_mesh, &self.cam2d, &self.view);
+                self.views.render_2d(&self.rs, size, &self.engine, &self.env, &self.gpu_mesh, self.sets.active, &self.cam2d, &self.view);
             }
         }
 
@@ -5053,7 +5183,8 @@ impl PainterApp {
         self.update_poly_highlight();
         if !self.drew_3d {
             let size = self.views.view3d.size;
-            self.views.render_3d(&self.rs, size, &self.engine, &self.env, &self.gpu_mesh, &self.cam, &self.view, Some(&self.overlays));
+            let engines = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+            self.views.render_3d(&self.rs, size, &engines, &self.env, &self.gpu_mesh, &self.cam, &self.view, Some(&self.overlays));
         }
         self.drew_3d = false;
     }

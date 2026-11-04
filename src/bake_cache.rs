@@ -96,13 +96,18 @@ fn file_stamp(h: &mut Hasher, path: &Option<PathBuf>) {
     }
 }
 
-/// The key of baking `mesh` with `settings` at `res` (already clamped to the
-/// bake limit).
-pub fn key(mesh: &Mesh, settings: &BakeSettings, res: u32) -> Key {
+/// The key of baking texture set `set` of `mesh` with `settings` at `res`
+/// (already clamped to the bake limit).
+pub fn key(mesh: &Mesh, settings: &BakeSettings, res: u32, set: usize) -> Key {
     let mut h = Hasher::new();
     h.word(FORMAT_VERSION as u64);
     h.word(code_fingerprint());
     h.word(res as u64);
+    // Every set's range: the ID map colors by set.
+    h.word(set as u64);
+    for s in &mesh.sets {
+        h.word(((s.tris.start as u64) << 32) | s.tris.end as u64);
+    }
     h.str(&format!("{settings:?}"));
     file_stamp(&mut h, &settings.high_poly);
     file_stamp(&mut h, &settings.cage);
@@ -302,13 +307,13 @@ mod tests {
     fn key_tracks_mesh_settings_and_resolution() {
         let ball = Primitive::MaterialBall.build();
         let s = BakeSettings::default();
-        let k = key(&ball, &s, 2048);
-        assert_eq!(k, key(&ball, &s, 2048), "the key is deterministic");
-        assert_ne!(k, key(&ball, &s, 1024));
-        assert_ne!(k, key(&Primitive::Sphere.build(), &s, 2048));
+        let k = key(&ball, &s, 2048, 0);
+        assert_eq!(k, key(&ball, &s, 2048, 0), "the key is deterministic");
+        assert_ne!(k, key(&ball, &s, 1024, 0));
+        assert_ne!(k, key(&Primitive::Sphere.build(), &s, 2048, 0));
         let mut s2 = s.clone();
         s2.ao_distance += 0.01;
-        assert_ne!(k, key(&ball, &s2, 2048));
+        assert_ne!(k, key(&ball, &s2, 2048, 0));
     }
 
     #[test]

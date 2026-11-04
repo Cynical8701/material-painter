@@ -215,6 +215,8 @@ impl PainterApp {
             folder: PathBuf::from(&p.export_folder),
             mesh_name: self.export.mesh_name.clone(),
             project_name: self.project_path.as_ref().and_then(|p| p.file_stem()).map_or("Untitled".into(), |s| s.to_string_lossy().into_owned()),
+            set_name: self.mesh.sets.get(self.sets.active).map_or(String::new(), |s| s.name.replace(' ', "")),
+            set_count: self.mesh.sets.len(),
             format: p.export_format,
             depth: p.export_depth,
             size: p.export_size,
@@ -224,17 +226,38 @@ impl PainterApp {
         }
     }
 
-    /// Reads the maps back now and writes the files on a worker thread.
-    fn start_export(&mut self, template: Template, ctx: &egui::Context) {
+    /// Every texture set's maps, read back now (after compositing), with
+    /// the settings that name its files.
+    fn export_snapshots(&mut self, settings: &export::Settings) -> Vec<(export::Snapshot, export::Settings)> {
         if self.engine.dirty {
             self.engine.composite();
         }
-        let snapshot = export::snapshot(&self.engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
+        self.composite_parked();
+        let engines = self.set_engines();
+        self.mesh
+            .sets
+            .iter()
+            .zip(engines)
+            .map(|(set, engine)| {
+                let snapshot = export::snapshot(engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
+                (snapshot, export::Settings { set_name: set.name.replace(' ', ""), ..settings.clone() })
+            })
+            .collect()
+    }
+
+    /// Reads the maps back now and writes the files on a worker thread.
+    fn start_export(&mut self, template: Template, ctx: &egui::Context) {
         let settings = self.export_settings();
+        let jobs = self.export_snapshots(&settings);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(export::export(&snapshot, &template, &settings));
+            let mut files = Vec::new();
+            let result = jobs.iter().try_for_each(|(snapshot, settings)| {
+                files.extend(export::export(snapshot, &template, settings)?);
+                Ok::<_, String>(())
+            });
+            let _ = tx.send(result.map(|_| files));
             ctx.request_repaint();
         });
         self.export.job = Some(rx);
@@ -243,11 +266,11 @@ impl PainterApp {
 
     /// Exports synchronously (agents wait for the files).
     pub(super) fn export_now(&mut self, template: usize, settings: &export::Settings) -> Result<Vec<PathBuf>, String> {
-        if self.engine.dirty {
-            self.engine.composite();
+        let mut files = Vec::new();
+        for (snapshot, settings) in self.export_snapshots(settings) {
+            files.extend(export::export(&snapshot, &self.export.templates[template], &settings)?);
         }
-        let snapshot = export::snapshot(&self.engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
-        export::export(&snapshot, &self.export.templates[template], settings)
+        Ok(files)
     }
 
     fn poll_export(&mut self) {
@@ -396,7 +419,7 @@ impl PainterApp {
                                 self.prefs.export_template = name;
                             }
                         }
-                        ui.label(egui::RichText::new("$mesh and $project in file names are replaced.").small().color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("$mesh, $set (texture set) and $project in file names are replaced.").small().color(theme::TEXT_DIM));
                         egui::ScrollArea::vertical().id_salt("maps").show(ui, |ui| {
                             let t = &mut self.export.templates[sel];
                             let mut remove = None;

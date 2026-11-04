@@ -881,7 +881,8 @@ struct Pipelines {
     apply_module: wgpu::ShaderModule,
     apply_layout: wgpu::PipelineLayout,
     apply_bgl: wgpu::BindGroupLayout,
-    apply_paint: HashMap<u8, wgpu::RenderPipeline>,
+    /// Made on first use per channel combination; shared by every texture set.
+    apply_paint: std::sync::Mutex<HashMap<u8, wgpu::RenderPipeline>>,
     apply_mask: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     folder_merge: wgpu::RenderPipeline,
@@ -904,8 +905,12 @@ pub struct Engine {
     rs: egui_wgpu::RenderState,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    p: Pipelines,
+    /// Shared by the texture sets of a document.
+    p: Arc<Pipelines>,
     pub res: u32,
+    /// The texture set's range in the mesh's index buffer: only these
+    /// triangles get position and normal maps, so only they take paint.
+    tris: std::ops::Range<u32>,
     pos: Tex,
     nrm: Tex,
     accum: [[Tex; 4]; 2],
@@ -986,10 +991,28 @@ fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; 4] {
 }
 
 impl Engine {
+    /// A document of one texture set covering the whole mesh.
     pub fn new(rs: &egui_wgpu::RenderState, mesh: &GpuMesh, bounds: (Vec3, Vec3), res: u32) -> Engine {
+        let p = Arc::new(Self::create_pipelines(&rs.device));
+        Self::with_pipelines(rs, p, mesh, 0..mesh.index_count, bounds, res)
+    }
+
+    /// Another texture set of the same document: `tris` is its range in the
+    /// mesh's index buffer. Shares this engine's pipelines.
+    pub fn sibling(&self, mesh: &GpuMesh, tris: std::ops::Range<u32>, res: u32) -> Engine {
+        Self::with_pipelines(&self.rs, self.p.clone(), mesh, tris, self.bounds, res)
+    }
+
+    fn with_pipelines(
+        rs: &egui_wgpu::RenderState,
+        p: Arc<Pipelines>,
+        mesh: &GpuMesh,
+        tris: std::ops::Range<u32>,
+        bounds: (Vec3, Vec3),
+        res: u32,
+    ) -> Engine {
         let device = rs.device.clone();
         let queue = rs.queue.clone();
-        let p = Self::create_pipelines(&device);
         let sampler = gpu::linear_sampler(&device, wgpu::AddressMode::ClampToEdge);
 
         let dummy = Tex::new(&device, "dummy", 1, 1, F::Rgba8Unorm, LAYER_USAGE);
@@ -1076,6 +1099,7 @@ impl Engine {
             region_unknown: false,
             generation: 0,
             res,
+            tris,
             p,
             device,
             queue,
@@ -1311,7 +1335,7 @@ impl Engine {
             entries: &[gpu::tex_entry(0, true), gpu::sampler_entry(1)],
         });
         let resample_layout = gpu::layout(device, &resample_bgl);
-        let resample = [F::Rgba8Unorm, F::Rg8Unorm, F::Rg16Float, F::R8Unorm, F::Rgba16Float]
+        let resample = [F::Rgba8Unorm, F::Rg8Unorm, F::Rg16Float, F::R8Unorm, F::R16Float, F::Rgba16Float]
             .into_iter()
             .map(|f| {
                 let pl = gpu::fullscreen_pipeline(
@@ -1366,7 +1390,7 @@ impl Engine {
             apply_module,
             apply_layout,
             apply_bgl,
-            apply_paint: HashMap::new(),
+            apply_paint: Default::default(),
             apply_mask,
             composite,
             folder_merge,
@@ -1386,6 +1410,9 @@ impl Engine {
     /// Rasterizes position and normal maps for the current mesh at the
     /// current resolution, with dilation past UV island borders.
     pub fn bake_uv(&mut self, mesh: &GpuMesh) {
+        // A mesh change can leave the range past the end; the app sets the
+        // new range right after, and this draws nothing meanwhile.
+        let tris = self.tris.start.min(mesh.index_count)..self.tris.end.min(mesh.index_count);
         let device = &self.device;
         let tmp_pos = Tex::new(device, "dilate pos", self.res, self.res, POS_FORMAT, LAYER_USAGE);
         let tmp_nrm = Tex::new(device, "dilate nrm", self.res, self.res, NRM_FORMAT, LAYER_USAGE);
@@ -1400,7 +1427,7 @@ impl Engine {
             pass.set_pipeline(&self.p.uvbake);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            pass.draw_indexed(tris, 0, 0..1);
         }
         let bg = |src_pos: &Tex, src_nrm: &Tex| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1435,6 +1462,18 @@ impl Engine {
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
         self.bounds
+    }
+
+    /// The texture set's range in the mesh's index buffer.
+    pub fn triangles(&self) -> std::ops::Range<u32> {
+        self.tris.clone()
+    }
+
+    /// Moves the texture set to another range of the (new) mesh and remakes
+    /// its position and normal maps.
+    pub fn set_triangles(&mut self, tris: std::ops::Range<u32>, mesh: &GpuMesh) {
+        self.tris = tris;
+        self.bake_uv(mesh);
     }
 
     pub fn set_bounds(&mut self, bounds: (Vec3, Vec3)) {
@@ -2604,13 +2643,17 @@ impl Engine {
         true
     }
 
-    fn apply_pipeline(&mut self, mask: u8) -> &wgpu::RenderPipeline {
-        let p = &mut self.p;
-        p.apply_paint.entry(mask).or_insert_with(|| {
-            let targets: Vec<_> =
-                (0..4).map(|c| if mask & (1 << c) != 0 { gpu::target(PAINT_FORMATS[c]) } else { None }).collect();
-            gpu::fullscreen_pipeline(&self.device, "apply paint", &p.apply_module, "fs_paint", &p.apply_layout, &targets)
-        })
+    fn apply_pipeline(&self, mask: u8) -> wgpu::RenderPipeline {
+        let p = &self.p;
+        let mut cache = p.apply_paint.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(mask)
+            .or_insert_with(|| {
+                let targets: Vec<_> =
+                    (0..4).map(|c| if mask & (1 << c) != 0 { gpu::target(PAINT_FORMATS[c]) } else { None }).collect();
+                gpu::fullscreen_pipeline(&self.device, "apply paint", &p.apply_module, "fs_paint", &p.apply_layout, &targets)
+            })
+            .clone()
     }
 
     /// Lays down this frame's stamps and writes the stroke into the target.
@@ -2741,9 +2784,7 @@ impl Engine {
         self.queue.write_buffer(&self.apply_ubuf, 0, bytemuck::bytes_of(&au));
 
         let mask_bits: u8 = channels.iter().map(|&c| 1u8 << c).sum();
-        if target != StrokeTarget::Mask {
-            self.apply_pipeline(mask_bits);
-        }
+        let paint_pipeline = (target != StrokeTarget::Mask).then(|| self.apply_pipeline(mask_bits));
 
         let device = &self.device;
         let snap_view = |c: usize| match target {
@@ -2784,7 +2825,7 @@ impl Engine {
                     for (tex, &c) in textures.iter().zip(&channels) {
                         att[c] = gpu::color_attachment(&tex.view, wgpu::LoadOp::Load);
                     }
-                    (&self.p.apply_paint[&mask_bits], att)
+                    (paint_pipeline.as_ref().expect("made above for paint targets"), att)
                 }
             };
             let mut pass = gpu::pass(encoder, "apply", &attachments);
@@ -3406,6 +3447,23 @@ impl Engine {
         });
         let mut pass = gpu::pass(encoder, "resample", &[gpu::color_attachment(&dst.view, wgpu::LoadOp::Load)]);
         pass.set_pipeline(&self.p.resample[&dst.format]);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Draws `src` over all of `dst`, a view of a texture of format `format`
+    /// (any of the layer, final and mesh-map formats); for copies at another size.
+    pub fn resample_to_view(&self, encoder: &mut wgpu::CommandEncoder, src: &Tex, dst: &wgpu::TextureView, format: F) {
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.p.resample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        let mut pass = gpu::pass(encoder, "resample", &[gpu::color_attachment(dst, wgpu::LoadOp::Load)]);
+        pass.set_pipeline(&self.p.resample[&format]);
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
     }

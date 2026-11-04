@@ -125,7 +125,8 @@ impl PainterApp {
     /// and the mesh they apply to.
     fn bake_key(&self, prepare: bool) -> String {
         let mesh = Arc::as_ptr(&self.mesh) as usize;
-        if prepare { format!("{mesh}|{}", self.bake_settings.prepare_key()) } else { format!("{mesh}|{:?}", self.bake_settings) }
+        let set = self.sets.active;
+        if prepare { format!("{mesh}|{set}|{}", self.bake_settings.prepare_key()) } else { format!("{mesh}|{set}|{:?}", self.bake_settings) }
     }
 
     /// A full bake is starting: it replaces the preview (which stays on
@@ -175,7 +176,7 @@ impl PainterApp {
     }
 
     /// Ends the preview; with `restore`, the full bake it covered comes back.
-    fn end_preview(&mut self, restore: bool) {
+    pub(super) fn end_preview(&mut self, restore: bool) {
         self.bake_preview.run = None;
         self.bake_preview.preparing = None;
         self.bake_preview.shown = None;
@@ -256,11 +257,11 @@ impl PainterApp {
                 ctx.request_repaint();
             }
             _ => {
-                let (mesh, settings) = (self.mesh.clone(), self.bake_settings.clone());
+                let (mesh, settings, set) = (self.mesh.clone(), self.bake_settings.clone(), self.sets.active);
                 let (tx, rx) = mpsc::channel();
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(bake::prepare(&mesh, &settings));
+                    let _ = tx.send(bake::prepare(&mesh, &settings, set));
                     ctx.request_repaint();
                 });
                 self.bake_preview.preparing = Some((pkey, rx));

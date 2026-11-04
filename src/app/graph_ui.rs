@@ -19,7 +19,7 @@ pub(super) struct GraphDoc {
     pub graph: Graph,
     rt: Runtime,
     /// Edited since the last evaluation.
-    dirty: bool,
+    pub(super) dirty: bool,
     /// Its layers need the outputs again (new layer, new texture set).
     push: bool,
     maps_seen: u64,
@@ -440,6 +440,7 @@ impl PainterApp {
                 self.shader_files_changed();
             }
         }
+        self.fill_parked_graphs();
         let maps_version = self.engine.maps_version;
         for i in 0..self.graphs.docs.len() {
             let id = self.graphs.docs[i].id;
@@ -469,6 +470,32 @@ impl PainterApp {
         }
         if self.workspace == super::Workspace::ShaderMaker {
             self.update_shader_preview();
+        }
+    }
+
+    /// Texture sets not being edited keep the graph outputs they had; one
+    /// that has none yet (an opened project) gets them rendered on its own
+    /// mesh maps.
+    fn fill_parked_graphs(&mut self) {
+        let (lib, docs) = (&self.graphs.lib, &mut self.graphs.docs);
+        for p in self.sets.parked.iter_mut().flatten() {
+            let engine = &mut p.engine;
+            for li in 0..engine.layers.len() {
+                let l = &engine.layers[li];
+                let Content::Fill(f) = &l.content else { continue };
+                let Some(id) = f.graph.filter(|_| l.images.iter().all(Option::is_none)) else { continue };
+                let Some(d) = docs.iter_mut().find(|d| d.id == id && !d.shading) else { continue };
+                let version = engine.maps_version;
+                {
+                    let maps = |m: usize| engine.mesh_map(m);
+                    d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, lib, &maps, version);
+                }
+                // The edited set's outputs are made again on its own maps.
+                d.maps_seen = u64::MAX;
+                let outs: [Option<Arc<Tex>>; 5] = d.graph.outputs(lib).map(|o| o.and_then(|n| d.rt.output(n).cloned()));
+                let name = d.graph.name.clone();
+                engine.set_graph_images(li, [outs[0].clone(), outs[1].clone(), outs[2].clone(), outs[3].clone()], &name);
+            }
         }
     }
 
@@ -1000,7 +1027,9 @@ impl PainterApp {
             painter.rect_filled(head, 0.0, theme::WIDGET);
             painter.rect_filled(Rect::from_min_size(head.min, vec2(3.0 * zoom, head.height())), 0.0, color);
             let title = def.map_or_else(|| format!("? {}", n.def), |d| d.name.clone());
-            painter.text(head.left_center() + vec2(7.0 * zoom, 0.0), egui::Align2::LEFT_CENTER, title, font(12.0), Color32::WHITE);
+            let t = theme::elided(&painter, &title, font(12.0), Color32::WHITE, head.width() - 26.0 * zoom);
+            let title_cut = t.elided.then_some(title);
+            painter.galley(head.left_center() + vec2(7.0 * zoom, -t.size().y * 0.5), t, Color32::WHITE);
             if d.graph.exposed.iter().any(|(nid, _)| *nid == id) {
                 painter.text(head.right_center() - vec2(7.0 * zoom, 0.0), egui::Align2::RIGHT_CENTER, "◆", font(10.0), Color32::from_rgb(255, 220, 120));
             }
@@ -1042,8 +1071,14 @@ impl PainterApp {
                     }
                 }
             }
-            if let Some(err) = error {
-                resp.on_hover_text(err.as_str());
+            match (error, title_cut) {
+                (Some(err), _) => {
+                    resp.on_hover_text(err.as_str());
+                }
+                (None, Some(full)) => {
+                    resp.on_hover_text(full);
+                }
+                _ => {}
             }
 
             // Output pin: drag a link out of it.

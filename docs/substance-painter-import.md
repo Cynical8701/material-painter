@@ -7,11 +7,13 @@ what didn't.
 ## What comes across
 
 - **The model**: every mesh in the project, with its UVs and normals.
-- **The texture set's size** (up to 4096²).
-- **The final look** of base color, roughness, metallic and height: Painter's own result as of
-  its last save, as one paint layer, *Painter result (flattened)*. This is the project exactly as
-  it looked in Painter.
-- **The layer stack's structure**, rebuilt in a hidden folder, *Painter layers (rebuilt)*:
+- **Every texture set**, as a texture set of its own (the parts of the model that use its
+  material), with its size (up to 4096²). Switch between them in the Texture Set panel or at the
+  top of the Layers panel.
+- **The final look** of each set's base color, roughness, metallic and height: Painter's own
+  result as of its last save, as one paint layer, *Painter result (flattened)*. This is the
+  project exactly as it looked in Painter.
+- **Each set's layer stack structure**, rebuilt in a hidden folder, *Painter layers (rebuilt)*:
   - folders and layers with their names, visibility and opacity;
   - fills of flat values (color, roughness, metallic, height), exactly;
   - masks: their starting value, Levels, and Painter's dirt, edge wear, curvature, ambient
@@ -35,7 +37,6 @@ To edit the structure instead of the flattened result, show *Painter layers (reb
   emissive, opacity, ambient occlusion and others.
 - **Baked mesh maps**: Material Painter bakes its own from the model when the project opens. If
   Painter baked from a high poly, load the same high poly in the bake window.
-- **More than one texture set**: only the first comes in.
 - **Texture sets larger than 4096²** come in at 4096².
 - A channel Painter never computed before saving isn't stored in the file; open and save the
   project in Painter to refresh it.

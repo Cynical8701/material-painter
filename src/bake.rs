@@ -464,6 +464,9 @@ pub struct PreparedScene {
     low_draws: Option<(Vec<u32>, Vec<(u32, u32, u32)>)>,
     /// Name groups matched between low and high poly.
     pub matched_names: usize,
+    /// The low-poly triangles baked: one texture set's. Rays still see the
+    /// whole mesh.
+    raster: std::ops::Range<u32>,
     /// Low-poly-only bakes: one vertex per low-poly corner in BVH order, with
     /// the triangle's BVH slot + 2 in the tangent w (sign = handedness).
     low_corners: Option<Vec<crate::mesh::Vertex>>,
@@ -476,11 +479,11 @@ pub struct PreparedScene {
     uv_scale: f32,
 }
 
-/// World units per UV unit, averaged over the mesh: the square root of its
-/// surface area over the UV area it covers.
-fn uv_scale(mesh: &Mesh) -> f32 {
+/// World units per UV unit, averaged over triangles `tris` of the mesh: the
+/// square root of their surface area over the UV area they cover.
+fn uv_scale(mesh: &Mesh, tris: std::ops::Range<u32>) -> f32 {
     let (mut area, mut uv_area) = (0.0f64, 0.0f64);
-    for t in mesh.indices.chunks_exact(3) {
+    for t in mesh.indices[tris.start as usize * 3..tris.end as usize * 3].chunks_exact(3) {
         let v = [t[0], t[1], t[2]].map(|i| &mesh.vertices[i as usize]);
         let p = v.map(|v| Vec3::from_array(v.pos));
         let uv = v.map(|v| glam::Vec2::from_array(v.uv));
@@ -894,10 +897,11 @@ fn pack_segments(sets: [Vec<EdgeSeg>; 2]) -> (Vec<[f32; 4]>, Vec<[f32; 4]>, [f32
     (nodes, segs, roots)
 }
 
-/// Low-poly indices sorted by group, plus one `(first index, count, group)`
-/// draw per run: the UV raster draws each group as its own instance.
-fn group_draws(indices: &[u32], group: impl Fn(usize) -> u32) -> (Vec<u32>, Vec<(u32, u32, u32)>) {
-    let mut order: Vec<usize> = (0..indices.len() / 3).collect();
+/// Low-poly indices of triangles `tris` sorted by group, plus one `(first
+/// index, count, group)` draw per run: the UV raster draws each group as its
+/// own instance.
+fn group_draws(indices: &[u32], tris: std::ops::Range<usize>, group: impl Fn(usize) -> u32) -> (Vec<u32>, Vec<(u32, u32, u32)>) {
+    let mut order: Vec<usize> = tris.collect();
     order.sort_by_key(|&t| group(t));
     let mut sorted = Vec::with_capacity(indices.len());
     let mut draws: Vec<(u32, u32, u32)> = Vec::new();
@@ -925,9 +929,12 @@ fn denoise_passes(ao_rays: u32) -> u32 {
     }
 }
 
-pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, String> {
+/// Prepares baking texture set `set` of `low` (its triangles get maps; the
+/// whole mesh occludes).
+pub fn prepare(low: &Mesh, settings: &BakeSettings, set: usize) -> Result<PreparedScene, String> {
     let start = Instant::now();
     let low_tris = low.indices.len() / 3;
+    let raster = low.sets.get(set).map_or(0..low_tris as u32, |s| s.tris.clone());
     let (positions, normals, indices, tri_material, material_count, source, src_objects, tri_color) = match &settings.high_poly {
         Some(path) => {
             let hp = HighPoly::load(path, low.center, low.scale)?;
@@ -940,7 +947,13 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, Str
         None => {
             let positions: Vec<Vec3> = low.vertices.iter().map(|v| Vec3::from_array(v.pos)).collect();
             let normals: Vec<Vec3> = low.vertices.iter().map(|v| Vec3::from_array(v.normal)).collect();
-            (positions, normals, low.indices.clone(), vec![0; low_tris], 1, format!("{} (low poly)", low.name), None, low.tri_color.clone())
+            // The low poly's materials are its texture sets.
+            let mut tri_material = vec![0; low_tris];
+            for (k, s) in low.sets.iter().enumerate() {
+                tri_material[s.tris.start as usize..s.tris.end as usize].fill(k as u32);
+            }
+            let count = low.sets.len().max(1) as u32;
+            (positions, normals, low.indices.clone(), tri_material, count, format!("{} (low poly)", low.name), None, low.tri_color.clone())
         }
     };
 
@@ -966,7 +979,8 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, Str
             if matched_names > 0 {
                 let low_by_object: Vec<u32> =
                     low.objects.iter().map(|n| groups[&base_name(n)]).map(|g| if matched.contains(&g) { g } else { 0 }).collect();
-                low_draws = Some(group_draws(&low.indices, |t| low_by_object[low.tri_object[t] as usize]));
+                let tris = raster.start as usize..raster.end as usize;
+                low_draws = Some(group_draws(&low.indices, tris, |t| low_by_object[low.tri_object[t] as usize]));
             } else {
                 src_group.fill(0);
             }
@@ -1103,6 +1117,9 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, Str
     let low_corners = (settings.high_poly.is_none() && bvh.order.len() < (1 << 24) - 2).then(|| {
         let mut corners = Vec::with_capacity(bvh.order.len() * 3);
         for (slot, &t) in bvh.order.iter().enumerate() {
+            if !raster.contains(&t) {
+                continue;
+            }
             for &i in &low.indices[t as usize * 3..t as usize * 3 + 3] {
                 let mut v = low.vertices[i as usize];
                 v.tangent[3] = (slot as f32 + 2.0).copysign(v.tangent[3]);
@@ -1141,7 +1158,8 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings) -> Result<PreparedScene, Str
         matched_names,
         cage,
         cage_reach,
-        uv_scale: uv_scale(low),
+        uv_scale: uv_scale(low, raster.clone()),
+        raster,
     })
 }
 
@@ -1677,7 +1695,7 @@ impl GpuBaker {
                 }
                 (None, None) => {
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    pass.draw_indexed(scene.raster.start * 3..scene.raster.end * 3, 0, 0..1);
                 }
             }
         }
@@ -1710,7 +1728,8 @@ impl GpuBaker {
                 let mut pass = gpu::pass(&mut encoder, "bake cage", &att);
                 pass.set_pipeline(&self.uv);
                 pass.set_vertex_buffer(0, vertices.slice(..));
-                pass.draw(0..corners.len() as u32, 0..1);
+                // One corner per low-poly index: the set's corners.
+                pass.draw(scene.raster.start * 3..scene.raster.end * 3, 0..1);
             }
             let forward = dilate_group(&set);
             let backward = dilate_group(&tmp);
@@ -2350,7 +2369,7 @@ pub(crate) mod tests {
         settings: &BakeSettings,
         res: u32,
     ) -> (BakedMaps, Arc<BakeReport>, Tex) {
-        let scene = prepare(mesh, settings).expect("bake source");
+        let scene = prepare(mesh, settings, 0).expect("bake source");
         let baker = GpuBaker::new(device);
         let ctx = egui::Context::default();
         let mut run = baker.start(device, queue, gpu_mesh, &scene, settings, res);

@@ -20,6 +20,8 @@ pub struct RawMesh {
     /// Material index per triangle.
     pub tri_material: Vec<u32>,
     pub material_count: u32,
+    /// Material names by index (may be shorter than `material_count`).
+    pub material_names: Vec<String>,
     /// Object (mesh node) index per triangle, into `objects`.
     pub tri_object: Vec<u32>,
     pub objects: Vec<String>,
@@ -46,9 +48,11 @@ pub fn load(path: &Path) -> Result<RawMesh, String> {
 }
 
 fn load_obj(path: &Path) -> Result<RawMesh, String> {
-    let (models, _) = tobj::load_obj(path, &tobj::LoadOptions { single_index: true, triangulate: true, ..Default::default() })
+    let (models, materials) = tobj::load_obj(path, &tobj::LoadOptions { single_index: true, triangulate: true, ..Default::default() })
         .map_err(|e| format!("Failed to read OBJ: {e}"))?;
     let mut out = Builder::default();
+    // A missing .mtl leaves the indices (and default names).
+    out.material_names = materials.map(|m| m.into_iter().map(|m| m.name).collect()).unwrap_or_default();
     for m in &models {
         let mesh = &m.mesh;
         let count = mesh.positions.len() / 3;
@@ -94,6 +98,7 @@ fn load_fbx(path: &Path) -> Result<RawMesh, String> {
 
     let mut out = Builder::default();
     let material_count = scene.materials.len().max(1) as u32;
+    out.material_names = scene.materials.iter().map(|m| m.element.name.to_string()).collect();
     let mut tri = Vec::new();
     for node in &scene.nodes {
         let Some(mesh) = node.mesh.as_ref() else { continue };
@@ -161,6 +166,7 @@ struct Builder {
     weld: HashMap<[u32; 9], u32>,
     missing_uvs: Vec<String>,
     max_material: u32,
+    material_names: Vec<String>,
     objects: Vec<String>,
     tri_object: Vec<u32>,
     all_colors: bool,
@@ -225,6 +231,7 @@ impl Builder {
             indices: self.indices,
             tri_material: self.tri_material,
             material_count: self.max_material + 1,
+            material_names: self.material_names,
             missing_uvs: self.missing_uvs,
             tri_object: self.tri_object,
             objects: self.objects,

@@ -3,16 +3,17 @@
 //! The file is read with the reader adapted from SubCraft (`crate::spp`, MIT licensed, credited
 //! there). What comes across:
 //! * the model, every mesh of it, with its UVs and normals;
-//! * the texture set's size and the final look of its base color, roughness, metallic and
-//!   height channels: Painter's flattened result as of its last save, as one paint layer;
-//! * the layer stack's structure, rebuilt as far as Material Painter has equivalents (see
+//! * every texture set (the meshes of one material), with its size and the final look of its
+//!   base color, roughness, metallic and height channels: Painter's flattened result as of its
+//!   last save, as one paint layer;
+//! * each set's layer stack structure, rebuilt as far as Material Painter has equivalents (see
 //!   `app::spp_open`), next to that flattened layer.
 //!
 //! What does not, and is listed in the import report: procedural (Substance `.sbsar`)
 //! materials, filters and generators (Material Painter has no Substance engine, and never
 //! reads the contents of those archives: they are Adobe's), brush strokes, Painter's other
-//! channels (normal details, emissive, opacity, ambient occlusion), its baked mesh maps (Material
-//! Painter bakes its own) and any texture set past the first.
+//! channels (normal details, emissive, opacity, ambient occlusion) and its baked mesh maps
+//! (Material Painter bakes its own).
 
 use crate::mesh::Mesh;
 use crate::spp::{CacheFormat, LayerInfo, SppFile, channel_bits};
@@ -26,15 +27,21 @@ pub const MAX_RESOLUTION: u32 = 4096;
 /// `engine::PAINT_FORMATS[channel]` layout.
 pub type ChannelData = (u32, Vec<u8>);
 
-/// What an import made of a project.
-pub struct Imported {
-    pub mesh: Mesh,
-    pub set_name: String,
+/// One texture set of an imported project.
+pub struct ImportedSet {
     pub resolution: u32,
     /// Base color, roughness, metallic, height (Material Painter's channel order).
     pub channels: [Option<ChannelData>; 4],
     /// The texture set's layer stack, bottom to top, for rebuilding.
     pub layers: Vec<LayerInfo>,
+}
+
+/// What an import made of a project.
+pub struct Imported {
+    /// Split into texture sets, one per Painter texture set.
+    pub mesh: Mesh,
+    /// One per `mesh.sets`, in that order.
+    pub sets: Vec<ImportedSet>,
     /// What came across, for the report.
     pub came: Vec<String>,
     /// What didn't, and why.
@@ -63,19 +70,19 @@ pub fn import(path: &Path) -> Result<Imported, String> {
     let err = |e: crate::spp::SppError| format!("Can't read {}: {e}", path.display());
     let mut file = SppFile::open(path).map_err(err)?;
     let project = file.project().map_err(err)?;
-    let Some(set) = project.texture_sets.first().cloned() else {
+    if project.texture_sets.is_empty() {
         return Err("The project has no texture set.".into());
-    };
+    }
     let mut came = Vec::new();
     let mut left = Vec::new();
 
-    // The model: every mesh, as one.
-    let meshes = file.meshes().map_err(err)?;
+    // The model: every mesh, as one, split into texture sets by material.
+    let (meshes, materials) = file.meshes_and_materials().map_err(err)?;
     if meshes.is_empty() {
         return Err("The project has no model.".into());
     }
     let (mut positions, mut normals, mut uvs, mut indices) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut objects, mut tri_object) = (Vec::new(), Vec::new());
+    let (mut objects, mut tri_object, mut tri_material) = (Vec::new(), Vec::new(), Vec::new());
     for (k, m) in meshes.iter().enumerate() {
         let base = positions.len() as u32;
         positions.extend(&m.positions);
@@ -86,6 +93,7 @@ pub fn import(path: &Path) -> Result<Imported, String> {
         for t in &m.triangles {
             indices.extend(t.iter().map(|i| i + base));
             tri_object.push(k as u32);
+            tri_material.push(m.material);
         }
         objects.push(m.name.clone());
     }
@@ -96,77 +104,100 @@ pub fn import(path: &Path) -> Result<Imported, String> {
         mesh.tri_object = tri_object;
         mesh.objects = objects;
     }
-    came.push(format!("The model: {} mesh{} ({tris} triangles), with its UVs and normals.", meshes.len(), if meshes.len() == 1 { "" } else { "es" }));
-
-    let size = 1u32 << set.width_log2.clamp(7, 13);
-    let resolution = size.min(MAX_RESOLUTION);
+    // Without material names (an unusual dump), materials pair with texture sets in order.
+    let names: Vec<String> = if materials.is_empty() { project.texture_sets.iter().map(|s| s.name.clone()).collect() } else { materials };
+    mesh.split_by_material(&tri_material, &names);
     came.push(format!(
-        "Texture set \"{}\" at {resolution}²{}.",
-        set.name,
-        if size > MAX_RESOLUTION { format!(" (Painter's {size}² is past Material Painter's largest)") } else { String::new() }
+        "The model: {} mesh{} ({tris} triangles), with its UVs and normals, in {} texture set{}.",
+        meshes.len(),
+        if meshes.len() == 1 { "" } else { "es" },
+        mesh.sets.len(),
+        if mesh.sets.len() == 1 { "" } else { "s" }
     ));
-    if project.texture_sets.len() > 1 {
-        let others: Vec<&str> = project.texture_sets[1..].iter().map(|s| s.name.as_str()).collect();
-        left.push(format!(
-            "Texture sets after the first ({}): Material Painter works on one texture set; open each part's mesh separately to paint it.",
-            others.join(", ")
-        ));
-    }
 
-    // The flattened channels.
-    let mut channels: [Option<ChannelData>; 4] = Default::default();
-    let mut got = Vec::new();
-    for (k, (bits, label)) in CHANNELS.iter().enumerate() {
-        match file.channel_texture(&set, *bits, MAX_RESOLUTION) {
-            Ok(Some(img)) => {
-                let p = &img.plane;
-                if p.width != p.height {
-                    left.push(format!("{label}: not square ({}x{}), skipped.", p.width, p.height));
-                    continue;
-                }
-                let data = match (k, img.format) {
-                    (0, CacheFormat::Srgb8Alpha8) => to_u8(&p.data),
-                    (1 | 2, CacheFormat::Rg8) => to_u8(&p.data),
-                    (3, CacheFormat::Rg16f) => p.data.iter().flat_map(|v| crate::gpu::f32_to_f16(*v).to_le_bytes()).collect(),
-                    (_, f) => {
-                        left.push(format!("{label}: stored as {f:?}, which this import doesn't read."));
-                        continue;
-                    }
-                };
-                channels[k] = Some((p.width, data));
-                got.push(*label);
-            }
-            Ok(None) => {
-                // Painter only stores channels it has computed.
-                if set.channels.iter().any(|c| c.bits == *bits) {
-                    left.push(format!("{label}: Painter hadn't stored its result (open and save the project in Painter to refresh it)."));
-                }
-            }
-            Err(e) => left.push(format!("{label}: couldn't be read ({e}).")),
-        }
-    }
-    if got.is_empty() {
-        left.push("No painted result was stored in the project: the model comes in unpainted.".into());
-    } else {
-        came.push(format!("The final look of {}: Painter's result as of its last save, as one paint layer.", got.join(", ").to_lowercase()));
-    }
-    let other: Vec<String> = set.channels.iter().filter(|c| !CHANNELS.iter().any(|(b, _)| *b == c.bits)).map(|c| channel_name(c.bits)).collect();
-    if !other.is_empty() {
-        left.push(format!("Painter channels Material Painter doesn't have: {}.", other.join(", ")));
-    }
-    left.push("Painter's baked mesh maps: Material Painter bakes its own from the model. If Painter baked from a high poly, load it in the bake window.".into());
-
-    // What the layer stack holds, for the report.
+    let mut sets = Vec::with_capacity(mesh.sets.len());
     let mut procedural = 0;
     let mut strokes = 0;
-    crate::spp::document::walk_layers(
-        &set.layers,
-        &mut |l, _| {
-            procedural += l.sources.iter().filter(|s| matches!(s, crate::spp::SourceInfo::Procedural { .. })).count();
-            strokes += l.strokes;
-        },
-        0,
-    );
+    let mut other_channels: Vec<String> = Vec::new();
+    for ms in &mesh.sets {
+        let Some(set) = project.texture_sets.iter().find(|s| s.name == ms.name).or(if mesh.sets.len() == 1 { project.texture_sets.first() } else { None }) else {
+            left.push(format!("Texture set \"{}\": Painter's project has no set of that name; it comes in unpainted.", ms.name));
+            sets.push(ImportedSet { resolution: 2048, channels: Default::default(), layers: Vec::new() });
+            continue;
+        };
+        let size = 1u32 << set.width_log2.clamp(7, 13);
+        let resolution = size.min(MAX_RESOLUTION);
+
+        // The flattened channels.
+        let mut channels: [Option<ChannelData>; 4] = Default::default();
+        let mut got = Vec::new();
+        for (k, (bits, label)) in CHANNELS.iter().enumerate() {
+            match file.channel_texture(set, *bits, MAX_RESOLUTION) {
+                Ok(Some(img)) => {
+                    let p = &img.plane;
+                    if p.width != p.height {
+                        left.push(format!("{}: {label} not square ({}x{}), skipped.", set.name, p.width, p.height));
+                        continue;
+                    }
+                    let data = match (k, img.format) {
+                        (0, CacheFormat::Srgb8Alpha8) => to_u8(&p.data),
+                        (1 | 2, CacheFormat::Rg8) => to_u8(&p.data),
+                        (3, CacheFormat::Rg16f) => p.data.iter().flat_map(|v| crate::gpu::f32_to_f16(*v).to_le_bytes()).collect(),
+                        (_, f) => {
+                            left.push(format!("{}: {label} stored as {f:?}, which this import doesn't read.", set.name));
+                            continue;
+                        }
+                    };
+                    channels[k] = Some((p.width, data));
+                    got.push(*label);
+                }
+                Ok(None) => {
+                    // Painter only stores channels it has computed.
+                    if set.channels.iter().any(|c| c.bits == *bits) {
+                        left.push(format!(
+                            "{}: {label} wasn't stored by Painter (open and save the project in Painter to refresh it).",
+                            set.name
+                        ));
+                    }
+                }
+                Err(e) => left.push(format!("{}: {label} couldn't be read ({e}).", set.name)),
+            }
+        }
+        came.push(format!(
+            "Texture set \"{}\" at {resolution}²{}{}.",
+            set.name,
+            if size > MAX_RESOLUTION { format!(" (Painter's {size}² is past Material Painter's largest)") } else { String::new() },
+            if got.is_empty() {
+                ", unpainted (no stored result)".to_string()
+            } else {
+                format!(", with the final look of {} as one paint layer", got.join(", ").to_lowercase())
+            }
+        ));
+        for c in set.channels.iter().filter(|c| !CHANNELS.iter().any(|(b, _)| *b == c.bits)) {
+            let n = channel_name(c.bits);
+            if !other_channels.contains(&n) {
+                other_channels.push(n);
+            }
+        }
+        crate::spp::document::walk_layers(
+            &set.layers,
+            &mut |l, _| {
+                procedural += l.sources.iter().filter(|s| matches!(s, crate::spp::SourceInfo::Procedural { .. })).count();
+                strokes += l.strokes;
+            },
+            0,
+        );
+        sets.push(ImportedSet { resolution, channels, layers: set.layers.clone() });
+    }
+    let unused: Vec<&str> =
+        project.texture_sets.iter().filter(|s| !mesh.sets.iter().any(|m| m.name == s.name)).map(|s| s.name.as_str()).collect();
+    if !unused.is_empty() && mesh.sets.len() > 1 {
+        left.push(format!("Texture sets with no part of the model: {}.", unused.join(", ")));
+    }
+    if !other_channels.is_empty() {
+        left.push(format!("Painter channels Material Painter doesn't have: {}.", other_channels.join(", ")));
+    }
+    left.push("Painter's baked mesh maps: Material Painter bakes its own from the model. If Painter baked from a high poly, load it in the bake window.".into());
     if procedural > 0 {
         left.push(format!(
             "{procedural} procedural source{} (Substance materials, generators): Material Painter can't run them; their result is in the flattened layer.",
@@ -177,7 +208,7 @@ pub fn import(path: &Path) -> Result<Imported, String> {
         left.push(format!("{strokes} brush stroke{}: kept in the flattened layer, not as editable strokes.", if strokes == 1 { "" } else { "s" }));
     }
 
-    Ok(Imported { mesh, set_name: set.name.clone(), resolution, channels, layers: set.layers.clone(), came, left })
+    Ok(Imported { mesh, sets, came, left })
 }
 
 fn to_u8(v: &[f32]) -> Vec<u8> {
@@ -188,6 +219,51 @@ fn to_u8(v: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Opt-in check of a real project: `MP_SPP_TEST=a.spp cargo test spp_from_env -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn spp_from_env() {
+        let Ok(path) = std::env::var("MP_SPP_TEST") else { return };
+        let imported = import(Path::new(&path)).expect("imports");
+        for (set, data) in imported.mesh.sets.iter().zip(&imported.sets) {
+            let got: Vec<bool> = data.channels.iter().map(Option::is_some).collect();
+            let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+            for &i in &imported.mesh.indices[set.index_range().start as usize..set.index_range().end as usize] {
+                let uv = imported.mesh.vertices[i as usize].uv;
+                lo = lo.min(Vec2::from(uv));
+                hi = hi.max(Vec2::from(uv));
+            }
+            println!("{} {:?}: {}², channels {got:?}, {} layers, uv {lo} .. {hi}", set.name, set.tris, data.resolution, data.layers.len());
+        }
+        assert_eq!(imported.mesh.sets.len(), imported.sets.len());
+        // Each set's base color with its UV wireframe drawn on, to check they line up.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/spp");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (set, data) in imported.mesh.sets.iter().zip(&imported.sets) {
+            let Some((w, px)) = &data.channels[0] else { continue };
+            let mut img = image::RgbaImage::from_raw(*w, *w, px.clone()).unwrap();
+            let r = set.index_range();
+            for t in imported.mesh.indices[r.start as usize..r.end as usize].chunks_exact(3) {
+                for e in 0..3 {
+                    let a = Vec2::from(imported.mesh.vertices[t[e] as usize].uv) * *w as f32;
+                    let b = Vec2::from(imported.mesh.vertices[t[(e + 1) % 3] as usize].uv) * *w as f32;
+                    let n = (a.distance(b).ceil() as usize).max(1);
+                    for s in 0..=n {
+                        let p = a.lerp(b, s as f32 / n as f32);
+                        if p.x >= 0.0 && p.y >= 0.0 && (p.x as u32) < *w && (p.y as u32) < *w {
+                            img.put_pixel(p.x as u32, p.y as u32, image::Rgba([0, 255, 0, 255]));
+                        }
+                    }
+                }
+            }
+            let small = image::imageops::resize(&img, 1024.min(*w), 1024.min(*w), image::imageops::FilterType::Triangle);
+            small.save(dir.join(format!("uvcheck_{}.png", set.name))).unwrap();
+        }
+        for l in imported.came.iter().chain(&imported.left) {
+            println!("  {l}");
+        }
+    }
+
     /// SubCraft's synthetic project (no real Painter file): the model, the stack's layers and
     /// a report that says what was left out.
     #[test]
@@ -197,10 +273,11 @@ mod tests {
         let imported = import(&path).expect("imports");
         let _ = std::fs::remove_file(&path);
         assert_eq!(imported.mesh.indices.len() / 3, 2, "the quad");
-        assert_eq!(imported.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Rust", "Dirt"]);
+        assert_eq!(imported.sets.len(), 1);
+        assert_eq!(imported.sets[0].layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Rust", "Dirt"]);
         assert!(imported.came.iter().any(|l| l.starts_with("The model")));
         // Its one cached channel (roughness) is 4x2: not square, reported and skipped.
-        assert!(imported.channels.iter().all(Option::is_none));
+        assert!(imported.sets[0].channels.iter().all(Option::is_none));
         assert!(imported.left.iter().any(|l| l.contains("not square")), "{:?}", imported.left);
         assert!(imported.left.iter().any(|l| l.contains("baked mesh maps")));
     }

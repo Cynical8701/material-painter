@@ -552,7 +552,8 @@ impl PainterApp {
                     self.engine.composite();
                 }
                 let views = self.mcp_views.get_or_insert_with(|| ViewRenderer::new(&self.rs));
-                views.render_3d(&self.rs, [w, h], &self.engine, &self.env, &self.gpu_mesh, &cam, &self.view, Some(&self.overlays));
+                let engines = super::texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+                views.render_3d(&self.rs, [w, h], &engines, &self.env, &self.gpu_mesh, &cam, &self.view, Some(&self.overlays));
                 if !self.engine.begin_stroke(i, target, mat.enabled, erase) {
                     return Err("nothing to paint: check the channels (or, erasing, that the layer has paint)".into());
                 }
@@ -803,7 +804,8 @@ impl PainterApp {
                 }
                 // A separate renderer, so the app's own viewport keeps its size.
                 let views = self.mcp_views.get_or_insert_with(|| ViewRenderer::new(&self.rs));
-                views.render_3d(&self.rs, [w, h], &self.engine, &self.env, &self.gpu_mesh, &cam, &settings, Some(&self.overlays));
+                let engines = super::texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+                views.render_3d(&self.rs, [w, h], &engines, &self.env, &self.gpu_mesh, &cam, &settings, Some(&self.overlays));
                 let img = views.view3d.image();
                 let rgba = crate::gpu::read_texture(&self.rs.device, &self.rs.queue, img);
                 Reply::Now(png(&rgba, img.width, img.height).map(|p| vec![Out::Png(p)]))

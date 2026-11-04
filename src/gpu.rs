@@ -258,6 +258,8 @@ pub struct GpuMesh {
     pub edge_count: u32,
     pub seams: wgpu::Buffer,
     pub seam_count: u32,
+    /// The texture sets' ranges (see [`crate::mesh::MeshSet`]).
+    pub sets: Vec<crate::mesh::MeshSet>,
 }
 
 impl GpuMesh {
@@ -293,6 +295,7 @@ impl GpuMesh {
             edge_count: mesh.uv_edges.len() as u32,
             seams,
             seam_count: mesh.seam_edges.len() as u32,
+            sets: mesh.sets.clone(),
         }
     }
 }

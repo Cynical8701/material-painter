@@ -438,7 +438,9 @@ pub struct ViewRenderer {
     shadow_map: Tex,
     shadow_sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
-    globals: [wgpu::Buffer; 2],
+    /// Per-draw uniforms: the 2D view's, then one per texture set in the 3D
+    /// view (each set has its own resolution, bake and custom maps).
+    globals: Vec<wgpu::Buffer>,
     sampler: wgpu::Sampler,
     pub view3d: ViewTarget,
     pub view2d: ViewTarget,
@@ -618,14 +620,7 @@ impl ViewRenderer {
             ..Default::default()
         });
 
-        let globals = [0, 1].map(|_| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("view globals"),
-                size: size_of::<Globals>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
+        let globals = vec![Self::globals_buffer(&device), Self::globals_buffer(&device)];
         let custom_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("preview shader params"),
             size: (CUSTOM_PARAMS * 16) as u64,
@@ -720,6 +715,15 @@ impl ViewRenderer {
         self.custom_mesh.is_some()
     }
 
+    fn globals_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view globals"),
+            size: size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
     fn bind_group(&self, device: &wgpu::Device, engine: &Engine, env: &Environment, globals: &wgpu::Buffer) -> wgpu::BindGroup {
         fn v(view: &wgpu::TextureView) -> wgpu::BindingResource<'_> {
             wgpu::BindingResource::TextureView(view)
@@ -803,11 +807,12 @@ impl ViewRenderer {
         proj * view
     }
 
+    /// Draws the mesh: texture set `k` of `mesh.sets` with `engines[k]`.
     pub fn render_3d(
         &mut self,
         rs: &egui_wgpu::RenderState,
         size: [u32; 2],
-        engine: &Engine,
+        engines: &[&Engine],
         env: &Environment,
         mesh: &GpuMesh,
         cam: &OrbitCam,
@@ -817,12 +822,22 @@ impl ViewRenderer {
         self.view3d.ensure_size(rs, size);
         let size = self.view3d.size;
         let vp = cam.view_proj(size[0] as f32 / size[1] as f32);
-        let mut g = Self::base_globals(engine, settings, size);
-        g.view_proj = vp.to_cols_array_2d();
-        g.inv_view_proj = vp.inverse().to_cols_array_2d();
-        g.cam_pos = cam.eye().extend(1.0).to_array();
-        rs.queue.write_buffer(&self.globals[0], 0, bytemuck::bytes_of(&g));
-        let bg = self.bind_group(&rs.device, engine, env, &self.globals[0]);
+        while self.globals.len() < engines.len() + 1 {
+            self.globals.push(Self::globals_buffer(&rs.device));
+        }
+        let bgs: Vec<wgpu::BindGroup> = engines
+            .iter()
+            .enumerate()
+            .map(|(k, engine)| {
+                let mut g = Self::base_globals(engine, settings, size);
+                g.view_proj = vp.to_cols_array_2d();
+                g.inv_view_proj = vp.inverse().to_cols_array_2d();
+                g.cam_pos = cam.eye().extend(1.0).to_array();
+                rs.queue.write_buffer(&self.globals[k + 1], 0, bytemuck::bytes_of(&g));
+                self.bind_group(&rs.device, engine, env, &self.globals[k + 1])
+            })
+            .collect();
+        let bg = &bgs[0];
         let transparent = settings.background == Background::Transparent;
 
         let t = &self.view3d;
@@ -831,7 +846,7 @@ impl ViewRenderer {
             let shadow_bg = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("key shadow"),
                 layout: &self.shadow_bgl,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.globals[0].as_entire_binding() }],
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.globals[1].as_entire_binding() }],
             });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("key shadow"),
@@ -872,7 +887,7 @@ impl ViewRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             if !transparent {
                 pass.set_pipeline(&self.sky);
                 pass.draw(0..3, 0..1);
@@ -880,7 +895,11 @@ impl ViewRenderer {
             pass.set_pipeline(self.custom_mesh.as_ref().filter(|_| settings.mode == ViewMode::Material).unwrap_or(&self.mesh));
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            for (set, bg) in mesh.sets.iter().zip(&bgs) {
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw_indexed(set.index_range(), 0, 0..1);
+            }
+            pass.set_bind_group(0, bg, &[]);
             if settings.show_wire_3d {
                 pass.set_pipeline(&self.wire3d);
                 pass.set_index_buffer(mesh.edges.slice(..), wgpu::IndexFormat::Uint32);
@@ -913,6 +932,7 @@ impl ViewRenderer {
         rs.queue.submit([encoder.finish()]);
     }
 
+    /// Draws texture set `set` of the mesh, painted by `engine`, flat.
     pub fn render_2d(
         &mut self,
         rs: &egui_wgpu::RenderState,
@@ -920,6 +940,7 @@ impl ViewRenderer {
         engine: &Engine,
         env: &Environment,
         mesh: &GpuMesh,
+        set: usize,
         cam: &Cam2d,
         settings: &ViewSettings,
     ) {
@@ -928,8 +949,9 @@ impl ViewRenderer {
         let mut g = Self::base_globals(engine, settings, size);
         g.view2d = [cam.zoom, cam.pan.x, cam.pan.y, 0.0];
         g.extra[3] = settings.uv_wire_opacity;
-        rs.queue.write_buffer(&self.globals[1], 0, bytemuck::bytes_of(&g));
-        let bg = self.bind_group(&rs.device, engine, env, &self.globals[1]);
+        rs.queue.write_buffer(&self.globals[0], 0, bytemuck::bytes_of(&g));
+        let bg = self.bind_group(&rs.device, engine, env, &self.globals[0]);
+        let (edges, seams) = mesh.sets.get(set).map_or((0..mesh.edge_count, 0..mesh.seam_count), |s| (s.edges.clone(), s.seams.clone()));
 
         let mut encoder = rs.device.create_command_encoder(&Default::default());
         {
@@ -946,12 +968,12 @@ impl ViewRenderer {
             if settings.show_wire {
                 pass.set_pipeline(&self.wire);
                 pass.set_index_buffer(mesh.edges.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.edge_count, 0, 0..1);
+                pass.draw_indexed(edges, 0, 0..1);
             }
-            if settings.show_seams_2d && mesh.seam_count > 0 {
+            if settings.show_seams_2d && !seams.is_empty() {
                 pass.set_pipeline(&self.seam2d);
                 pass.set_index_buffer(mesh.seams.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.seam_count, 0, 0..1);
+                pass.draw_indexed(seams, 0, 0..1);
             }
         }
         rs.queue.submit([encoder.finish()]);

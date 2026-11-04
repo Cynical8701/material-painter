@@ -215,7 +215,8 @@ impl PainterApp {
             self.engine.composite();
         }
         let views = self.mcp_views.get_or_insert_with(|| crate::viewport::ViewRenderer::new(&self.rs));
-        views.render_3d(&self.rs, [SIZE, SIZE], &self.engine, &self.env, &self.gpu_mesh, &self.cam, &self.view, None);
+        let engines = super::texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+        views.render_3d(&self.rs, [SIZE, SIZE], &engines, &self.env, &self.gpu_mesh, &self.cam, &self.view, None);
         let img = views.view3d.image();
         let rgba = crate::gpu::read_texture(&self.rs.device, &self.rs.queue, img);
         let buf = image::RgbaImage::from_raw(img.width, img.height, rgba)?;

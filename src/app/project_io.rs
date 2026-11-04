@@ -10,7 +10,7 @@
 
 use super::PainterApp;
 use crate::bake::{IdSource, Quality};
-use crate::engine::{Blend, Content, FillParams, Folder, GenKind, Generator, Layer, Levels, Mask, MatValues, Projection};
+use crate::engine::{Blend, Content, Engine, FillParams, Folder, GenKind, Generator, Layer, Levels, Mask, MatValues, Projection};
 use crate::environment::EnvSource;
 use crate::gpu::Tex;
 use crate::mesh::{Mesh, Vertex};
@@ -362,6 +362,59 @@ impl PainterApp {
         Ok(self.engine.texture_from_bytes(label, format, w, h, &bytes))
     }
 
+    /// One texture set's part of a project.
+    fn set_json(&self, w: &mut Writer, engine: &Engine) -> Value {
+        let mut layers = Vec::new();
+        for l in &engine.layers {
+            let content = match &l.content {
+                Content::Paint(ch) => {
+                    let channels: Vec<Value> = ch.iter().map(|t| t.as_ref().map_or(Value::Null, |t| self.tex_json(w, t))).collect();
+                    json!({"kind": "paint", "channels": channels})
+                }
+                Content::Fill(p) => json!({"kind": "fill", "fill": fill_json(p)}),
+                Content::Folder(fo) => json!({"kind": "folder", "open": fo.open}),
+            };
+            let mask = l.mask.as_ref().map(|m| {
+                json!({
+                    "paint": m.paint.as_ref().map(|t| self.tex_json(w, t)),
+                    "generator": m.generator.as_ref().map(generator_json),
+                    "graph": m.graph,
+                    "filters": mask_filters_json(&m.filters),
+                    "layers": mask_layers_json(&m.layers),
+                })
+            });
+            // A graph's outputs are rendered again on load, not stored.
+            let from_graph = matches!(&l.content, Content::Fill(p) if p.graph.is_some());
+            let images: Vec<Value> = l
+                .images
+                .iter()
+                .map(|im| im.as_ref().filter(|_| !from_graph))
+                .map(|im| im.map_or(Value::Null, |im| json!({"name": im.name, "data": w.blob(&im.encoded)})))
+                .collect();
+            layers.push(json!({
+                "images": images,
+                "id": l.id,
+                "name": l.name,
+                "visible": l.visible,
+                "opacity": l.opacity,
+                "blend": l.blend.name(),
+                "parent": l.parent,
+                "content": content,
+                "mask": mask,
+            }));
+        }
+        let fixes: Vec<Value> = (0..engine.map_fix.len())
+            .filter_map(|i| Some(json!({"map": i, "texture": self.tex_json(w, engine.map_fix[i].as_ref()?)})))
+            .collect();
+        let levels: Vec<Value> = engine.map_levels.iter().map(|l| json!([l.black, l.white, l.gamma])).collect();
+        json!({
+            "resolution": engine.res,
+            "layers_bottom_to_top": layers,
+            "map_fixes": fixes,
+            "map_levels": levels,
+        })
+    }
+
     pub(super) fn save_project(&mut self, path: &Path) -> Result<(), String> {
         let bytes = self.write_project(path)?;
         self.project_path = Some(path.to_path_buf());
@@ -403,49 +456,26 @@ impl PainterApp {
             "tri_object": w.blob(bytemuck::cast_slice(&mesh.tri_object)),
             "tri_color": mesh.tri_color.as_ref().map(|c| w.blob(bytemuck::cast_slice(c))),
         });
-        let mut layers = Vec::new();
-        for l in &self.engine.layers {
-            let content = match &l.content {
-                Content::Paint(ch) => {
-                    let channels: Vec<Value> = ch.iter().map(|t| t.as_ref().map_or(Value::Null, |t| self.tex_json(&mut w, t))).collect();
-                    json!({"kind": "paint", "channels": channels})
-                }
-                Content::Fill(p) => json!({"kind": "fill", "fill": fill_json(p)}),
-                Content::Folder(fo) => json!({"kind": "folder", "open": fo.open}),
-            };
-            let mask = l.mask.as_ref().map(|m| {
-                json!({
-                    "paint": m.paint.as_ref().map(|t| self.tex_json(&mut w, t)),
-                    "generator": m.generator.as_ref().map(generator_json),
-                    "graph": m.graph,
-                    "filters": mask_filters_json(&m.filters),
-                    "layers": mask_layers_json(&m.layers),
-                })
-            });
-            // A graph's outputs are rendered again on load, not stored.
-            let from_graph = matches!(&l.content, Content::Fill(p) if p.graph.is_some());
-            let images: Vec<Value> = l
-                .images
-                .iter()
-                .map(|im| im.as_ref().filter(|_| !from_graph))
-                .map(|im| im.map_or(Value::Null, |im| json!({"name": im.name, "data": w.blob(&im.encoded)})))
-                .collect();
-            layers.push(json!({
-                "images": images,
-                "id": l.id,
-                "name": l.name,
-                "visible": l.visible,
-                "opacity": l.opacity,
-                "blend": l.blend.name(),
-                "parent": l.parent,
-                "content": content,
-                "mask": mask,
-            }));
-        }
-        let fixes: Vec<Value> = (0..self.engine.map_fix.len())
-            .filter_map(|i| Some(json!({"map": i, "texture": self.tex_json(&mut w, self.engine.map_fix[i].as_ref()?)})))
+        // Every texture set: its layers, size and mesh-map corrections.
+        let engines = super::texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
+        let sets: Vec<Value> = self
+            .mesh
+            .sets
+            .iter()
+            .zip(&engines)
+            .enumerate()
+            .map(|(k, (set, engine))| {
+                let selected = match self.sets.parked.get(k).and_then(Option::as_ref) {
+                    Some(p) => p.selected,
+                    None => self.selected,
+                };
+                let mut v = self.set_json(&mut w, engine);
+                v["name"] = json!(set.name);
+                v["tris"] = json!([set.tris.start, set.tris.end]);
+                v["selected"] = json!(selected);
+                v
+            })
             .collect();
-        let levels: Vec<Value> = self.engine.map_levels.iter().map(|l| json!([l.black, l.white, l.gamma])).collect();
         let bs = &self.bake_settings;
         let bake = json!({
             "quality": format!("{:?}", bs.quality),
@@ -487,14 +517,12 @@ impl PainterApp {
         let manifest = json!({
             "app": "Material Painter",
             // 2: map levels gamma brightens above 1 (version 1 darkened).
-            "version": 2,
-            "resolution": self.engine.res,
+            // 3: texture sets (layers, size and map fixes per set).
+            "version": 3,
             "mesh": mesh_json,
-            "layers_bottom_to_top": layers,
+            "texture_sets": sets,
+            "active_set": self.sets.active,
             "graphs": self.graphs.to_json(&self.used_graphs()),
-            "selected": self.selected,
-            "map_fixes": fixes,
-            "map_levels": levels,
             "bake": bake,
             "view": view,
         });
@@ -574,8 +602,6 @@ impl PainterApp {
                 mesh.tri_color = Some(colors);
             }
         }
-        let res = manifest["resolution"].as_u64().unwrap_or(2048) as u32;
-
         let bv = &manifest["bake"];
         let mut bs = crate::bake::BakeSettings::default();
         if let Some(q) = s(bv, "quality") {
@@ -615,72 +641,27 @@ impl PainterApp {
             _ => IdSource::MeshParts,
         };
 
-        // Switch mesh and resolution first: layers are created at the new size.
+        // Texture sets: projects before version 3 have one, at the top level.
+        let set_values: Vec<&Value> = match manifest["texture_sets"].as_array() {
+            Some(a) if !a.is_empty() => a.iter().collect(),
+            _ => vec![&manifest],
+        };
+        let ranges: Vec<(String, std::ops::Range<u32>)> = set_values
+            .iter()
+            .filter_map(|sv| {
+                let t = sv["tris"].as_array()?;
+                let (a, b) = (t.first()?.as_u64()? as u32, t.get(1)?.as_u64()? as u32);
+                Some((s(sv, "name").unwrap_or("Material").to_string(), a..b))
+            })
+            .collect();
+        if ranges.len() == set_values.len() {
+            mesh.set_ranges(ranges);
+        }
+        let set_count = mesh.sets.len();
+
+        // Switch mesh first, then each set's size: layers are created at it.
         self.bake_settings = bs;
-        while !self.engine.layers.is_empty() {
-            self.engine.delete_layer(0, &mut self.undo);
-        }
         self.load_mesh(mesh, ctx);
-        if res != self.engine.res {
-            self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo);
-        }
-        let mut layers = Vec::new();
-        for lv in manifest["layers_bottom_to_top"].as_array().ok_or_else(bad)? {
-            let name = s(lv, "name").unwrap_or("Layer").to_string();
-            let c = &lv["content"];
-            let content = match s(c, "kind") {
-                Some("paint") => {
-                    let ch = c["channels"].as_array().ok_or_else(bad)?;
-                    let mut out: [Option<Tex>; 4] = [None, None, None, None];
-                    for (k, t) in ch.iter().enumerate().take(4) {
-                        if !t.is_null() {
-                            out[k] = Some(self.tex_from(&r, t, "layer")?);
-                        }
-                    }
-                    Content::Paint(out)
-                }
-                Some("fill") => Content::Fill(fill_from(&c["fill"])),
-                Some("folder") => Content::Folder(Folder { open: b(c, "open", true) }),
-                _ => return Err(bad()),
-            };
-            let mask = match lv.get("mask").filter(|m| !m.is_null()) {
-                Some(mv) => Some(Mask {
-                    paint: match mv.get("paint").filter(|p| !p.is_null()) {
-                        Some(t) => Some(self.tex_from(&r, t, "mask")?),
-                        None => None,
-                    },
-                    generator: match mv.get("generator").filter(|g| !g.is_null()) {
-                        Some(g) => Some(generator_from(g)?),
-                        None => None,
-                    },
-                    graph: mv["graph"].as_u64(),
-                    filters: mask_filters_from(&mv["filters"]),
-                    layers: mask_layers_from(&mv["layers"]),
-                }),
-                None => None,
-            };
-            let mut images: [Option<crate::engine::FillImage>; 4] = Default::default();
-            for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(4) {
-                if !iv.is_null() {
-                    let data = std::sync::Arc::new(r.blob(&iv["data"])?);
-                    images[k] = Some(self.engine.decode_fill_image(s(iv, "name").unwrap_or("image").to_string(), data)?);
-                }
-            }
-            let blend_name = s(lv, "blend").unwrap_or("Normal");
-            layers.push(Layer {
-                id: lv["id"].as_u64().ok_or_else(bad)?,
-                name,
-                visible: b(lv, "visible", true),
-                opacity: f(lv, "opacity", 1.0),
-                blend: Blend::ALL.into_iter().find(|x| x.name() == blend_name).unwrap_or(Blend::Normal),
-                content,
-                mask,
-                parent: lv["parent"].as_u64(),
-                images,
-                thumb: None,
-            });
-        }
-        self.engine.restore_layers(layers);
         self.graphs.clear(&self.rs);
         for gv in manifest["graphs"].as_array().into_iter().flatten() {
             let Some(id) = gv["id"].as_u64() else { continue };
@@ -691,23 +672,93 @@ impl PainterApp {
                 Err(e) => self.status = format!("A material graph didn't load: {e}"),
             }
         }
+        for (k, sv) in set_values.iter().enumerate().take(set_count) {
+            self.switch_set(k);
+            while !self.engine.layers.is_empty() {
+                self.engine.delete_layer(0, &mut self.undo);
+            }
+            let res = sv["resolution"].as_u64().unwrap_or(2048) as u32;
+            if res != self.engine.res {
+                self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo);
+            }
+            let mut layers = Vec::new();
+            for lv in sv["layers_bottom_to_top"].as_array().ok_or_else(bad)? {
+                let name = s(lv, "name").unwrap_or("Layer").to_string();
+                let c = &lv["content"];
+                let content = match s(c, "kind") {
+                    Some("paint") => {
+                        let ch = c["channels"].as_array().ok_or_else(bad)?;
+                        let mut out: [Option<Tex>; 4] = [None, None, None, None];
+                        for (k, t) in ch.iter().enumerate().take(4) {
+                            if !t.is_null() {
+                                out[k] = Some(self.tex_from(&r, t, "layer")?);
+                            }
+                        }
+                        Content::Paint(out)
+                    }
+                    Some("fill") => Content::Fill(fill_from(&c["fill"])),
+                    Some("folder") => Content::Folder(Folder { open: b(c, "open", true) }),
+                    _ => return Err(bad()),
+                };
+                let mask = match lv.get("mask").filter(|m| !m.is_null()) {
+                    Some(mv) => Some(Mask {
+                        paint: match mv.get("paint").filter(|p| !p.is_null()) {
+                            Some(t) => Some(self.tex_from(&r, t, "mask")?),
+                            None => None,
+                        },
+                        generator: match mv.get("generator").filter(|g| !g.is_null()) {
+                            Some(g) => Some(generator_from(g)?),
+                            None => None,
+                        },
+                        graph: mv["graph"].as_u64(),
+                        filters: mask_filters_from(&mv["filters"]),
+                        layers: mask_layers_from(&mv["layers"]),
+                    }),
+                    None => None,
+                };
+                let mut images: [Option<crate::engine::FillImage>; 4] = Default::default();
+                for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(4) {
+                    if !iv.is_null() {
+                        let data = std::sync::Arc::new(r.blob(&iv["data"])?);
+                        images[k] = Some(self.engine.decode_fill_image(s(iv, "name").unwrap_or("image").to_string(), data)?);
+                    }
+                }
+                let blend_name = s(lv, "blend").unwrap_or("Normal");
+                layers.push(Layer {
+                    id: lv["id"].as_u64().ok_or_else(bad)?,
+                    name,
+                    visible: b(lv, "visible", true),
+                    opacity: f(lv, "opacity", 1.0),
+                    blend: Blend::ALL.into_iter().find(|x| x.name() == blend_name).unwrap_or(Blend::Normal),
+                    content,
+                    mask,
+                    parent: lv["parent"].as_u64(),
+                    images,
+                    thumb: None,
+                });
+            }
+            self.engine.restore_layers(layers);
+            self.engine.map_fix = Default::default();
+            for fv in sv["map_fixes"].as_array().into_iter().flatten() {
+                let map = fv["map"].as_u64().unwrap_or(u64::MAX) as usize;
+                if map < self.engine.map_fix.len() {
+                    self.engine.map_fix[map] = Some(self.tex_from(&r, &fv["texture"], "map fix")?);
+                }
+            }
+            for (dst, lv) in self.engine.map_levels.iter_mut().zip(sv["map_levels"].as_array().into_iter().flatten()) {
+                let a = lv.as_array().filter(|a| a.len() == 3);
+                if let Some(a) = a {
+                    let g = |i: usize| a[i].as_f64().unwrap_or(0.0) as f32;
+                    // Version 1 projects stored the inverse gamma; keep their look.
+                    let gamma = if manifest["version"].as_u64().unwrap_or(1) < 2 { 1.0 / g(2).max(1e-3) } else { g(2) };
+                    *dst = Levels { black: g(0), white: g(1), gamma };
+                }
+            }
+            self.engine.map_levels_changed();
+            self.selected = sv["selected"].as_u64().map_or(0, |x| x as usize).min(self.engine.layers.len().saturating_sub(1));
+        }
+        self.switch_set(manifest["active_set"].as_u64().map_or(0, |x| x as usize).min(set_count - 1));
         self.repush_graphs();
-        for fv in manifest["map_fixes"].as_array().into_iter().flatten() {
-            let map = fv["map"].as_u64().unwrap_or(u64::MAX) as usize;
-            if map < self.engine.map_fix.len() {
-                self.engine.map_fix[map] = Some(self.tex_from(&r, &fv["texture"], "map fix")?);
-            }
-        }
-        for (dst, lv) in self.engine.map_levels.iter_mut().zip(manifest["map_levels"].as_array().into_iter().flatten()) {
-            let a = lv.as_array().filter(|a| a.len() == 3);
-            if let Some(a) = a {
-                let g = |i: usize| a[i].as_f64().unwrap_or(0.0) as f32;
-                // Version 1 projects stored the inverse gamma; keep their look.
-                let gamma = if manifest["version"].as_u64().unwrap_or(1) < 2 { 1.0 / g(2).max(1e-3) } else { g(2) };
-                *dst = Levels { black: g(0), white: g(1), gamma };
-            }
-        }
-        self.engine.map_levels_changed();
 
         let v = &manifest["view"];
         let d = crate::viewport::ViewSettings::default();
@@ -768,7 +819,6 @@ impl PainterApp {
             self.load_env(src, ctx);
         }
 
-        self.selected = manifest["selected"].as_u64().map_or(0, |x| x as usize).min(self.engine.layers.len().saturating_sub(1));
         self.undo.clear();
         self.saved_serial = self.undo.state_serial();
         self.autosaved_serial = self.saved_serial;
