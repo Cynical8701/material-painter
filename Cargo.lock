@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "material_painter"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytemuck",
  "eframe",

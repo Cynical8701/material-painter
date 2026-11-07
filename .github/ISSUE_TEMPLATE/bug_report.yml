@@ -10,7 +10,7 @@ body:
     attributes:
       label: Version
       description: Help → About Material Painter
-      placeholder: "0.1.5"
+      placeholder: "0.1.6"
     validations:
       required: true
   - type: dropdown
