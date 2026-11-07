@@ -4,15 +4,15 @@
 //! there). What comes across:
 //! * the model, every mesh of it, with its UVs and normals;
 //! * every texture set (the meshes of one material), with its size and the final look of its
-//!   base color, roughness, metallic and height channels: Painter's flattened result as of its
-//!   last save, as one paint layer;
+//!   base color, roughness, metallic, height and opacity channels: Painter's flattened result as
+//!   of its last save, as one paint layer;
 //! * each set's layer stack structure, rebuilt as far as Material Painter has equivalents (see
 //!   `app::spp_open`), next to that flattened layer.
 //!
 //! What does not, and is listed in the import report: procedural (Substance `.sbsar`)
 //! materials, filters and generators (Material Painter has no Substance engine, and never
 //! reads the contents of those archives: they are Adobe's), brush strokes, Painter's other
-//! channels (normal details, emissive, opacity, ambient occlusion) and its baked mesh maps
+//! channels (normal details, ambient occlusion) and its baked mesh maps
 //! (Material Painter bakes its own).
 
 use crate::mesh::Mesh;
@@ -30,8 +30,8 @@ pub type ChannelData = (u32, Vec<u8>);
 /// One texture set of an imported project.
 pub struct ImportedSet {
     pub resolution: u32,
-    /// Base color, roughness, metallic, height (Material Painter's channel order).
-    pub channels: [Option<ChannelData>; 4],
+    /// Base color, roughness, metallic, height, opacity (Material Painter's channel order).
+    pub channels: [Option<ChannelData>; crate::engine::CHANNELS],
     /// The texture set's layer stack, bottom to top, for rebuilding.
     pub layers: Vec<LayerInfo>,
 }
@@ -49,8 +49,17 @@ pub struct Imported {
 }
 
 /// Painter channel flag for each of Material Painter's channels.
-const CHANNELS: [(u64, &str); 4] =
-    [(channel_bits::BASE_COLOR, "Base color"), (channel_bits::ROUGHNESS, "Roughness"), (channel_bits::METALLIC, "Metallic"), (channel_bits::HEIGHT, "Height")];
+const CHANNELS: [(u64, &str); crate::engine::CHANNELS] = [
+    (channel_bits::BASE_COLOR, "Base color"),
+    (channel_bits::ROUGHNESS, "Roughness"),
+    (channel_bits::METALLIC, "Metallic"),
+    (channel_bits::HEIGHT, "Height"),
+    (channel_bits::OPACITY, "Opacity"),
+    (channel_bits::EMISSIVE, "Emissive"),
+    (channel_bits::NORMAL, "Normal"),
+    // Painter's specular level channel: not read yet (bit 0 matches nothing).
+    (0, "Specular"),
+];
 
 fn channel_name(bits: u64) -> String {
     match bits {
@@ -129,7 +138,7 @@ pub fn import(path: &Path) -> Result<Imported, String> {
         let resolution = size.min(MAX_RESOLUTION);
 
         // The flattened channels.
-        let mut channels: [Option<ChannelData>; 4] = Default::default();
+        let mut channels: [Option<ChannelData>; crate::engine::CHANNELS] = Default::default();
         let mut got = Vec::new();
         for (k, (bits, label)) in CHANNELS.iter().enumerate() {
             match file.channel_texture(set, *bits, MAX_RESOLUTION) {
@@ -140,9 +149,11 @@ pub fn import(path: &Path) -> Result<Imported, String> {
                         continue;
                     }
                     let data = match (k, img.format) {
-                        (0, CacheFormat::Srgb8Alpha8) => to_u8(&p.data),
-                        (1 | 2, CacheFormat::Rg8) => to_u8(&p.data),
+                        (0 | 5, CacheFormat::Srgb8Alpha8) => to_u8(&p.data),
+                        (1 | 2 | 4, CacheFormat::Rg8) => to_u8(&p.data),
                         (3, CacheFormat::Rg16f) => p.data.iter().flat_map(|v| crate::gpu::f32_to_f16(*v).to_le_bytes()).collect(),
+                        // Painter's normal details: tangent space, already encoded 0..1 (flat: 0.5, 0.5, 1).
+                        (crate::engine::NORMAL, CacheFormat::Rgba16f) => to_u8(&p.data),
                         (_, f) => {
                             left.push(format!("{}: {label} stored as {f:?}, which this import doesn't read.", set.name));
                             continue;

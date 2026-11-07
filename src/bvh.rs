@@ -48,6 +48,23 @@ impl Bvh {
         Bvh::build(tris)
     }
 
+    /// Over the mesh triangles `keep` accepts (hits still report mesh triangle indices).
+    pub fn from_mesh_where(mesh: &Mesh, keep: impl Fn(usize) -> bool) -> Bvh {
+        let ids: Vec<u32> = (0..mesh.indices.len() / 3).filter(|&t| keep(t)).map(|t| t as u32).collect();
+        let tris = ids
+            .iter()
+            .map(|&t| {
+                let k = t as usize * 3;
+                [0, 1, 2].map(|c| Vec3::from_array(mesh.vertices[mesh.indices[k + c] as usize].pos))
+            })
+            .collect();
+        let mut bvh = Bvh::build(tris);
+        for o in &mut bvh.order {
+            *o = ids[*o as usize];
+        }
+        bvh
+    }
+
     pub fn build(tris: Vec<[Vec3; 3]>) -> Bvh {
         let n = tris.len();
         let bmin: Vec<Vec3> = tris.iter().map(|t| t[0].min(t[1]).min(t[2])).collect();
@@ -266,6 +283,20 @@ impl Bvh {
 mod tests {
     use super::*;
     use crate::mesh::Primitive;
+
+    #[test]
+    fn subset_reports_mesh_triangles() {
+        let mesh = Primitive::RoundedCube.build();
+        let o = Vec3::new(0.13, 0.27, 5.0);
+        let d = Vec3::new(0.0, 0.0, -1.0);
+        let front = Bvh::from_mesh(&mesh).raycast(o, d).expect("hits the front face").tri;
+        // Without the front face's triangle, the ray finds another one, by its mesh index.
+        let sub = Bvh::from_mesh_where(&mesh, |t| t as u32 != front);
+        let hit = sub.raycast(o, d).expect("hits behind");
+        assert_ne!(hit.tri, front);
+        assert!((hit.tri as usize) < mesh.indices.len() / 3);
+        assert_eq!(sub.order.len(), mesh.indices.len() / 3 - 1);
+    }
 
     #[test]
     fn raycast_reports_triangle_and_barycentrics() {

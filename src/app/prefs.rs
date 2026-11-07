@@ -186,7 +186,7 @@ impl Preferences {
 
     /// Missing or invalid entries keep their defaults, so files from older
     /// versions load.
-    fn from_json(v: &Value) -> Preferences {
+    pub(super) fn from_json(v: &Value) -> Preferences {
         let d = Preferences::default();
         let b = |k: &str, def: bool| v[k].as_bool().unwrap_or(def);
         let f = |k: &str, def: f32, lo: f32, hi: f32| v[k].as_f64().map_or(def, |x| (x as f32).clamp(lo, hi));

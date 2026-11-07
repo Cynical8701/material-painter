@@ -21,6 +21,13 @@
 //! In the body, inputs read as `in_a(uv)` (vec4 for color, f32 for gray),
 //! parameters as `params.opacity`, and `res()` is the output size in texels.
 //!
+//! A `// @surface` line gives a texture node the mesh's surface: world
+//! position and normal, the baked maps and the smart mask building blocks
+//! of `wear.wgsl`. `surface(uv)` returns a `MaskSurface` (position, normal,
+//! maps, bounds) for one texel, `covered(uv)` whether a texel is on the mesh.
+//! These nodes follow the model in 3D (no seams between UV islands), as the
+//! layer stack's fills and smart masks do.
+//!
 //! A `// @shading` line makes a *shading* node instead: a step of a preview
 //! shader (see `graph::shading`), evaluated per pixel of the 3D view rather
 //! than rendered to a texture. Its body is `fn node(c: Shade) -> vec4<f32>`;
@@ -90,6 +97,8 @@ pub struct NodeDef {
     pub source: String,
     /// A step of a preview shader rather than a texture node (`@shading`).
     pub shading: bool,
+    /// Reads the mesh's surface: position, normal, baked maps (`@surface`).
+    pub surface: bool,
 }
 
 pub const MAX_INPUTS: usize = 8;
@@ -210,18 +219,20 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
         body: String::new(),
         source: source.to_string(),
         shading: false,
+        surface: false,
     };
     let mut body_start = 0;
-    for (n, line) in source.lines().enumerate() {
+    // Lines with their endings, so offsets hold for "\r\n" files too.
+    for (n, line) in source.split_inclusive('\n').enumerate() {
         let t = line.trim();
         let Some(rest) = t.strip_prefix("//") else {
             if t.is_empty() {
-                body_start += line.len() + 1;
+                body_start += line.len();
                 continue;
             }
             break;
         };
-        body_start += line.len() + 1;
+        body_start += line.len();
         let Some(tag) = rest.trim().strip_prefix('@') else { continue };
         let (key, value) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
         let value = value.trim();
@@ -234,6 +245,7 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
             "input" => def.inputs.push(input(value).map_err(at)?),
             "param" => def.params.push(param(value).map_err(at)?),
             "shading" => def.shading = true,
+            "surface" => def.surface = true,
             k => return Err(at(format!("unknown tag '@{k}'"))),
         }
     }
@@ -259,6 +271,9 @@ pub fn parse(id: &str, source: &str) -> Result<NodeDef, String> {
         } else {
             "the node needs a 'fn node(uv: vec2<f32>) -> vec4<f32>'".into()
         });
+    }
+    if def.shading && def.surface {
+        return Err("a node is either a shading node or a surface node, not both".into());
     }
     if def.shading && images > 0 {
         return Err("shading nodes read the surface from `c` and can't take image or mesh map parameters".into());
@@ -289,6 +304,9 @@ impl NodeDef {
         }
         s.push_str("\nfn res() -> f32 {\n    return nu.info.x;\n}\n\n");
         s.push_str(include_str!("lib.wgsl"));
+        if self.surface {
+            s.push_str(SURFACE);
+        }
         // Parameters.
         s.push_str("\nstruct Params {\n    _pad: f32,\n");
         for p in &self.params {
@@ -386,6 +404,66 @@ impl NodeDef {
     }
 }
 
+/// What `@surface` nodes get: the mesh's surface maps in group 1 (see
+/// `runtime::Surface`), the smart mask code, and helpers.
+const SURFACE: &str = concat!(
+    "
+struct SurfaceU {
+    bmin: vec4<f32>,
+    bsize: vec4<f32>,
+    // baked edge and crease distances' largest value, unused x3
+    info: vec4<f32>,
+};
+@group(1) @binding(0) var<uniform> su: SurfaceU;
+@group(1) @binding(1) var s_pos: texture_2d<f32>;
+@group(1) @binding(2) var s_nrm: texture_2d<f32>;
+@group(1) @binding(3) var s_a: texture_2d<f32>;
+@group(1) @binding(4) var s_b: texture_2d<f32>;
+@group(1) @binding(5) var s_c: texture_2d<f32>;
+@group(1) @binding(6) var s_e: texture_2d<f32>;
+@group(1) @binding(7) var s_samp: sampler;
+",
+    include_str!("../shaders/wear.wgsl"),
+    "
+// Whether the texel at `uv` is on the mesh (not between UV islands).
+fn covered(uv: vec2<f32>) -> bool {
+    return textureSampleLevel(s_pos, s_samp, uv, 0.0).a > 0.5;
+}
+
+// The mesh's surface at `uv`: world position and normal, baked maps,
+// bounds. Mask settings (scale, seed, edge width, ID) start at zero.
+fn surface(uv: vec2<f32>) -> MaskSurface {
+    var s: MaskSurface;
+    s.p = textureSampleLevel(s_pos, s_samp, uv, 0.0).xyz;
+    s.n = normalize(textureSampleLevel(s_nrm, s_samp, uv, 0.0).xyz * 2.0 - 1.0);
+    s.a = textureSampleLevel(s_a, s_samp, uv, 0.0);
+    s.b = textureSampleLevel(s_b, s_samp, uv, 0.0);
+    s.c = textureSampleLevel(s_c, s_samp, uv, 0.0);
+    s.e = textureSampleLevel(s_e, s_samp, uv, 0.0);
+    let right = textureSampleLevel(s_pos, s_samp, uv + vec2<f32>(1.0 / res(), 0.0), 0.0);
+    s.texel_world = select(2.0 / res(), distance(right.xyz, s.p), right.a > 0.5);
+    s.bmin = su.bmin.xyz;
+    s.bsize = su.bsize.xyz;
+    s.emax = su.info.x;
+    return s;
+}
+
+// An image projected from the three axes in world space (tri-planar),
+// `tiling` repeats per world unit, `sharpness` how quickly the axes hand
+// over; mipmapped by the texel's world size.
+fn triplanar(t: texture_2d<f32>, s: MaskSurface, tiling: f32, sharpness: f32) -> vec4<f32> {
+    let size = f32(textureDimensions(t).x);
+    let lod = log2(max(s.texel_world * tiling * size, 1.0));
+    var w = pow(abs(s.n), vec3<f32>(max(sharpness, 1.0)));
+    w /= max(w.x + w.y + w.z, 1e-4);
+    let q = s.p * tiling;
+    return textureSampleLevel(t, samp, vec2<f32>(q.z, -q.y), lod) * w.x
+        + textureSampleLevel(t, samp, q.xz, lod) * w.y
+        + textureSampleLevel(t, samp, vec2<f32>(q.x, -q.y), lod) * w.z;
+}
+"
+);
+
 /// A parameter value packed into its uniform slot.
 pub fn pack(v: &Value) -> [f32; 4] {
     match v {
@@ -446,6 +524,9 @@ fn node(uv: vec2<f32>) -> vec4<f32> {
         let e = parse("x", "// @input 1a: color\nfn node(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }").unwrap_err();
         assert!(e.contains("valid name"), "{e}");
         assert!(parse("x", "// @name X\n").unwrap_err().contains("fn node"));
+        // Windows line endings: the body starts at the code, not inside the header.
+        let crlf = BLEND.replace('\n', "\r\n");
+        assert!(parse("blend", &crlf).unwrap().body.trim_start().starts_with("fn node("));
         let e = parse("x", "// @input a: color\n// @param a: bool\nfn node(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }").unwrap_err();
         assert!(e.contains("twice"), "{e}");
     }

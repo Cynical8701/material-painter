@@ -142,7 +142,7 @@ fn render(
         Item::Generator(i) => {
             // The mask in white over black, like the generator's own preview.
             let flat = |c: f32| FillParams {
-                mat: MatValues { enabled: [true, true, true, false], color: [c; 3], rough: 0.6, metal: 0.0, height: 0.0 },
+                mat: MatValues { color: [c; 3], rough: 0.6, ..MatValues::default() },
                 ..Default::default()
             };
             engine.add_fill_layer(0, None, "Black".into(), flat(0.06), &mut undo);

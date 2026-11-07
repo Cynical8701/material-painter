@@ -23,6 +23,9 @@ pub enum ViewMode {
     Roughness,
     Metallic,
     Height,
+    Opacity,
+    Emission,
+    Specular,
     Normal,
     Map(usize),
     Custom(u32),
@@ -32,8 +35,17 @@ pub enum ViewMode {
 }
 
 impl ViewMode {
-    pub const CHANNELS: [ViewMode; 6] =
-        [ViewMode::Material, ViewMode::BaseColor, ViewMode::Roughness, ViewMode::Metallic, ViewMode::Height, ViewMode::Normal];
+    pub const CHANNELS: [ViewMode; 9] = [
+        ViewMode::Material,
+        ViewMode::BaseColor,
+        ViewMode::Roughness,
+        ViewMode::Metallic,
+        ViewMode::Height,
+        ViewMode::Opacity,
+        ViewMode::Emission,
+        ViewMode::Specular,
+        ViewMode::Normal,
+    ];
 
     pub fn all() -> Vec<ViewMode> {
         let mut v = Self::CHANNELS.to_vec();
@@ -49,6 +61,9 @@ impl ViewMode {
             ViewMode::Roughness => 2,
             ViewMode::Metallic => 3,
             ViewMode::Height => 4,
+            ViewMode::Opacity => 23,
+            ViewMode::Emission => 24,
+            ViewMode::Specular => 25,
             ViewMode::Normal => 5,
             ViewMode::Map(i) => 6 + i as u32,
             // Which custom map rides in the globals (see `base_globals`).
@@ -66,6 +81,9 @@ impl ViewMode {
             ViewMode::Roughness => "Roughness",
             ViewMode::Metallic => "Metallic",
             ViewMode::Height => "Height",
+            ViewMode::Opacity => "Opacity",
+            ViewMode::Emission => "Emission",
+            ViewMode::Specular => "Specular",
             ViewMode::Normal => "Normal (final)",
             ViewMode::Map(i) => crate::engine::MAPS[i].name,
             // The app names it after the map (see `PainterApp::mode_name`).
@@ -202,6 +220,9 @@ pub struct ViewSettings {
     /// How much the baked ambient occlusion darkens the 3D view's lighting
     /// (display only: bakes and exports keep the full map).
     pub ao_strength: f32,
+    /// How bright emission shows in the 3D view and the path tracer
+    /// (display only: exports keep the 0-1 emission color).
+    pub emission: f32,
     pub post: PostSettings,
     pub key: KeyLight,
 }
@@ -253,6 +274,7 @@ impl Default for ViewSettings {
             uv_wire_opacity: 0.45,
             use_baked_normal: true,
             ao_strength: 0.6,
+            emission: 2.0,
             post: PostSettings::default(),
             key: KeyLight::default(),
         }
@@ -417,7 +439,18 @@ impl ViewTarget {
 /// Parameter slots (vec4 each) of a custom preview shader.
 pub const CUSTOM_PARAMS: usize = 128;
 
+/// How the 3D view draws one texture set.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct SetLook {
+    /// Not drawn at all.
+    pub hidden: bool,
+    /// 0..1: tints the set to show which part of the mesh it is.
+    pub highlight: f32,
+}
+
 pub struct ViewRenderer {
+    /// Per texture set (missing entries: shown, no highlight).
+    pub set_looks: Vec<SetLook>,
     layout: wgpu::PipelineLayout,
     /// The mesh drawn with a custom preview shader (a compiled shading graph).
     custom_mesh: Option<wgpu::RenderPipeline>,
@@ -426,6 +459,8 @@ pub struct ViewRenderer {
     env_sampler: wgpu::Sampler,
     sky: wgpu::RenderPipeline,
     mesh: wgpu::RenderPipeline,
+    /// The mesh's see-through texels, blended after the opaque ones.
+    mesh_t: wgpu::RenderPipeline,
     quad: wgpu::RenderPipeline,
     wire: wgpu::RenderPipeline,
     wire3d: wgpu::RenderPipeline,
@@ -496,6 +531,9 @@ impl ViewRenderer {
                     count: None,
                 },
                 gpu::uniform_entry(18, false),
+                gpu::tex_entry(20, true),
+                gpu::tex_entry(21, true),
+                gpu::tex_entry(22, true),
             ],
         });
         let layout = gpu::layout(device, &bgl);
@@ -554,6 +592,12 @@ impl ViewRenderer {
         let vb = [Some(gpu::vertex_layout())];
         let sky = pipeline("sky", "vs_fullscreen", "fs_sky", &[], tri, depth(false, wgpu::CompareFunction::Always), MSAA, &hdr);
         let mesh = pipeline("mesh", "vs_mesh", "fs_mesh", &vb, tri, depth(true, wgpu::CompareFunction::Less), MSAA, &hdr);
+        let hdr_over = Some(wgpu::ColorTargetState {
+            format: HDR_FORMAT,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        });
+        let mesh_t = pipeline("mesh (see-through)", "vs_mesh", "fs_mesh_t", &vb, tri, depth(true, wgpu::CompareFunction::Less), MSAA, &hdr_over);
         let quad = pipeline("quad", "vs_quad", "fs_quad", &[], tri, None, 1, &color);
         let wire = pipeline("wire", "vs_wire", "fs_wire", &vb, wgpu::PrimitiveTopology::LineList, None, 1, &blended);
         // Overlays test against the mesh depth but never write it.
@@ -629,12 +673,14 @@ impl ViewRenderer {
         });
         ViewRenderer {
             layout,
+            set_looks: Vec::new(),
             custom_mesh: None,
             custom_params,
             post: PostFx::new(rs, COLOR_FORMAT),
             env_sampler: env_sampler(device),
             sky,
             mesh,
+            mesh_t,
             quad,
             wire,
             wire3d,
@@ -663,7 +709,7 @@ impl ViewRenderer {
             return Ok(());
         };
         let src = format!(
-            "{}\n{code}\n@fragment\nfn fs_mesh_custom(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{\n    let c = mesh_shade_inputs(in, front);\n    return vec4<f32>(max(custom_shade(c), vec3<f32>(0.0)), 1.0);\n}}\n",
+            "{}\n{code}\n@fragment\nfn fs_mesh_custom(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{\n    let c = mesh_shade_inputs(in, front);\n    if (view_alpha(c.s) < 0.5) {{\n        discard;\n    }}\n    return vec4<f32>(highlighted(max(custom_shade(c), vec3<f32>(0.0))), 1.0);\n}}\n",
             include_str!("shaders/view.wgsl")
         );
         let (pipeline, err) = crate::graph::runtime::validation_scope(device, || {
@@ -752,6 +798,9 @@ impl ViewRenderer {
                 wgpu::BindGroupEntry { binding: 16, resource: v(&self.shadow_map.view) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
                 wgpu::BindGroupEntry { binding: 18, resource: self.custom_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: v(engine.final_tex(crate::engine::FINAL_EMISSION).srgb()) },
+                wgpu::BindGroupEntry { binding: 21, resource: v(&engine.final_tex(crate::engine::FINAL_NORMAL).view) },
+                wgpu::BindGroupEntry { binding: 22, resource: v(&engine.final_tex(crate::engine::FINAL_SPECULAR).view) },
             ],
         })
     }
@@ -780,7 +829,7 @@ impl ViewRenderer {
             bmin: engine.bounds().0.extend(0.0).to_array(),
             bsize: (engine.bounds().1 - engine.bounds().0).extend(0.0).to_array(),
             bg: [s.bg_color[0], s.bg_color[1], s.bg_color[2], s.bg_intensity],
-            bg2: [s.bg_blur, s.background as u32 as f32, 0.0, 0.0],
+            bg2: [s.bg_blur, s.background as u32 as f32, s.emission, 0.0],
             light_vp: Self::light_view_proj(engine, s).to_cols_array_2d(),
             sun: s.key.direction(s.env_rotation).extend(s.key.intensity).to_array(),
             sun_c: [s.key.color[0], s.key.color[1], s.key.color[2], if s.key.on { 1.0 } else { 0.0 }],
@@ -830,6 +879,7 @@ impl ViewRenderer {
             .enumerate()
             .map(|(k, engine)| {
                 let mut g = Self::base_globals(engine, settings, size);
+                g.size[3] = self.set_looks.get(k).map_or(0.0, |l| l.highlight);
                 g.view_proj = vp.to_cols_array_2d();
                 g.inv_view_proj = vp.inverse().to_cols_array_2d();
                 g.cam_pos = cam.eye().extend(1.0).to_array();
@@ -839,6 +889,7 @@ impl ViewRenderer {
             .collect();
         let bg = &bgs[0];
         let transparent = settings.background == Background::Transparent;
+        let shown: Vec<usize> = (0..mesh.sets.len()).filter(|&k| !self.set_looks.get(k).is_some_and(|l| l.hidden)).collect();
 
         let t = &self.view3d;
         let mut encoder = rs.device.create_command_encoder(&Default::default());
@@ -864,7 +915,9 @@ impl ViewRenderer {
             pass.set_pipeline(&self.shadow);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            for &k in &shown {
+                pass.draw_indexed(mesh.sets[k].index_range(), 0, 0..1);
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -895,20 +948,39 @@ impl ViewRenderer {
             pass.set_pipeline(self.custom_mesh.as_ref().filter(|_| settings.mode == ViewMode::Material).unwrap_or(&self.mesh));
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (set, bg) in mesh.sets.iter().zip(&bgs) {
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw_indexed(set.index_range(), 0, 0..1);
+            for &k in &shown {
+                if let Some(bg) = bgs.get(k) {
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.draw_indexed(mesh.sets[k].index_range(), 0, 0..1);
+                }
+            }
+            // See-through texels, over everything opaque (the built-in look
+            // only; a preview shader cuts them out at half opacity).
+            if self.custom_mesh.is_none() || settings.mode != ViewMode::Material {
+                pass.set_pipeline(&self.mesh_t);
+                for &k in &shown {
+                    if let (Some(bg), Some(e)) = (bgs.get(k), engines.get(k)) {
+                        if e.uses_opacity() {
+                            pass.set_bind_group(0, bg, &[]);
+                            pass.draw_indexed(mesh.sets[k].index_range(), 0, 0..1);
+                        }
+                    }
+                }
             }
             pass.set_bind_group(0, bg, &[]);
             if settings.show_wire_3d {
                 pass.set_pipeline(&self.wire3d);
                 pass.set_index_buffer(mesh.edges.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.edge_count, 0, 0..1);
+                for &k in &shown {
+                    pass.draw_indexed(mesh.sets[k].edges.clone(), 0, 0..1);
+                }
             }
             if settings.show_seams_3d && mesh.seam_count > 0 {
                 pass.set_pipeline(&self.seam3d);
                 pass.set_index_buffer(mesh.seams.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.seam_count, 0, 0..1);
+                for &k in &shown {
+                    pass.draw_indexed(mesh.sets[k].seams.clone(), 0, 0..1);
+                }
             }
             if let Some(overlays) = overlays {
                 for o in &overlays.slots {

@@ -8,7 +8,7 @@ struct RtU {
     inv_view_proj: mat4x4<f32>,
     cam_pos: vec4<f32>,
     frame: vec4<f32>,    // width, height, sample index, max bounces
-    light: vec4<f32>,    // env rotation, unused, ground y, ground enabled
+    light: vec4<f32>,    // env rotation, emission strength, ground y, ground enabled
     params: vec4<f32>,   // use baked normal, height strength, texel size, texture resolution
     env: vec4<f32>,      // env intensity, radiance max lod, background blur, background mode
     bg: vec4<f32>,       // background color (linear), background intensity
@@ -35,6 +35,9 @@ struct RtU {
 @group(0) @binding(15) var env_samp: sampler;
 // [total, marginal cdf (H + 1), row cdfs H * (W + 1), func W * H]; see environment.rs.
 @group(0) @binding(16) var<storage, read> env_cdf: array<f32>;
+@group(0) @binding(17) var t_emission: texture_2d_array<f32>;  // sRGB view: reads linear
+@group(0) @binding(18) var t_normal: texture_2d_array<f32>;  // painted normal detail, tangent space, encoded 0..1
+@group(0) @binding(19) var t_spec: texture_2d_array<f32>;  // specular level (0.5: 4% reflectance)
 
 const PI: f32 = 3.14159265;
 const NONE: u32 = 0xffffffffu;
@@ -250,6 +253,12 @@ struct Mat {
     albedo: vec3<f32>,
     rough: f32,
     metal: f32,
+    // Opacity (base color alpha): the share of rays the surface stops.
+    alpha: f32,
+    // Light the surface gives off (linear, times the view's emission strength).
+    emission: vec3<f32>,
+    // Specular level of non-metals (0.5: 4% reflectance).
+    spec: f32,
 };
 
 fn brdf(m: Mat, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
@@ -260,7 +269,7 @@ fn brdf(m: Mat, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
     }
     let h = normalize(v + l);
     let a = max(m.rough * m.rough, 0.002);
-    let f0 = mix(vec3<f32>(0.04), m.albedo, m.metal);
+    let f0 = mix(vec3<f32>(0.08 * m.spec), m.albedo, m.metal);
     let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0);
     let spec = f * ggx_d(max(dot(n, h), 0.0), a) * smith_g(nv, nl, a) / (4.0 * nv * nl);
     let diff = (1.0 - f) * m.albedo * (1.0 - m.metal) / PI;
@@ -299,11 +308,16 @@ fn mesh_surface(h: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         rn = -rn;
     }
 
-    s.m.albedo = textureSampleLevel(t_color, samp, uv, layer, 0.0).rgb;
+    let col = textureSampleLevel(t_color, samp, uv, layer, 0.0);
+    s.m.albedo = col.rgb;
+    s.m.alpha = col.a;
+    s.m.emission = textureSampleLevel(t_emission, samp, uv, layer, 0.0).rgb * u.light.y;
     s.m.rough = clamp(textureSampleLevel(t_rough, samp, uv, layer, 0.0).r, 0.03, 1.0);
     s.m.metal = textureSampleLevel(t_metal, samp, uv, layer, 0.0).r;
+    s.m.spec = textureSampleLevel(t_spec, samp, uv, layer, 0.0).r;
 
-    // Same normal composition as the raster view: baked normal + painted height.
+    // Same normal composition as the raster view: baked normal, painted
+    // normal, painted height.
     let tx = u.params.z;
     let hl = textureSampleLevel(t_height, samp, uv - vec2<f32>(tx, 0.0), layer, 0.0).r;
     let hr = textureSampleLevel(t_height, samp, uv + vec2<f32>(tx, 0.0), layer, 0.0).r;
@@ -317,6 +331,8 @@ fn mesh_surface(h: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         let b = textureSampleLevel(t_baked, samp, uv, layer, 0.0).xy;
         base = vec3<f32>(b, sqrt(max(1.0 - dot(b, b), 0.0)));
     }
+    let pn = normalize(textureSampleLevel(t_normal, samp, uv, layer, 0.0).xyz * 2.0 - 1.0);
+    base = normalize(vec3<f32>(base.xy + pn.xy, base.z * pn.z));
     let ts = normalize(vec3<f32>(base.xy + vec2<f32>(-hu, ht), base.z));
     // MikkTSpace decoding, as in the raster view.
     let b_up = -cross(rn, tg.xyz) * select(1.0, -1.0, tg.w < 0.0);
@@ -340,6 +356,8 @@ fn trace(o_in: vec3<f32>, d_in: vec3<f32>) -> vec3<f32> {
     let ground_on = u.light.w > 0.5;
     // Pdf of the BSDF sample that produced the current ray (0 for camera rays).
     var bsdf_pdf = 0.0;
+    // See-through surfaces passed so far (each one doesn't count as a bounce).
+    var passed = 0;
 
     for (var bounce = 0; bounce <= max_bounces; bounce++) {
         let h = intersect(o, d, 1e30, false);
@@ -363,6 +381,14 @@ fn trace(o_in: vec3<f32>, d_in: vec3<f32>) -> vec3<f32> {
         var s: Surface;
         if (h.tri != NONE && h.t < tg) {
             s = mesh_surface(h, o, d);
+            // Stochastic transparency: a surface of opacity a stops a share a
+            // of the rays; the rest go on through it, unchanged.
+            if (s.m.alpha < 0.999 && passed < 32 && rand() >= s.m.alpha) {
+                passed += 1;
+                o = s.p + d * 1e-3;
+                bounce -= 1;
+                continue;
+            }
         } else {
             s.p = o + d * tg;
             s.ng = vec3<f32>(0.0, 1.0, 0.0);
@@ -372,13 +398,19 @@ fn trace(o_in: vec3<f32>, d_in: vec3<f32>) -> vec3<f32> {
             s.m.albedo = mix(vec3<f32>(0.32), vec3<f32>(0.22), fade);
             s.m.rough = 0.9;
             s.m.metal = 0.0;
+            s.m.alpha = 1.0;
+            s.m.emission = vec3<f32>(0.0);
+            s.m.spec = 0.5;
         }
+        // Emissive surfaces light what they're seen from (and, through
+        // bounces, everything near them).
+        radiance += throughput * s.m.emission;
         let v = -d;
         let origin = s.p + s.ng * 1e-3;
 
         // Lobe selection, shared by light sampling (for MIS) and BSDF sampling.
         let nv = max(dot(s.n, v), 1e-4);
-        let f0 = mix(vec3<f32>(0.04), s.m.albedo, s.m.metal);
+        let f0 = mix(vec3<f32>(0.08 * s.m.spec), s.m.albedo, s.m.metal);
         let fv = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
         let spec_w = dot(fv, vec3<f32>(0.333));
         let diff_w = dot(s.m.albedo * (1.0 - s.m.metal) * (1.0 - fv), vec3<f32>(0.333));

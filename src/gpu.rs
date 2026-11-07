@@ -183,6 +183,46 @@ pub fn shader(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ShaderModu
     })
 }
 
+/// An image as a sampled texture with a full mip chain (each level a
+/// box-filtered half of the one above), for tiling images seen from afar.
+pub fn upload_mips<P: image::Pixel<Subpixel = u8> + 'static>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: image::ImageBuffer<P, Vec<u8>>,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> Tex {
+    use image::imageops::FilterType;
+    let (w, h) = img.dimensions();
+    let mips = w.max(h).max(1).ilog2() + 1;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let channels = P::CHANNEL_COUNT as u32;
+    let mut level = img;
+    for mip in 0..mips {
+        let (lw, lh) = level.dimensions();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &level,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(lw * channels), rows_per_image: None },
+            wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
+        );
+        if mip + 1 < mips {
+            level = image::imageops::resize(&level, (lw / 2).max(1), (lh / 2).max(1), FilterType::Triangle);
+        }
+    }
+    let view = texture.create_view(&Default::default());
+    Tex { texture, view, srgb_view: None, format, width: w, height: h, samples: 1 }
+}
+
 pub fn layout(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> wgpu::PipelineLayout {
     device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,

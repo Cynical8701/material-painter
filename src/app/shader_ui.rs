@@ -334,7 +334,8 @@ impl PainterApp {
         let rt = sm.rt.get_or_insert_with(|| Runtime::new(&self.rs.device, &self.rs.queue));
         let engine = &self.engine;
         let maps = |m: usize| engine.mesh_map(m);
-        rt.evaluate(&self.rs.device, &self.rs.queue, &sm.preview, &lib, &maps, engine.maps_version);
+        let surface = engine.graph_surface();
+        rt.evaluate(&self.rs.device, &self.rs.queue, &sm.preview, &lib, &maps, Some(&surface), engine.maps_version, false);
         sm.error = rt.errors.get(&node).map(|e| def.map_error(e));
     }
 

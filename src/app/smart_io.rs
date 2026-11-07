@@ -279,14 +279,14 @@ impl PainterApp {
                     f.graph = f.graph.and_then(|g| graph_map.get(&g).copied());
                     Content::Fill(f)
                 }
-                Some("folder") => Content::Folder(Folder { open: true }),
+                Some("folder") => Content::Folder(Folder { open: true, graph: None }),
                 _ => continue,
             };
-            let mut images: [Option<crate::engine::FillImage>; 4] = Default::default();
-            for (ch, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(4) {
+            let mut images: [Option<crate::engine::FillImage>; crate::engine::CHANNELS] = Default::default();
+            for (ch, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(crate::engine::CHANNELS) {
                 let Some(file) = iv["file"].as_str() else { continue };
                 let data = Arc::new(read(file)?);
-                images[ch] = Some(self.engine.decode_fill_image(iv["name"].as_str().unwrap_or("image").to_string(), data)?);
+                images[ch] = Some(self.engine.decode_channel_image(ch, iv["name"].as_str().unwrap_or("image").to_string(), data)?);
             }
             let mv = &lv["mask"];
             masks.push((!mv.is_null()).then(|| MaskPlan {

@@ -7,6 +7,7 @@ pub mod def;
 pub mod presets;
 pub(crate) mod runtime;
 pub mod shading;
+pub mod smart;
 
 pub use def::{Kind, NodeDef, ParamKind, Value};
 pub use runtime::Runtime;
@@ -15,8 +16,18 @@ use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Channels an Output node can feed (its `usage` parameter, in order).
-pub const USAGES: [&str; 5] = ["Base Color", "Roughness", "Metallic", "Height", "Mask"];
+/// Channels an Output node can feed (its `usage` parameter, in order; files
+/// store the names, so new ones go at the end).
+pub const USAGES: [&str; 9] = ["Base Color", "Roughness", "Metallic", "Height", "Mask", "Opacity", "Emission", "Normal", "Specular"];
+/// The Mask usage (graph masks).
+pub const MASK_USAGE: usize = 4;
+/// The usage feeding each paint channel (`engine::CHANNELS` order).
+pub const CHANNEL_USAGE: [usize; crate::engine::CHANNELS] = [0, 1, 2, 3, 5, 6, 7, 8];
+
+/// A graph's outputs per paint channel (`engine::CHANNELS` order).
+pub fn channel_outputs<T: Clone>(outs: &[Option<T>; USAGES.len()]) -> [Option<T>; crate::engine::CHANNELS] {
+    CHANNEL_USAGE.map(|u| outs[u].clone())
+}
 pub const OUTPUT_DEF: &str = "output";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,20 +42,157 @@ pub struct Node {
     pub links: HashMap<String, u64>,
 }
 
+/// A graph parameter: one named control in the layer properties that sets
+/// node parameters ("Rust amount" moving a mask's level and a blend's
+/// opacity at once).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphParam {
+    pub name: String,
+    /// The heading it shows under in the layer properties ("": none).
+    pub group: String,
+    /// The node parameters it sets: (node, parameter name). The first one
+    /// gives its kind and current value.
+    pub binds: Vec<(u64, String)>,
+    /// What "reset" goes back to (the value when it was made).
+    pub default: Option<Value>,
+}
+
+/// What a node of a folder's live graph stands for (see [`smart`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Role {
+    /// The layer's smart mask (a Smart Mask node).
+    Mask,
+    /// One channel of the layer (a Layer node; its `channel` value).
+    Channel(usize),
+    /// The folder's output for a usage (an Output node).
+    Output(usize),
+    /// The node feeding the layer's mask when it isn't the smart mask; the
+    /// mask graph (an app graph id) renders what it feeds.
+    Source(u64),
+}
+
+/// Ties a node of a folder's live graph to a layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tag {
+    pub node: u64,
+    /// The layer (the folder itself for outputs).
+    pub layer: u64,
+    pub role: Role,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Graph {
     pub name: String,
     /// Texture size every node renders at.
     pub res: u32,
+    /// `res` follows the texture set the graph's layer is in.
+    pub match_set: bool,
     pub nodes: Vec<Node>,
     pub next_id: u64,
-    /// Parameters shown in the layer properties: (node, parameter name).
-    pub exposed: Vec<(u64, String)>,
+    /// The graph's parameters, in the order the layer properties show them.
+    pub params: Vec<GraphParam>,
+    /// A folder's live graph: which nodes are its layers.
+    pub tags: Vec<Tag>,
 }
 
 impl Graph {
     pub fn new(name: &str) -> Graph {
-        Graph { name: name.to_string(), res: 1024, nodes: Vec::new(), next_id: 1, exposed: Vec::new() }
+        Graph { name: name.to_string(), res: 1024, match_set: false, nodes: Vec::new(), next_id: 1, params: Vec::new(), tags: Vec::new() }
+    }
+
+    /// The node standing for `role` of layer `layer` (any source for `Source`).
+    pub fn tagged(&self, layer: u64, role: Role) -> Option<u64> {
+        self.tags
+            .iter()
+            .find(|t| t.layer == layer && (t.role == role || matches!((t.role, role), (Role::Source(_), Role::Source(_)))))
+            .map(|t| t.node)
+            .filter(|n| self.node(*n).is_some())
+    }
+
+    /// What `node` stands for in a folder's live graph.
+    pub fn tag_of(&self, node: u64) -> Option<Tag> {
+        self.tags.iter().find(|t| t.node == node && !matches!(t.role, Role::Source(_))).copied()
+    }
+
+    /// The graph parameter that sets `node`'s parameter `name`.
+    pub fn param_of(&self, node: u64, name: &str) -> Option<usize> {
+        self.params.iter().position(|p| p.binds.iter().any(|(n, k)| *n == node && k == name))
+    }
+
+    /// Whether any graph parameter sets one of `node`'s parameters.
+    pub fn is_bound(&self, node: u64) -> bool {
+        self.params.iter().any(|p| p.binds.iter().any(|(n, _)| *n == node))
+    }
+
+    /// A new graph parameter for `node`'s parameter `name`, named after
+    /// them; returns its index. An already bound parameter keeps its own.
+    pub fn expose(&mut self, node: u64, name: &str, lib: &Library) -> usize {
+        if let Some(i) = self.param_of(node, name) {
+            return i;
+        }
+        let n = self.node(node);
+        let def_name = n.and_then(|n| lib.find(&n.def)).map_or("Node".to_string(), |d| d.name.clone());
+        let default = n.and_then(|n| lib.value(n, name));
+        let mut label = format!("{def_name} {}", name.replace('_', " "));
+        let mut k = 2;
+        while self.params.iter().any(|p| p.name == label) {
+            label = format!("{def_name} {} {k}", name.replace('_', " "));
+            k += 1;
+        }
+        self.params.push(GraphParam { name: label, group: String::new(), binds: vec![(node, name.to_string())], default });
+        self.params.len() - 1
+    }
+
+    /// Makes graph parameter `index` also set `node`'s parameter `name`
+    /// (taking it from any other graph parameter).
+    pub fn bind(&mut self, index: usize, node: u64, name: &str, lib: &Library) {
+        self.unbind(node, name);
+        let Some(p) = self.params.get_mut(index) else { return };
+        p.binds.push((node, name.to_string()));
+        // The new node follows the parameter's value.
+        if let Some((_, v)) = self.param_value(index, lib) {
+            self.set_param(index, v, lib);
+        }
+    }
+
+    /// Stops any graph parameter setting `node`'s parameter `name`; a
+    /// parameter left with nothing to set goes away.
+    pub fn unbind(&mut self, node: u64, name: &str) {
+        for p in &mut self.params {
+            p.binds.retain(|(n, k)| !(*n == node && k == name));
+        }
+        self.params.retain(|p| !p.binds.is_empty());
+    }
+
+    /// The definition and current value of graph parameter `index` (from
+    /// the first node parameter it sets that still exists).
+    pub fn param_value(&self, index: usize, lib: &Library) -> Option<(def::Param, Value)> {
+        self.params.get(index)?.binds.iter().find_map(|(nid, name)| {
+            let node = self.node(*nid)?;
+            let p = lib.find(&node.def)?.params.iter().find(|p| &p.name == name)?.clone();
+            let v = lib.value(node, name)?;
+            Some((p, v))
+        })
+    }
+
+    /// Sets graph parameter `index`: every node parameter it drives that
+    /// takes this kind of value (numbers clamped to each one's range).
+    pub fn set_param(&mut self, index: usize, v: Value, lib: &Library) {
+        let Some(p) = self.params.get(index) else { return };
+        for (nid, name) in p.binds.clone() {
+            let Some(node) = self.node_mut(nid) else { continue };
+            let Some(param) = lib.find(&node.def).and_then(|d| d.params.iter().find(|q| q.name == name)) else { continue };
+            if std::mem::discriminant(&param.default) != std::mem::discriminant(&v) {
+                continue;
+            }
+            let v = match (&param.kind, &v) {
+                (ParamKind::Float { min, max }, Value::Float(f)) => Value::Float(f.clamp(min.min(*max), max.max(*min))),
+                (ParamKind::Int { min, max }, Value::Int(i)) => Value::Int(*i.clamp(min.min(max), max.max(min))),
+                (ParamKind::Enum(opts), Value::Enum(i)) => Value::Enum((*i).min(opts.len().saturating_sub(1))),
+                _ => v.clone(),
+            };
+            node.params.insert(name, v);
+        }
     }
 
     /// A starter graph: noise through a gradient map into base color, and
@@ -83,10 +231,15 @@ impl Graph {
 
     pub fn remove(&mut self, id: u64) {
         self.nodes.retain(|n| n.id != id);
-        self.exposed.retain(|(n, _)| *n != id);
+        for p in &mut self.params {
+            p.binds.retain(|(n, _)| *n != id);
+        }
+        self.params.retain(|p| !p.binds.is_empty());
         for n in &mut self.nodes {
             n.links.retain(|_, from| *from != id);
         }
+        // A mask source keeps its tag: the mask graph stays the layer's.
+        self.tags.retain(|t| t.node != id || matches!(t.role, Role::Source(_)));
     }
 
     /// Whether `to` feeds `from`, directly or not (a link from `from` to
@@ -148,8 +301,8 @@ impl Graph {
     }
 
     /// The Output node feeding each usage (the first one, if several do).
-    pub fn outputs(&self, lib: &Library) -> [Option<u64>; 5] {
-        let mut out = [None; 5];
+    pub fn outputs(&self, lib: &Library) -> [Option<u64>; USAGES.len()] {
+        let mut out = [None; USAGES.len()];
         for n in self.nodes.iter().filter(|n| n.def == OUTPUT_DEF) {
             let usage = match lib.value(n, "usage") {
                 Some(Value::Enum(i)) => i,
@@ -180,8 +333,35 @@ impl Graph {
                 json!({"id": n.id, "def": n.def, "pos": n.pos, "params": params, "links": links})
             })
             .collect();
-        let exposed: Vec<Json> = self.exposed.iter().map(|(n, p)| json!([n, p])).collect();
-        json!({"name": self.name, "res": self.res, "next_id": self.next_id, "nodes": nodes, "exposed": exposed})
+        let params: Vec<Json> = self
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let binds: Vec<Json> = p.binds.iter().map(|(n, k)| json!([n, k])).collect();
+                let kind = self.param_value(i, lib).map(|(d, _)| d.kind);
+                let default = p.default.as_ref().map_or(Json::Null, |v| value_json(v, kind.as_ref()));
+                json!({"name": p.name, "group": p.group, "binds": binds, "default": default})
+            })
+            .collect();
+        let tags: Vec<Json> = self
+            .tags
+            .iter()
+            .map(|t| {
+                let (role, i) = match t.role {
+                    Role::Mask => ("mask", 0),
+                    Role::Channel(c) => ("channel", c as u64),
+                    Role::Output(u) => ("output", u as u64),
+                    Role::Source(d) => ("source", d),
+                };
+                json!({"node": t.node, "layer": t.layer, "role": role, "i": i})
+            })
+            .collect();
+        let mut out = json!({"name": self.name, "res": self.res, "match_set": self.match_set, "next_id": self.next_id, "nodes": nodes, "params": params});
+        if !tags.is_empty() {
+            out["tags"] = json!(tags);
+        }
+        out
     }
 
     /// Reads a graph; parameters are typed by the definitions in `lib`
@@ -189,6 +369,7 @@ impl Graph {
     pub fn from_json(v: &Json, lib: &Library) -> Result<Graph, String> {
         let mut g = Graph::new(v["name"].as_str().unwrap_or("Graph"));
         g.res = v["res"].as_u64().map_or(1024, |r| (r as u32).clamp(64, 4096));
+        g.match_set = v["match_set"].as_bool().unwrap_or(false);
         for n in v["nodes"].as_array().ok_or("graph has no nodes list")? {
             let id = n["id"].as_u64().ok_or("node without id")?;
             let def = n["def"].as_str().ok_or("node without def")?.to_string();
@@ -210,9 +391,39 @@ impl Graph {
             g.nodes.push(Node { id, def, pos, params, links });
         }
         g.next_id = g.next_id.max(v["next_id"].as_u64().unwrap_or(1));
+        let pair = |e: &Json| Some((e[0].as_u64()?, e[1].as_str()?.to_string()));
+        for p in v["params"].as_array().into_iter().flatten() {
+            let binds: Vec<(u64, String)> = p["binds"].as_array().into_iter().flatten().filter_map(pair).collect();
+            if binds.is_empty() {
+                continue;
+            }
+            let kind = binds.iter().find_map(|(n, k)| {
+                let node = g.node(*n)?;
+                Some(lib.find(&node.def)?.params.iter().find(|q| &q.name == k)?.kind.clone())
+            });
+            let default = kind.and_then(|k| json_value(&p["default"], &k));
+            g.params.push(GraphParam {
+                name: p["name"].as_str().unwrap_or("Parameter").to_string(),
+                group: p["group"].as_str().unwrap_or("").to_string(),
+                binds,
+                default,
+            });
+        }
+        for t in v["tags"].as_array().into_iter().flatten() {
+            let (Some(node), Some(layer), i) = (t["node"].as_u64(), t["layer"].as_u64(), t["i"].as_u64().unwrap_or(0)) else { continue };
+            let role = match t["role"].as_str() {
+                Some("mask") => Role::Mask,
+                Some("channel") => Role::Channel(i as usize),
+                Some("output") => Role::Output(i as usize),
+                Some("source") => Role::Source(i),
+                _ => continue,
+            };
+            g.tags.push(Tag { node, layer, role });
+        }
+        // Graphs from before named parameters: one per exposed node parameter.
         for e in v["exposed"].as_array().into_iter().flatten() {
-            if let (Some(n), Some(p)) = (e[0].as_u64(), e[1].as_str()) {
-                g.exposed.push((n, p.to_string()));
+            if let Some((n, k)) = pair(e) {
+                g.expose(n, &k, lib);
             }
         }
         Ok(g)
@@ -327,7 +538,7 @@ impl Library {
 
     /// Categories in display order, each with its node ids.
     pub fn categories(&self) -> Vec<(String, Vec<String>)> {
-        let order = ["Generators", "Adjust", "Blend", "Filters", "Inputs", "Outputs"];
+        let order = ["Generators", "Material", "Adjust", "Blend", "Filters", "Inputs", "Outputs"];
         let mut cats: Vec<(String, Vec<String>)> = Vec::new();
         for d in &self.defs {
             match cats.iter_mut().find(|(c, _)| *c == d.category) {
@@ -383,6 +594,46 @@ mod tests {
                 assert!(order.iter().position(|i| i == from).unwrap() < at);
             }
         }
+    }
+
+    #[test]
+    fn graph_parameters_drive_several_nodes_and_round_trip() {
+        let lib = Library::load(None);
+        let mut g = Graph::new("Params");
+        let a = g.add("levels", [0.0; 2]);
+        let b = g.add("histogram_scan", [0.0; 2]);
+        let i = g.expose(a, "out_low", &lib);
+        assert_eq!(g.params[i].name, "Levels out low");
+        assert_eq!(g.expose(a, "out_low", &lib), i, "already exposed");
+        g.bind(i, b, "position", &lib);
+        g.params[i].name = "Wear".into();
+        g.params[i].group = "Wear".into();
+        g.set_param(i, Value::Float(0.3), &lib);
+        assert_eq!(lib.value(g.node(a).unwrap(), "out_low"), Some(Value::Float(0.3)));
+        assert_eq!(lib.value(g.node(b).unwrap(), "position"), Some(Value::Float(0.3)));
+        assert_eq!(g.param_of(b, "position"), Some(i));
+        // A different kind of value leaves other kinds alone.
+        let c = g.add("noise", [0.0; 2]);
+        g.bind(i, c, "seed", &lib);
+        g.set_param(i, Value::Float(0.6), &lib);
+        assert_ne!(lib.value(g.node(c).unwrap(), "seed"), Some(Value::Float(0.6)));
+
+        let back = Graph::from_json(&g.to_json(&lib), &lib).unwrap();
+        assert_eq!(back.params, g.params);
+        // Removing the nodes removes the parameter.
+        let mut h = back.clone();
+        h.remove(a);
+        h.remove(b);
+        h.remove(c);
+        assert!(h.params.is_empty());
+
+        // An old graph's exposed parameters become graph parameters.
+        let mut old = g.to_json(&lib);
+        old["params"] = json!([]);
+        old["exposed"] = json!([[a, "out_low"]]);
+        let o = Graph::from_json(&old, &lib).unwrap();
+        assert_eq!(o.params.len(), 1);
+        assert_eq!(o.params[0].binds, vec![(a, "out_low".to_string())]);
     }
 
     #[test]

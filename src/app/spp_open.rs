@@ -84,7 +84,7 @@ fn blend_of(mode: i32) -> Option<Blend> {
 /// A fill from a layer's uniform sources (`None` when it has none), and whether other sources
 /// (images, procedural materials) were left out.
 fn fill_of(l: &LayerInfo) -> Option<(FillParams, bool)> {
-    let mut mat = MatValues { enabled: [false; 4], ..MatValues::default() };
+    let mut mat = MatValues { enabled: [false; crate::engine::CHANNELS], ..MatValues::default() };
     let mut partial = false;
     for s in &l.sources {
         match s {
@@ -217,7 +217,8 @@ impl PainterApp {
         let Imported { mesh, sets, came, left } = imported;
         self.graphs.clear(&self.rs);
         self.apply_project_defaults();
-        self.load_mesh(mesh, ctx);
+        let sizes: Vec<u32> = sets.iter().map(|s| s.resolution).collect();
+        self.load_mesh_sized(mesh, ctx, &sizes);
         let mut stack = Rebuilt::default();
         for (k, set) in sets.into_iter().enumerate() {
             self.switch_set(k);

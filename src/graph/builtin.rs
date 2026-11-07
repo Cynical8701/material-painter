@@ -2,6 +2,7 @@
 
 pub const BUILTIN: &[(&str, &str)] = &[
     ("color", include_str!("nodes/color.wgsl")),
+    ("value", include_str!("nodes/value.wgsl")),
     ("gradient", include_str!("nodes/gradient.wgsl")),
     ("noise", include_str!("nodes/noise.wgsl")),
     ("directional_noise", include_str!("nodes/directional_noise.wgsl")),
@@ -30,6 +31,8 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("transform", include_str!("nodes/transform.wgsl")),
     ("bitmap", include_str!("nodes/bitmap.wgsl")),
     ("mesh_map", include_str!("nodes/mesh_map.wgsl")),
+    ("smart_mask", include_str!("nodes/smart_mask.wgsl")),
+    ("layer", include_str!("nodes/layer.wgsl")),
     ("output", include_str!("nodes/output.wgsl")),
     // Shading nodes: steps of a preview shader (graph::shading).
     ("shade_base_color", include_str!("nodes/shading/base_color.wgsl")),

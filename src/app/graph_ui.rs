@@ -25,6 +25,12 @@ pub(super) struct GraphDoc {
     maps_seen: u64,
     /// A preview shader's graph (shading nodes), not a texture graph.
     pub shading: bool,
+    /// Last evaluated without the editor showing it: only the outputs kept
+    /// their textures (the editor's thumbnails need a new evaluation).
+    lean: bool,
+    /// A folder's live graph as last brought in line with its layers: what
+    /// differs since are the artist's edits.
+    pub(super) seen: Option<Graph>,
 }
 
 /// The floating add-node menu: where it opened (canvas units and screen)
@@ -91,6 +97,8 @@ pub(super) struct GraphStore {
     /// Keeps the user node folder watched; changes arrive on `changes`.
     _watcher: Option<notify::RecommendedWatcher>,
     changes: Option<mpsc::Receiver<()>>,
+    /// Repaints when a graph's image has been decoded.
+    repaint: egui::Context,
 }
 
 fn graphs_dir() -> Option<PathBuf> {
@@ -149,6 +157,7 @@ impl GraphStore {
             gallery: Default::default(),
             _watcher: watcher,
             changes,
+            repaint: ctx.clone(),
         };
         store.reload_shelf(ctx);
         store
@@ -185,9 +194,11 @@ impl GraphStore {
     pub fn insert(&mut self, rs: &eframe::egui_wgpu::RenderState, graph: Graph, id: Option<u64>) -> u64 {
         let id = id.unwrap_or(self.next_id);
         self.next_id = self.next_id.max(id + 1);
-        let rt = Runtime::new(&rs.device, &rs.queue);
+        let mut rt = Runtime::new(&rs.device, &rs.queue);
+        let ctx = self.repaint.clone();
+        rt.set_waker(Arc::new(move || ctx.request_repaint()));
         let shading = graph::shading::is_shading(&graph, &self.lib);
-        self.docs.push(GraphDoc { id, graph, rt, dirty: true, push: true, maps_seen: u64::MAX, shading });
+        self.docs.push(GraphDoc { id, graph, rt, dirty: true, push: true, maps_seen: u64::MAX, shading, lean: false, seen: None });
         id
     }
 
@@ -219,6 +230,7 @@ impl GraphStore {
 fn mask_starter(res: u32) -> Graph {
     let mut g = Graph::new("Mask graph");
     g.res = res;
+    g.match_set = true;
     let map = g.add("mesh_map", [0.0, 0.0]);
     let scan = g.add("histogram_scan", [220.0, 0.0]);
     let out = g.add("output", [440.0, 0.0]);
@@ -431,6 +443,7 @@ impl PainterApp {
     /// Evaluates the graphs that are shown or used and pushes changed
     /// outputs into their layers. Runs once a frame, before compositing.
     pub(super) fn update_graphs(&mut self) {
+        self.sync_folder_graphs();
         if let Some(rx) = &self.graphs.changes {
             if rx.try_iter().count() > 0 {
                 self.graphs.lib.reload_user();
@@ -455,13 +468,24 @@ impl PainterApp {
             if d.shading {
                 continue;
             }
-            if d.dirty || d.maps_seen != maps_version {
+            // Images decoded since: the nodes waiting for them render now.
+            if d.rt.take_images(&self.rs.device, &self.rs.queue) {
+                d.dirty = true;
+            }
+            if d.graph.match_set && d.graph.res != self.engine.res {
+                d.graph.res = self.engine.res;
+                d.dirty = true;
+            }
+            if d.dirty || d.maps_seen != maps_version || (d.lean && shown) {
                 let engine = &self.engine;
                 let maps = |m: usize| engine.mesh_map(m);
-                if d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, &self.graphs.lib, &maps, maps_version) {
+                let surface = engine.graph_surface();
+                let lean = !shown;
+                if d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, &self.graphs.lib, &maps, Some(&surface), maps_version, lean) {
                     d.push = true;
                 }
                 d.dirty = false;
+                d.lean = lean;
                 d.maps_seen = maps_version;
             }
             if d.push && in_use {
@@ -486,15 +510,19 @@ impl PainterApp {
                 let Some(id) = f.graph.filter(|_| l.images.iter().all(Option::is_none)) else { continue };
                 let Some(d) = docs.iter_mut().find(|d| d.id == id && !d.shading) else { continue };
                 let version = engine.maps_version;
+                if d.graph.match_set {
+                    d.graph.res = engine.res;
+                }
                 {
                     let maps = |m: usize| engine.mesh_map(m);
-                    d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, lib, &maps, version);
+                    let surface = engine.graph_surface();
+                    d.rt.evaluate(&self.rs.device, &self.rs.queue, &d.graph, lib, &maps, Some(&surface), version, true);
                 }
                 // The edited set's outputs are made again on its own maps.
                 d.maps_seen = u64::MAX;
-                let outs: [Option<Arc<Tex>>; 5] = d.graph.outputs(lib).map(|o| o.and_then(|n| d.rt.output(n).cloned()));
+                let outs: [Option<Arc<Tex>>; graph::USAGES.len()] = d.graph.outputs(lib).map(|o| o.and_then(|n| d.rt.output(n).cloned()));
                 let name = d.graph.name.clone();
-                engine.set_graph_images(li, [outs[0].clone(), outs[1].clone(), outs[2].clone(), outs[3].clone()], &name);
+                engine.set_graph_images(li, graph::channel_outputs(&outs), &name);
             }
         }
     }
@@ -502,16 +530,16 @@ impl PainterApp {
     /// Sends a graph's outputs to the fill layers and masks that use it.
     fn push_graph(&mut self, i: usize) {
         let d = &self.graphs.docs[i];
-        let outs: [Option<Arc<Tex>>; 5] = d.graph.outputs(&self.graphs.lib).map(|o| o.and_then(|n| d.rt.output(n).cloned()));
+        let outs: [Option<Arc<Tex>>; graph::USAGES.len()] = d.graph.outputs(&self.graphs.lib).map(|o| o.and_then(|n| d.rt.output(n).cloned()));
         let (id, name) = (d.id, d.graph.name.clone());
         for li in 0..self.engine.layers.len() {
             let l = &self.engine.layers[li];
             let (fill, mask) = (matches!(&l.content, Content::Fill(f) if f.graph == Some(id)), l.mask.as_ref().is_some_and(|m| m.graph == Some(id)));
             if fill {
-                self.engine.set_graph_images(li, [outs[0].clone(), outs[1].clone(), outs[2].clone(), outs[3].clone()], &name);
+                self.engine.set_graph_images(li, graph::channel_outputs(&outs), &name);
             }
             if mask {
-                if let Some(t) = outs[4].as_ref().or(outs[0].as_ref()) {
+                if let Some(t) = outs[graph::MASK_USAGE].as_ref().or(outs[0].as_ref()) {
                     self.engine.set_graph_mask(li, t);
                 }
             }
@@ -519,29 +547,116 @@ impl PainterApp {
         self.graphs.docs[i].push = false;
     }
 
-    /// The graph's exposed parameters as controls (layer properties).
+    /// The graph's parameters as controls, under their group headings
+    /// (layer properties).
     pub(super) fn exposed_controls(&mut self, ui: &mut egui::Ui, id: u64) {
         let custom = self.bake_settings.custom.clone();
         let lib = &self.graphs.lib;
         let Some(d) = self.graphs.docs.iter_mut().find(|d| d.id == id) else { return };
-        if d.graph.exposed.is_empty() {
-            ui.label(egui::RichText::new("Tip: mark parameters with ◇ in the Material Designer to tweak them here.").small().color(theme::TEXT_DIM));
+        if d.graph.params.is_empty() {
+            ui.label(egui::RichText::new("Tip: mark node settings with ◇ in the Material Designer to tweak them here.").small().color(theme::TEXT_DIM));
             return;
         }
-        let mut changed = false;
-        for (nid, name) in d.graph.exposed.clone() {
-            let Some(node) = d.graph.nodes.iter_mut().find(|n| n.id == nid) else { continue };
-            let Some(def) = lib.find(&node.def) else { continue };
-            let Some(p) = def.params.iter().find(|p| p.name == name) else { continue };
-            let mut v = lib.value(node, &name).unwrap_or_else(|| p.default.clone());
-            let label = format!("{} {}", def.name, name.replace('_', " "));
-            if labeled(ui, &label, |ui| param_widget(ui, p, &mut v, nid, &custom)) {
-                node.params.insert(name.clone(), v);
-                changed = true;
+        // Groups in the order their first parameter comes.
+        let mut groups: Vec<&str> = Vec::new();
+        for p in &d.graph.params {
+            if !groups.contains(&p.group.as_str()) {
+                groups.push(&p.group);
             }
         }
-        if changed {
+        let groups: Vec<String> = groups.into_iter().map(str::to_string).collect();
+        let mut set: Option<(usize, Value)> = None;
+        for group in &groups {
+            let mut rows = |ui: &mut egui::Ui| {
+                for i in (0..d.graph.params.len()).filter(|&i| &d.graph.params[i].group == group) {
+                    let Some((p, mut v)) = d.graph.param_value(i, lib) else { continue };
+                    let gp = &d.graph.params[i];
+                    let changed = labeled(ui, &gp.name, |ui| {
+                        let mut ch = param_widget(ui, &p, &mut v, id ^ (i as u64) << 32, &custom);
+                        if let Some(def) = gp.default.as_ref().filter(|def| **def != v) {
+                            if ui.small_button("⟲").on_hover_text("Back to the material's value").clicked() {
+                                v = def.clone();
+                                ch = true;
+                            }
+                        }
+                        ch
+                    });
+                    if changed {
+                        set = Some((i, v));
+                    }
+                }
+            };
+            if group.is_empty() {
+                rows(ui);
+            } else {
+                egui::CollapsingHeader::new(egui::RichText::new(group).strong()).id_salt(("graph group", id, group.as_str())).default_open(true).show(ui, rows);
+            }
+        }
+        if let Some((i, v)) = set {
+            d.graph.set_param(i, v, lib);
             d.dirty = true;
+        }
+    }
+
+    /// The open graph's parameters: rename, group, see what they drive,
+    /// remove (Node pane).
+    fn graph_params_panel(&mut self, ui: &mut egui::Ui, doc: u64) {
+        let lib = &self.graphs.lib;
+        let Some(d) = self.graphs.docs.iter_mut().find(|d| d.id == doc) else { return };
+        section(ui, "Material parameters");
+        if d.graph.params.is_empty() {
+            ui.label(
+                egui::RichText::new("None yet. Click ◇ next to a node setting to show it in the layer properties under a name of your choice; several settings can share one parameter.")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+            return;
+        }
+        let mut remove = None;
+        let mut select = None;
+        let mut move_up = None;
+        for i in 0..d.graph.params.len() {
+            let drives: Vec<(u64, String)> = d.graph.params[i]
+                .binds
+                .iter()
+                .map(|(n, k)| {
+                    let node = d.graph.node(*n).and_then(|n| lib.find(&n.def)).map_or("?".to_string(), |def| def.name.clone());
+                    (*n, format!("{node} · {}", k.replace('_', " ")))
+                })
+                .collect();
+            let p = &mut d.graph.params[i];
+            ui.push_id(("graph param", i), |ui| {
+                theme::card(theme::WIDGET).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(ui.available_width() - 64.0)).on_hover_text("Its name in the layer properties");
+                        if ui.add_enabled(i > 0, egui::Button::new("▲").small()).on_hover_text("Show it earlier").clicked() {
+                            move_up = Some(i);
+                        }
+                        if ui.small_button("✕").on_hover_text("Remove the parameter (the nodes keep their values)").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Group").small().color(theme::TEXT_DIM));
+                        ui.add(egui::TextEdit::singleline(&mut p.group).hint_text("none").desired_width(ui.available_width()))
+                            .on_hover_text("Parameters with the same group show together under that heading");
+                    });
+                    for (n, what) in drives {
+                        if ui.add(egui::Label::new(egui::RichText::new(format!("→ {what}")).small().color(theme::TEXT_DIM)).sense(Sense::click())).on_hover_text("Select the node").clicked() {
+                            select = Some(n);
+                        }
+                    }
+                });
+            });
+        }
+        if let Some(i) = move_up {
+            d.graph.params.swap(i - 1, i);
+        }
+        if let Some(i) = remove {
+            d.graph.params.remove(i);
+        }
+        if let Some(n) = select {
+            self.graphs.editor.selected = Some(n);
         }
     }
 
@@ -567,6 +682,9 @@ impl PainterApp {
         let mut ids = Vec::new();
         for l in &self.engine.layers {
             if let Content::Fill(f) = &l.content {
+                ids.extend(f.graph);
+            }
+            if let Content::Folder(f) = &l.content {
                 ids.extend(f.graph);
             }
             ids.extend(l.mask.as_ref().and_then(|m| m.graph));
@@ -595,16 +713,37 @@ impl PainterApp {
 
     /// A fill layer driven by `graph` (the starter graph when `None`).
     pub(super) fn add_graph_layer(&mut self, graph: Option<Graph>, at: usize, parent: Option<u64>) {
-        let graph = graph.unwrap_or_else(|| Graph::starter("Graph material"));
+        let mut graph = graph.unwrap_or_else(|| Graph::starter("Graph material"));
+        graph.match_set = true;
+        graph.res = self.engine.res;
         let name = graph.name.clone();
         let outs = graph.outputs(&self.graphs.lib);
         let id = self.graphs.insert(&self.rs, graph, None);
         let mut fill = FillParams { graph: Some(id), ..FillParams::default() };
-        fill.mat.enabled = [outs[0].is_some(), outs[1].is_some(), outs[2].is_some(), outs[3].is_some()];
+        fill.mat.enabled = graph::channel_outputs(&outs).map(|o| o.is_some());
+        // An emission output is the emitted color itself: no tint.
+        fill.mat.emission = [1.0; 3];
         self.selected = self.engine.add_fill_layer(at, parent, name, fill, &mut self.undo);
         self.target = StrokeTarget::Content;
         self.open_graph(id);
         self.status = "Added a graph fill layer. Edit its graph in the Material Graph window.".into();
+    }
+
+    /// A smart material as one graph fill layer: its settings are the
+    /// layer's material parameters; its graph opens in the Material Designer
+    /// on request.
+    pub(super) fn add_smart_graph(&mut self, smart: &crate::presets::SmartMaterial, at: usize, parent: Option<u64>) {
+        let mut graph = graph::smart::graph(smart, &self.graphs.lib);
+        // As sharp as the texture set, following it when it's resized.
+        graph.match_set = true;
+        graph.res = self.engine.res;
+        let name = graph.name.clone();
+        let outs = graph.outputs(&self.graphs.lib);
+        let id = self.graphs.insert(&self.rs, graph, None);
+        let mut fill = FillParams { graph: Some(id), ..FillParams::default() };
+        fill.mat.enabled = graph::channel_outputs(&outs).map(|o| o.is_some());
+        self.selected = self.engine.add_fill_layer(at, parent, name, fill, &mut self.undo);
+        self.target = StrokeTarget::Content;
     }
 
     /// A mask on the selected layer, rendered by a new mask graph.
@@ -613,7 +752,7 @@ impl PainterApp {
         if idx >= self.engine.layers.len() || self.engine.layers[idx].mask.is_some() {
             return;
         }
-        let id = self.graphs.insert(&self.rs, mask_starter(self.engine.res.min(2048)), None);
+        let id = self.graphs.insert(&self.rs, mask_starter(self.engine.res), None);
         self.engine.add_mask(idx, true, None, &mut self.undo);
         if let Some(m) = self.engine.layers[idx].mask.as_mut() {
             m.graph = Some(id);
@@ -627,6 +766,10 @@ impl PainterApp {
     /// the mask is targeted).
     pub(super) fn edit_selected_graph(&mut self) {
         let Some(l) = self.engine.layers.get(self.selected) else { return };
+        if l.is_folder() {
+            self.open_folder_graph(self.selected);
+            return;
+        }
         let id = if self.target == StrokeTarget::Mask {
             l.mask.as_ref().and_then(|m| m.graph)
         } else {
@@ -691,7 +834,17 @@ impl PainterApp {
     /// The Node tab: the selected node's settings.
     pub(super) fn designer_settings_pane(&mut self, ui: &mut egui::Ui) {
         match self.designer_doc() {
-            Some(doc) => self.node_panel(ui, doc),
+            Some(doc) => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.node_panel(ui, doc);
+                    // A folder's graph is tuned through its layers.
+                    let folder = self.engine.layers.iter().any(|l| matches!(&l.content, Content::Folder(f) if f.graph == Some(doc)));
+                    if !folder {
+                        ui.add_space(10.0);
+                        self.graph_params_panel(ui, doc);
+                    }
+                });
+            }
             None => {
                 ui.label(egui::RichText::new("Pick a material on the start page, or open a graph from the toolbar.").color(theme::TEXT_DIM));
             }
@@ -797,15 +950,28 @@ impl PainterApp {
                 ui.label(egui::RichText::new("Preview shader: the 3D view uses it while you texture").color(theme::TEXT_DIM));
             }
             if let Some(id) = self.graphs.editor.doc.filter(|_| !shading) {
+                let res_now = self.engine.res;
                 if let Some(d) = self.graphs.doc_mut(id) {
                     ui.label(egui::RichText::new("Size").color(theme::TEXT_DIM));
-                    let before = d.graph.res;
-                    egui::ComboBox::from_id_salt("graph res").selected_text(format!("{}", d.graph.res)).width(70.0).show_ui(ui, |ui| {
+                    let before = (d.graph.res, d.graph.match_set);
+                    let text = if d.graph.match_set { format!("Texture set ({})", d.graph.res) } else { d.graph.res.to_string() };
+                    egui::ComboBox::from_id_salt("graph res").selected_text(text).width(120.0).show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(d.graph.match_set, "Texture set")
+                            .on_hover_text("Render at the texture set's resolution, following it when it changes")
+                            .clicked()
+                        {
+                            d.graph.match_set = true;
+                            d.graph.res = res_now;
+                        }
                         for r in [256, 512, 1024, 2048, 4096] {
-                            ui.selectable_value(&mut d.graph.res, r, r.to_string());
+                            if ui.selectable_label(!d.graph.match_set && d.graph.res == r, r.to_string()).clicked() {
+                                d.graph.match_set = false;
+                                d.graph.res = r;
+                            }
                         }
                     });
-                    if d.graph.res != before {
+                    if (d.graph.res, d.graph.match_set) != before {
                         d.dirty = true;
                     }
                 }
@@ -1030,7 +1196,7 @@ impl PainterApp {
             let t = theme::elided(&painter, &title, font(12.0), Color32::WHITE, head.width() - 26.0 * zoom);
             let title_cut = t.elided.then_some(title);
             painter.galley(head.left_center() + vec2(7.0 * zoom, -t.size().y * 0.5), t, Color32::WHITE);
-            if d.graph.exposed.iter().any(|(nid, _)| *nid == id) {
+            if d.graph.is_bound(id) {
                 painter.text(head.right_center() - vec2(7.0 * zoom, 0.0), egui::Align2::RIGHT_CENTER, "◆", font(10.0), Color32::from_rgb(255, 220, 120));
             }
             let border = if error.is_some() {
@@ -1197,7 +1363,10 @@ impl PainterApp {
             });
             if del && !e.multi.is_empty() {
                 for id in std::mem::take(&mut e.multi) {
-                    d.graph.remove(id);
+                    // A folder's layers are removed in the layer stack.
+                    if d.graph.tag_of(id).is_none() {
+                        d.graph.remove(id);
+                    }
                 }
                 e.selected = None;
                 changed = true;
@@ -1284,13 +1453,23 @@ impl PainterApp {
         let lib = &self.graphs.lib;
         let Some(d) = self.graphs.docs.iter_mut().find(|d| d.id == doc) else { return };
         let error = d.rt.errors.get(&sel).cloned();
-        let Some(node) = d.graph.nodes.iter_mut().find(|n| n.id == sel) else { return };
+        let Some(ni) = d.graph.nodes.iter().position(|n| n.id == sel) else { return };
+        let node = &d.graph.nodes[ni];
         let Some(def) = lib.find(&node.def) else {
             ui.label(egui::RichText::new(format!("Unknown node '{}'. Its file is missing or has errors.", node.def)).color(Color32::from_rgb(240, 120, 90)));
             return;
         };
         ui.label(egui::RichText::new(&def.name).heading().color(Color32::WHITE));
         ui.label(egui::RichText::new(format!("{} · {}", def.category, if def.id.starts_with("user/") { "custom node" } else { "built-in" })).small().color(theme::TEXT_DIM));
+        if let Some(t) = d.graph.tag_of(sel) {
+            let what = match t.role {
+                graph::Role::Mask => "its smart mask".to_string(),
+                graph::Role::Channel(k) => format!("its {}", ["base color", "roughness", "metallic", "height", "emission"].get(k).unwrap_or(&"channel")),
+                _ => "the folder's output".to_string(),
+            };
+            let layer = self.engine.layers.iter().find(|l| l.id == t.layer).map_or("the folder".to_string(), |l| format!("layer '{}'", l.name));
+            ui.label(egui::RichText::new(format!("Shows {what} of {layer}: changes here change the layer, and the other way round.")).small().color(theme::ACCENT));
+        }
         if !def.description.is_empty() {
             ui.label(egui::RichText::new(&def.description).color(theme::TEXT));
         }
@@ -1298,32 +1477,84 @@ impl PainterApp {
             ui.label(egui::RichText::new(e).color(Color32::from_rgb(240, 120, 90)).monospace().small());
         }
         let mut changed = false;
-        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 290.0).show(ui, |ui| {
+        // The pane scrolls as a whole (node settings, preview, material parameters).
+        ui.scope(|ui| {
             if !def.params.is_empty() {
                 section(ui, "Parameters");
             }
+            // What the ◇ menus asked for, done once the node isn't borrowed.
+            enum Bind {
+                New,
+                To(usize),
+                Off,
+            }
+            let mut bind: Option<(String, Bind)> = None;
             for p in &def.params {
-                let mut v = lib.value(node, &p.name).unwrap_or_else(|| p.default.clone());
+                let mut v = lib.value(&d.graph.nodes[ni], &p.name).unwrap_or_else(|| p.default.clone());
                 let label = p.name.replace('_', " ");
-                let exposed = d.graph.exposed.iter().any(|(n, name)| *n == sel && *name == p.name);
-                let mut toggle = false;
+                let bound = d.graph.param_of(sel, &p.name);
+                // Graph parameters this one could join: the same kind of value.
+                let joinable: Vec<(usize, String)> = d
+                    .graph
+                    .params
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, gp)| Some(*i) != bound && gp.binds.iter().any(|(n, k)| {
+                        d.graph.nodes.iter().find(|x| x.id == *n).and_then(|x| lib.find(&x.def)).and_then(|def| def.params.iter().find(|q| &q.name == k))
+                            .is_some_and(|q| std::mem::discriminant(&q.default) == std::mem::discriminant(&p.default))
+                    }))
+                    .map(|(i, gp)| (i, gp.name.clone()))
+                    .collect();
                 let c = labeled(ui, &label, |ui| {
-                    let star = egui::RichText::new(if exposed { "◆" } else { "◇" }).color(if exposed { Color32::from_rgb(255, 220, 120) } else { theme::TEXT_DIM });
-                    toggle = ui.add(egui::Button::new(star).frame(false)).on_hover_text("Show this parameter in the layer properties (Material Paint)").clicked();
+                    let star = egui::RichText::new(if bound.is_some() { "◆" } else { "◇" })
+                        .color(if bound.is_some() { Color32::from_rgb(255, 220, 120) } else { theme::TEXT_DIM });
+                    let tip = match bound {
+                        Some(i) => format!("Set by the material parameter \"{}\"", d.graph.params[i].name),
+                        None => "Show this setting in the layer properties (Material Paint)".to_string(),
+                    };
+                    ui.menu_button(star, |ui| {
+                        if let Some(i) = bound {
+                            ui.label(egui::RichText::new(format!("Set by \"{}\"", d.graph.params[i].name)).small().color(theme::TEXT_DIM));
+                            if ui.button("Stop showing it").clicked() {
+                                bind = Some((p.name.clone(), Bind::Off));
+                            }
+                        } else if ui.button("Show as a new parameter").clicked() {
+                            bind = Some((p.name.clone(), Bind::New));
+                        }
+                        if !joinable.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Let a parameter set it too").small().color(theme::TEXT_DIM));
+                            for (i, name) in &joinable {
+                                if ui.button(name).clicked() {
+                                    bind = Some((p.name.clone(), Bind::To(*i)));
+                                }
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(tip);
                     param_widget(ui, p, &mut v, sel, &custom)
                 });
-                if toggle {
-                    if exposed {
-                        d.graph.exposed.retain(|(n, name)| !(*n == sel && *name == p.name));
-                    } else {
-                        d.graph.exposed.push((sel, p.name.clone()));
+                if c {
+                    d.graph.nodes[ni].params.insert(p.name.clone(), v.clone());
+                    changed = true;
+                    // The parameter's other nodes follow.
+                    if let Some(i) = bound {
+                        d.graph.set_param(i, v, lib);
                     }
                 }
-                if c {
-                    node.params.insert(p.name.clone(), v);
-                    changed = true;
-                }
             }
+            if let Some((name, b)) = bind {
+                match b {
+                    Bind::New => {
+                        d.graph.expose(sel, &name, lib);
+                    }
+                    Bind::To(i) => d.graph.bind(i, sel, &name, lib),
+                    Bind::Off => d.graph.unbind(sel, &name),
+                }
+                changed = true;
+            }
+            let node = &mut d.graph.nodes[ni];
             if !def.inputs.is_empty() {
                 section(ui, "Inputs");
                 for inp in &def.inputs {

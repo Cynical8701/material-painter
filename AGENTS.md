@@ -30,8 +30,10 @@ offscreen with egui_kittest into `target/bake_test/ui/`.
 |---|---|
 | `src/main.rs` | Entry point, window options, panic hook (`crash.rs`) |
 | `src/app.rs` + `src/app/` | The UI shell: workspaces (Material Paint, Material Designer, Shader Maker), docking (`dock.rs`), panels, input, actions (`Action` enum, processed once per frame), projects (`project_io.rs`), preferences, export window, welcome window |
-| `src/engine.rs` | One texture set: layer stack (paint, fill, folder), masks and mask filters, GPU painting and compositing, undo hooks |
-| `src/app/texture_sets.rs` | Texture sets: one `Engine` per material of the mesh (`Mesh::sets`); the edited one is `PainterApp::engine`, the others are parked. Views, bakes, export and projects cover every set |
+| `src/engine.rs` | One texture set: layer stack (paint, fill, folder), masks and mask filters, GPU painting and compositing, undo hooks. Eight paint channels (`CHANNELS`): opacity (`OPACITY`) composites into the final base color's alpha; normal (`NORMAL`) holds tangent-space detail that each layer adds to the stack below (fill normal-map images projected in world space go through the baked tangent map); specular (`SPECULAR`) is the specular level of non-metals (0.5: 4%) |
+| `src/app/texture_sets.rs` | Texture sets: one `Engine` per material of the mesh (`Mesh::sets`); the edited one is `PainterApp::engine`, the others are parked. Views, bakes, export and projects cover every set. Hiding a set rebuilds the picking BVH without it; highlights ride in the view globals (`SetLook`) |
+| `src/cage.rs`, `src/app/cage_paint.rs` | The bake cage: projection directions (averaged over split vertices), the probe behind the live cage preview, Auto-fix, and the cage brush (`BakeSettings::cage_paint`, a front/rear multiplier per vertex) |
+| `src/polyfill.rs` | Polygon fill selection: triangles, quads, face loops, flat areas, parts, objects, UV islands, texture sets; lasso test |
 | `src/bake.rs` | Mesh-map baking: CPU scene prep on a worker thread, then GPU passes pumped a few tiles per frame |
 | `src/bake_cache.rs` | On-disk cache of baked maps, keyed by mesh, settings and the bake code itself |
 | `src/viewport.rs`, `src/post.rs`, `src/raytrace.rs` | 3D and 2D view rendering, post-processing, path-traced preview |

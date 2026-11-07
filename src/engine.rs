@@ -2,8 +2,18 @@
 //!
 //! Memory model:
 //! * Paint layers allocate a channel texture only once that channel is painted,
-//!   and each channel uses its own compact format (RGBA8 color, RG8 roughness and
-//!   metallic, RG16F height; the second component is the channel's coverage).
+//!   and each channel uses its own compact format (RGBA8 color, RG8 roughness,
+//!   metallic and opacity, RG16F height; the second component is the channel's
+//!   coverage).
+//! * Opacity composites into the base color's alpha: the final color texture
+//!   is RGB plus opacity (1, opaque, until a layer sets it).
+//! * Emission is an RGBA8 channel like base color (sRGB rgb, coverage); its
+//!   final texture is black until a layer emits.
+//! * Normal is an RGBA8 channel of tangent-space normals (encoded 0..1,
+//!   coverage); each layer's normals add detail to the ones below rather
+//!   than replacing them. Its final texture is flat until a layer sets it.
+//! * Specular is an RG8 channel like roughness: the specular level of
+//!   non-metals, 0.5 for the usual 4% reflectance.
 //! * Fill layers and mask generators are procedural: zero texture memory.
 //! * Stroke history lives compressed in system RAM (see `undo.rs`).
 
@@ -17,11 +27,33 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use wgpu::TextureFormat as F;
 
-pub const CH_NAMES: [&str; 4] = ["Base Color", "Roughness", "Metallic", "Height"];
-const PAINT_FORMATS: [F; 4] = [F::Rgba8Unorm, F::Rg8Unorm, F::Rg8Unorm, F::Rg16Float];
-const ACCUM_FORMATS: [F; 4] = [F::Rgba8Unorm, F::R8Unorm, F::R8Unorm, F::R16Float];
+/// Paint channels: base color, roughness, metallic, height, opacity,
+/// emission, normal, specular.
+pub const CHANNELS: usize = 8;
+/// The opacity channel (composited into the final base color's alpha).
+pub const OPACITY: usize = 4;
+/// The emission channel: light the surface gives off (sRGB color).
+pub const EMISSION: usize = 5;
+/// The normal channel: tangent-space normal detail (OpenGL convention, encoded 0..1).
+pub const NORMAL: usize = 6;
+/// The specular channel: specular level of non-metals (0.5: 4% reflectance).
+pub const SPECULAR: usize = 7;
+pub const CH_NAMES: [&str; CHANNELS] = ["Base Color", "Roughness", "Metallic", "Height", "Opacity", "Emission", "Normal", "Specular"];
+const PAINT_FORMATS: [F; CHANNELS] =
+    [F::Rgba8Unorm, F::Rg8Unorm, F::Rg8Unorm, F::Rg16Float, F::Rg8Unorm, F::Rgba8Unorm, F::Rgba8Unorm, F::Rg8Unorm];
+/// Final channels: color (+ opacity), roughness, metallic, height, emission, normal, specular.
+pub const ACCUM: usize = 7;
+/// The final emission texture's index (see [`Engine::final_tex`]).
+pub const FINAL_EMISSION: usize = 4;
+/// The final normal texture's index: tangent-space, encoded 0..1 (flat: 0.5, 0.5, 1).
+pub const FINAL_NORMAL: usize = 5;
+/// The final specular level's index (0.5 where no layer sets it).
+pub const FINAL_SPECULAR: usize = 6;
+const ACCUM_FORMATS: [F; ACCUM] = [F::Rgba8Unorm, F::R8Unorm, F::R8Unorm, F::R16Float, F::Rgba8Unorm, F::Rgba8Unorm, F::R8Unorm];
 const POS_FORMAT: F = F::Rgba16Float;
 const NRM_FORMAT: F = F::Rgba8Unorm;
+/// Tangent and bitangent sign per texel (see `uvbake.wgsl`).
+const TAN_FORMAT: F = F::Rgba8Unorm;
 const MASK_FORMAT: F = F::R8Unorm;
 /// Filtered masks keep 16 bits, so blur and levels don't band.
 const MASK_FILTER_FORMAT: F = F::R16Float;
@@ -92,20 +124,46 @@ impl Blend {
 /// Material values shared by the brush and fill layers. Color is sRGB.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct MatValues {
-    pub enabled: [bool; 4],
+    pub enabled: [bool; CHANNELS],
     pub color: [f32; 3],
     pub rough: f32,
     pub metal: f32,
     pub height: f32,
+    /// 1 opaque, 0 fully transparent.
+    pub opacity: f32,
+    /// Emitted light, sRGB (black: none).
+    pub emission: [f32; 3],
+    /// How strongly a normal-map image bends the surface (1: as authored).
+    /// Without an image the normal channel is flat and changes nothing.
+    pub normal: f32,
+    /// Specular level of non-metals: 0.5 is the usual 4% reflectance, 0
+    /// none, 1 twice as much.
+    pub specular: f32,
 }
 
 impl Default for MatValues {
     fn default() -> Self {
-        Self { enabled: [true, true, true, false], color: [0.8, 0.8, 0.8], rough: 0.5, metal: 0.0, height: 0.0 }
+        Self {
+            enabled: [true, true, true, false, false, false, false, false],
+            color: [0.8, 0.8, 0.8],
+            rough: 0.5,
+            metal: 0.0,
+            height: 0.0,
+            opacity: 1.0,
+            emission: [0.0; 3],
+            normal: 1.0,
+            specular: 0.5,
+        }
     }
 }
 
-/// Inputs a smart mask mixes, in the order `generator()` in composite.wgsl expects.
+/// Channel flags from the first four (base color, roughness, metallic,
+/// height): the later channels off, as everything made before they existed.
+pub fn channels4(c: [bool; 4]) -> [bool; CHANNELS] {
+    [c[0], c[1], c[2], c[3], false, false, false, false]
+}
+
+/// Inputs a smart mask mixes, in the order `mask_input()` in wear.wgsl expects.
 pub const GEN_INPUTS: [(&str, &str); GEN_INPUT_COUNT] = [
     ("Edges", "Within the edge width of a convex edge (baked edge distance)"),
     ("Convexity", "Convex curvature"),
@@ -126,9 +184,10 @@ pub const GEN_INPUTS: [(&str, &str); GEN_INPUT_COUNT] = [
     ("Wood grain", "Rings and fibers running along the planks (the long axis, vertical on end faces)"),
     ("Cells", "Distance to the nearest cell center: pits, hammer dents, leather pebbling, cracks (invert)"),
     ("Scratches", "Fine scratches in random directions"),
+    ("Front distance", "Angle from the model's front (+Z) around its center: 0 straight ahead, 1 behind. Rings for eyes, lenses, dials"),
 ];
 
-pub const GEN_INPUT_COUNT: usize = 19;
+pub const GEN_INPUT_COUNT: usize = 20;
 
 /// Custom bake maps one smart mask can mix (any of the project's, by id).
 pub const MAX_CUSTOM_INPUTS: usize = 4;
@@ -168,6 +227,16 @@ pub mod gin {
     pub const GRAIN: usize = 16;
     pub const CELLS: usize = 17;
     pub const SCRATCHES: usize = 18;
+    pub const FRONT: usize = 19;
+}
+
+/// Polygon fill triangles in UV space: the selected faces, and strips
+/// past their island borders that pad the seams (drawn only outside every
+/// island).
+#[derive(Default)]
+pub struct PolyGeometry {
+    pub faces: Vec<[f32; 2]>,
+    pub padding: Vec<[f32; 2]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -542,7 +611,7 @@ pub struct FillImage {
 const MAX_IMAGE: u32 = 4096;
 
 pub enum Content {
-    Paint([Option<Tex>; 4]),
+    Paint([Option<Tex>; CHANNELS]),
     Fill(FillParams),
     /// Groups the layers directly below it whose `parent` is this layer.
     Folder(Folder),
@@ -556,6 +625,8 @@ pub enum Content {
 pub struct Folder {
     /// Expanded in the layer stack (UI only).
     pub open: bool,
+    /// Its live graph (an app graph id): the fill layers inside as nodes.
+    pub graph: Option<u64>,
 }
 
 /// One step of compositing.
@@ -777,8 +848,8 @@ pub struct Layer {
     pub mask: Option<Mask>,
     /// The folder this layer is in. A folder's layers sit directly below it.
     pub parent: Option<u64>,
-    /// Fill layers: images replacing color, roughness, metallic, height.
-    pub images: [Option<FillImage>; 4],
+    /// Fill layers: images replacing color, roughness, metallic, height, opacity.
+    pub images: [Option<FillImage>; CHANNELS],
     /// egui handle of the color channel, used as the layer thumbnail.
     pub thumb: Option<egui::TextureId>,
 }
@@ -822,6 +893,11 @@ struct LayerUniform {
     gid: [f32; 4],
     gx: [f32; 4],
     img: [f32; 4],
+    /// Fill emission (sRGB rgb) and the emission channel's flag.
+    emis: [f32; 4],
+    /// Normal image strength, normal channel flag, fill specular level,
+    /// specular channel flag.
+    ns: [f32; 4],
 }
 
 #[repr(C)]
@@ -852,6 +928,11 @@ struct ApplyUniform {
     ch: [f32; 4],
     p: [f32; 4],
     g: [f32; 4],
+    /// Emission (sRGB rgb) and whether the stroke paints it.
+    e: [f32; 4],
+    /// Specular level, whether the stroke paints it, whether it paints the
+    /// normal channel (flat), unused.
+    s: [f32; 4],
 }
 
 /// What the brush deposits during a stroke.
@@ -878,6 +959,9 @@ struct Pipelines {
     stamp: wgpu::RenderPipeline,
     stamp_bgl: wgpu::BindGroupLayout,
     poly: wgpu::RenderPipeline,
+    /// Polygon fill padding: only where no UV island is (reads the position map).
+    poly_pad: wgpu::RenderPipeline,
+    poly_pad_bgl: wgpu::BindGroupLayout,
     apply_module: wgpu::ShaderModule,
     apply_layout: wgpu::PipelineLayout,
     apply_bgl: wgpu::BindGroupLayout,
@@ -901,7 +985,7 @@ pub struct Engine {
     repeat_sampler: wgpu::Sampler,
     /// The stack below each open faded/masked folder while its layers are
     /// composited, one set per nesting level; only allocated while needed.
-    folder_below: Vec<[Tex; 4]>,
+    folder_below: Vec<[Tex; ACCUM]>,
     rs: egui_wgpu::RenderState,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -913,10 +997,13 @@ pub struct Engine {
     tris: std::ops::Range<u32>,
     pos: Tex,
     nrm: Tex,
-    accum: [[Tex; 4]; 2],
+    /// Tangent frame per texel: fill normal-map images projected in world
+    /// space (tri-planar, planar) are turned into tangent space with it.
+    tan: Tex,
+    accum: [[Tex; ACCUM]; 2],
     final_idx: usize,
     stroke: Tex,
-    snap: [Option<Tex>; 4],
+    snap: [Option<Tex>; CHANNELS],
     snap_mask: Option<Tex>,
     /// Baked mesh maps as produced by the baker (see [`MAPS`]).
     maps: [Tex; MAP_TEXTURES],
@@ -972,7 +1059,7 @@ pub struct Engine {
     /// recomposite from that layer up.
     prefix: Option<Prefix>,
     /// Holds the stack below the painted layer when more passes follow it.
-    prefix_cache: Option<[Tex; 4]>,
+    prefix_cache: Option<[Tex; ACCUM]>,
     /// Filtered masks: per layer, the two textures its filter steps
     /// alternate between (the result is in one of them).
     mask_out: HashMap<u64, [Tex; 3]>,
@@ -986,7 +1073,7 @@ pub struct Engine {
     pub generation: u64,
 }
 
-fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; 4] {
+fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; ACCUM] {
     ACCUM_FORMATS.map(|f| Tex::new(device, label, res, res, f, LAYER_USAGE))
 }
 
@@ -1037,10 +1124,11 @@ impl Engine {
             rs: rs.clone(),
             pos: Tex::new(&device, "position map", res, res, POS_FORMAT, LAYER_USAGE),
             nrm: Tex::new(&device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE),
+            tan: Tex::new(&device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE),
             accum: [accum_set(&device, res, "accum A"), accum_set(&device, res, "accum B")],
             final_idx: 0,
             stroke: Tex::new(&device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE),
-            snap: [None, None, None, None],
+            snap: Default::default(),
             snap_mask: None,
             maps,
             custom: Vec::new(),
@@ -1133,14 +1221,14 @@ impl Engine {
                 module: &uv_module,
                 entry_point: Some("fs_uv"),
                 compilation_options: Default::default(),
-                targets: &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT)],
+                targets: &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT), gpu::target(TAN_FORMAT)],
             }),
             multiview_mask: None,
             cache: None,
         });
         let dilate_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dilate"),
-            entries: &[gpu::tex_entry(0, false), gpu::tex_entry(1, false)],
+            entries: &[gpu::tex_entry(0, false), gpu::tex_entry(1, false), gpu::tex_entry(2, false)],
         });
         let dilate = gpu::fullscreen_pipeline(
             device,
@@ -1148,7 +1236,7 @@ impl Engine {
             &uv_module,
             "fs_dilate",
             &gpu::layout(device, &dilate_bgl),
-            &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT)],
+            &[gpu::target(POS_FORMAT), gpu::target(NRM_FORMAT), gpu::target(TAN_FORMAT)],
         );
 
         // Brush stamping into the stroke mask.
@@ -1203,11 +1291,15 @@ impl Engine {
 
         // Polygon fill: selected triangles rasterized at their UVs into the stroke mask.
         let poly_module = gpu::shader(device, "poly fill", include_str!("shaders/poly.wgsl"));
-        let poly = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("poly fill"),
+        let poly_pad_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("poly padding"),
+            entries: &[gpu::tex_entry(0, false)],
+        });
+        let poly_pipeline = |label: &str, fs: &str, bgls: &[Option<&wgpu::BindGroupLayout>]| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[],
+                bind_group_layouts: bgls,
                 immediate_size: 0,
             })),
             vertex: wgpu::VertexState {
@@ -1225,13 +1317,15 @@ impl Engine {
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &poly_module,
-                entry_point: Some("fs_poly"),
+                entry_point: Some(fs),
                 compilation_options: Default::default(),
                 targets: &[gpu::target(STROKE_FORMAT)],
             }),
             multiview_mask: None,
             cache: None,
         });
+        let poly = poly_pipeline("poly fill", "fs_poly", &[]);
+        let poly_pad = poly_pipeline("poly padding", "fs_poly_pad", &[Some(&poly_pad_bgl)]);
 
         // Applying the stroke to layer channels / masks.
         let apply_module = gpu::shader(device, "apply", include_str!("shaders/apply.wgsl"));
@@ -1248,6 +1342,10 @@ impl Engine {
                 gpu::tex_entry(7, false),
                 gpu::tex_entry(8, true),
                 gpu::sampler_entry(9),
+                gpu::tex_entry(10, false),
+                gpu::tex_entry(11, false),
+                gpu::tex_entry(12, false),
+                gpu::tex_entry(13, false),
             ],
         });
         let apply_layout = gpu::layout(device, &apply_bgl);
@@ -1261,7 +1359,8 @@ impl Engine {
         );
 
         // Layer compositing.
-        let composite_module = gpu::shader(device, "composite", include_str!("shaders/composite.wgsl"));
+        let composite_module =
+            gpu::shader(device, "composite", concat!(include_str!("shaders/wear.wgsl"), include_str!("shaders/composite.wgsl")));
         let mut entries = vec![gpu::uniform_entry(0, true)];
         for b in 1..=11 {
             // Layer slots 5-8 also hold fill images, which are filtered.
@@ -1286,6 +1385,18 @@ impl Engine {
         }
         entries.push(gpu::sampler_entry(17));
         entries.push(gpu::sampler_entry(18));
+        // The layer's opacity channel (paint) or image (fill).
+        entries.push(gpu::tex_entry(19, true));
+        // The stack's emission so far, and the layer's emission (paint) or image (fill).
+        entries.push(gpu::tex_entry(20, false));
+        entries.push(gpu::tex_entry(21, true));
+        // Normal and specular: the stack's so far, and the layer's (paint or fill image).
+        entries.push(gpu::tex_entry(22, false));
+        entries.push(gpu::tex_entry(23, true));
+        entries.push(gpu::tex_entry(24, false));
+        entries.push(gpu::tex_entry(25, true));
+        // The tangent frame, for normal images projected in world space.
+        entries.push(gpu::tex_entry(26, false));
         let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite"),
             entries: &entries,
@@ -1387,6 +1498,8 @@ impl Engine {
             stamp,
             stamp_bgl,
             poly,
+            poly_pad,
+            poly_pad_bgl,
             apply_module,
             apply_layout,
             apply_bgl,
@@ -1416,39 +1529,49 @@ impl Engine {
         let device = &self.device;
         let tmp_pos = Tex::new(device, "dilate pos", self.res, self.res, POS_FORMAT, LAYER_USAGE);
         let tmp_nrm = Tex::new(device, "dilate nrm", self.res, self.res, NRM_FORMAT, LAYER_USAGE);
+        let tmp_tan = Tex::new(device, "dilate tan", self.res, self.res, TAN_FORMAT, LAYER_USAGE);
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
             let mut pass = gpu::pass(
                 &mut encoder,
                 "uv bake",
-                &[gpu::color_attachment(&self.pos.view, clear), gpu::color_attachment(&self.nrm.view, clear)],
+                &[
+                    gpu::color_attachment(&self.pos.view, clear),
+                    gpu::color_attachment(&self.nrm.view, clear),
+                    gpu::color_attachment(&self.tan.view, clear),
+                ],
             );
             pass.set_pipeline(&self.p.uvbake);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(tris, 0, 0..1);
         }
-        let bg = |src_pos: &Tex, src_nrm: &Tex| {
+        let bg = |src: [&Tex; 3]| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.p.dilate_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_pos.view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src_nrm.view) },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src[0].view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src[1].view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&src[2].view) },
                 ],
             })
         };
-        let forward = bg(&self.pos, &self.nrm);
-        let backward = bg(&tmp_pos, &tmp_nrm);
+        let forward = bg([&self.pos, &self.nrm, &self.tan]);
+        let backward = bg([&tmp_pos, &tmp_nrm, &tmp_tan]);
         for i in 0..DILATE_PASSES {
-            let (group, dst_pos, dst_nrm) =
-                if i % 2 == 0 { (&forward, &tmp_pos, &tmp_nrm) } else { (&backward, &self.pos, &self.nrm) };
+            let (group, dst) =
+                if i % 2 == 0 { (&forward, [&tmp_pos, &tmp_nrm, &tmp_tan]) } else { (&backward, [&self.pos, &self.nrm, &self.tan]) };
             let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
             let mut pass = gpu::pass(
                 &mut encoder,
                 "dilate",
-                &[gpu::color_attachment(&dst_pos.view, load), gpu::color_attachment(&dst_nrm.view, load)],
+                &[
+                    gpu::color_attachment(&dst[0].view, load),
+                    gpu::color_attachment(&dst[1].view, load),
+                    gpu::color_attachment(&dst[2].view, load),
+                ],
             );
             pass.set_pipeline(&self.p.dilate);
             pass.set_bind_group(0, group, &[]);
@@ -1637,11 +1760,14 @@ impl Engine {
 
     /// Fills a fill layer's image slots from a material graph's outputs
     /// (derived data: no history entry).
-    pub fn set_graph_images(&mut self, idx: usize, outputs: [Option<Arc<Tex>>; 4], name: &str) {
+    pub fn set_graph_images(&mut self, idx: usize, outputs: [Option<Arc<Tex>>; CHANNELS], name: &str) {
         let Some(layer) = self.layers.get_mut(idx) else { return };
-        layer.images = outputs.map(|o| {
-            o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()) })
-        });
+        // A channel the graph has no output for keeps the layer's value.
+        let mut images: [Option<FillImage>; CHANNELS] = Default::default();
+        for (slot, o) in images.iter_mut().zip(outputs) {
+            *slot = o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()) });
+        }
+        layer.images = images;
         self.mark_dirty();
     }
 
@@ -1757,6 +1883,19 @@ impl Engine {
         (&self.pos, &self.nrm)
     }
 
+    /// The mesh surface material graphs' surface nodes read.
+    pub fn graph_surface(&self) -> crate::graph::runtime::Surface<'_> {
+        let (lo, hi) = self.bounds;
+        crate::graph::runtime::Surface {
+            pos: &self.pos,
+            nrm: &self.nrm,
+            maps: [self.map_tex(0), self.map_tex(1), self.map_tex(2), self.map_tex(4)],
+            bmin: lo.to_array(),
+            bsize: (hi - lo).to_array(),
+            edge_max: self.edge_max,
+        }
+    }
+
     // ------------------------------------------------------------------ layers
 
     // ------------------------------------------------------------------ projects
@@ -1861,50 +2000,45 @@ impl Engine {
         Ok(FillImage { tex: Arc::new(tex), name, encoded })
     }
 
+    /// An image for fill channel `ch`. Opacity takes the image's alpha when
+    /// it has one (a cut-out: leaves, lace, decals), else its brightness.
+    pub fn decode_channel_image(&self, ch: usize, name: String, encoded: Arc<Vec<u8>>) -> Result<FillImage, String> {
+        if ch != OPACITY {
+            return self.decode_fill_image(name, encoded);
+        }
+        let img = image::load_from_memory(&encoded).map_err(|e| format!("can't read {name}: {e}"))?;
+        let gray = if img.color().has_alpha() {
+            let rgba = img.into_rgba8();
+            image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| image::Luma([rgba.get_pixel(x, y)[3]]))
+        } else {
+            img.into_luma8()
+        };
+        Ok(FillImage { tex: Arc::new(self.upload_mips(gray, F::R8Unorm)), name, encoded })
+    }
+
     fn upload_mips<P: image::Pixel<Subpixel = u8> + 'static>(&self, mut img: image::ImageBuffer<P, Vec<u8>>, format: F) -> Tex {
-        use image::imageops::FilterType;
         if img.width().max(img.height()) > MAX_IMAGE {
             let k = MAX_IMAGE as f32 / img.width().max(img.height()) as f32;
             let (w, h) = (((img.width() as f32 * k) as u32).max(1), ((img.height() as f32 * k) as u32).max(1));
-            img = image::imageops::resize(&img, w, h, FilterType::Triangle);
+            img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
         }
-        let (w, h) = img.dimensions();
-        let mips = w.max(h).ilog2() + 1;
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fill image"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let channels = P::CHANNEL_COUNT as u32;
-        let mut level = img;
-        for mip in 0..mips {
-            let (lw, lh) = level.dimensions();
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                &level,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(lw * channels), rows_per_image: None },
-                wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
-            );
-            if mip + 1 < mips {
-                level = image::imageops::resize(&level, (lw / 2).max(1), (lh / 2).max(1), FilterType::Triangle);
-            }
-        }
-        let view = texture.create_view(&Default::default());
-        Tex { texture, view, srgb_view: None, format, width: w, height: h, samples: 1 }
+        gpu::upload_mips(&self.device, &self.queue, img, format, "fill image")
     }
 
     /// Sets or clears the image on one channel of a fill layer, enabling the
     /// channel when an image is set; one undo step.
     pub fn set_fill_image(&mut self, idx: usize, ch: usize, image: Option<FillImage>, undo: &mut UndoStack) {
         let Some(layer) = self.layers.get(idx) else { return };
-        if !layer.is_fill() || ch >= 4 {
+        if !layer.is_fill() || ch >= CHANNELS {
             return;
         }
+        // Opacity reads the image's alpha (or brightness): decoded for that.
+        let image = match image {
+            Some(im) if ch == OPACITY && im.tex.format != F::R8Unorm && !im.encoded.is_empty() => {
+                self.decode_channel_image(ch, im.name.clone(), im.encoded.clone()).ok().or(Some(im))
+            }
+            other => other,
+        };
         let label = format!("Image on {}", layer.name);
         self.commit_props(undo);
         undo.begin_group(label.clone());
@@ -1914,6 +2048,10 @@ impl Engine {
             // A height image is scaled by the height value: start it as is.
             if ch == 3 && f.mat.height == 0.0 && layer.images[3].is_none() {
                 f.mat.height = 0.5;
+            }
+            // An emission image is tinted by the emission color: black would hide it.
+            if ch == EMISSION && f.mat.emission == [0.0; 3] {
+                f.mat.emission = [1.0; 3];
             }
         }
         let mut images = layer.images.clone();
@@ -1982,7 +2120,7 @@ impl Engine {
             visible: true,
             opacity: 1.0,
             blend: Blend::Normal,
-            content: Content::Folder(Folder { open: true }),
+            content: Content::Folder(Folder { open: true, graph: None }),
             mask: None,
             parent,
             images: Default::default(),
@@ -2047,7 +2185,7 @@ impl Engine {
             visible: true,
             opacity: 1.0,
             blend: Blend::Normal,
-            content: Content::Paint([None, None, None, None]),
+            content: Content::Paint(Default::default()),
             mask: None,
             parent,
             images: Default::default(),
@@ -2063,11 +2201,11 @@ impl Engine {
         at: usize,
         parent: Option<u64>,
         name: String,
-        channels: [Option<(u32, Vec<u8>)>; 4],
+        channels: [Option<(u32, Vec<u8>)>; CHANNELS],
         undo: &mut UndoStack,
     ) -> usize {
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let mut chans: [Option<Tex>; 4] = Default::default();
+        let mut chans: [Option<Tex>; CHANNELS] = Default::default();
         for (ch, data) in channels.into_iter().enumerate() {
             let Some((size, texels)) = data else { continue };
             let format = PAINT_FORMATS[ch];
@@ -2202,9 +2340,10 @@ impl Engine {
             n
         };
         let content = match &src.content {
-            Content::Paint(ch) => Content::Paint([0, 1, 2, 3].map(|i| ch[i].as_ref().map(|t| copy(&mut encoder, t)))),
+            Content::Paint(ch) => Content::Paint(std::array::from_fn(|i| ch[i].as_ref().map(|t| copy(&mut encoder, t)))),
             Content::Fill(f) => Content::Fill(*f),
-            Content::Folder(f) => Content::Folder(*f),
+            // A copy gets a live graph of its own when one is asked for.
+            Content::Folder(f) => Content::Folder(Folder { graph: None, ..*f }),
         };
         let mask = src.mask.as_ref().map(|m| Mask {
             paint: m.paint.as_ref().map(|t| copy(&mut encoder, t)),
@@ -2239,7 +2378,7 @@ impl Engine {
         self.commit_props(undo);
         let layer = &mut self.layers[idx];
         Self::release_thumb(&self.rs, layer);
-        let old = std::mem::replace(&mut layer.content, Content::Paint([None, None, None, None]));
+        let old = std::mem::replace(&mut layer.content, Content::Paint(Default::default()));
         let (id, label) = (layer.id, format!("Clear {}", layer.name));
         self.record(undo, label, Edit::Content { id, content: old });
         self.mark_dirty();
@@ -2316,6 +2455,23 @@ impl Engine {
             Edit::Stroke(UndoEntry { layer_id, target: StrokeTarget::Mask, channels: vec![], before, after }),
         );
         undo.end_group();
+        self.mark_dirty();
+    }
+
+    /// Points a layer's mask at a smart mask, a mask graph or neither (a
+    /// white mask), keeping its filters and mask layers; one undo step.
+    pub fn set_mask_source(&mut self, idx: usize, generator: Option<Generator>, graph: Option<u64>, undo: &mut UndoStack) {
+        if idx >= self.layers.len() {
+            return;
+        }
+        self.commit_props(undo);
+        // A mask graph's output arrives as the paint (`set_graph_mask`).
+        let paint = (generator.is_none() && graph.is_none()).then(|| self.new_mask_texture(true));
+        let layer = &mut self.layers[idx];
+        let (filters, layers) = layer.mask.as_ref().map_or_else(Default::default, |m| (m.filters.clone(), m.layers.clone()));
+        let old = layer.mask.replace(Mask { paint, generator, graph, filters, layers });
+        let (id, label) = (layer.id, format!("Change the mask of {}", layer.name));
+        self.record(undo, label, Edit::Mask { id, mask: old });
         self.mark_dirty();
     }
 
@@ -2574,7 +2730,7 @@ impl Engine {
 
     /// Starts a stroke on the content or mask of layer `idx`. Returns false if
     /// there is nothing paintable there.
-    pub fn begin_stroke(&mut self, idx: usize, target: StrokeTarget, enabled: [bool; 4], erase: bool) -> bool {
+    pub fn begin_stroke(&mut self, idx: usize, target: StrokeTarget, enabled: [bool; CHANNELS], erase: bool) -> bool {
         if let StrokeTarget::BakeFix(map) = target {
             if !self.begin_fix_stroke(map, erase) {
                 return false;
@@ -2589,7 +2745,7 @@ impl Engine {
         let layer_id = layer.id;
         let channels: Vec<usize> = match (target, &layer.content) {
             (StrokeTarget::Content, Content::Paint(ch)) => {
-                (0..4).filter(|&c| enabled[c] && (!erase || ch[c].is_some())).collect()
+                (0..CHANNELS).filter(|&c| enabled[c] && (!erase || ch[c].is_some())).collect()
             }
             (StrokeTarget::Mask, _) => {
                 if layer.mask.is_none() {
@@ -2650,7 +2806,7 @@ impl Engine {
             .entry(mask)
             .or_insert_with(|| {
                 let targets: Vec<_> =
-                    (0..4).map(|c| if mask & (1 << c) != 0 { gpu::target(PAINT_FORMATS[c]) } else { None }).collect();
+                    (0..CHANNELS).map(|c| if mask & (1 << c) != 0 { gpu::target(PAINT_FORMATS[c]) } else { None }).collect();
                 gpu::fullscreen_pipeline(&self.device, "apply paint", &p.apply_module, "fs_paint", &p.apply_layout, &targets)
             })
             .clone()
@@ -2707,19 +2863,26 @@ impl Engine {
 
     /// Polygon fill: adds whole triangles to the stroke (UV-space vertices,
     /// three per triangle) and writes the stroke into the target.
-    pub fn stroke_polys(&mut self, uv_tris: &[[f32; 2]], paint: &BrushPaint) {
-        if self.active.is_none() || uv_tris.is_empty() {
+    pub fn stroke_polys(&mut self, geometry: &PolyGeometry, paint: &BrushPaint) {
+        let (faces, padding) = (&geometry.faces, &geometry.padding);
+        if self.active.is_none() || faces.is_empty() {
             return;
         }
-        let (lo, hi) = uv_tris.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), p| {
+        let (lo, hi) = faces.iter().chain(padding).fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), p| {
             ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])])
         });
         self.add_region(Some([lo[0], lo[1], hi[0], hi[1]]));
         use wgpu::util::DeviceExt;
+        let all: Vec<[f32; 2]> = faces.iter().chain(padding).copied().collect();
         let vertices = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("poly fill"),
-            contents: bytemuck::cast_slice(uv_tris),
+            contents: bytemuck::cast_slice(&all),
             usage: wgpu::BufferUsages::VERTEX,
+        });
+        let pos_map = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("poly padding"),
+            layout: &self.p.poly_pad_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.pos.view) }],
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -2728,9 +2891,15 @@ impl Engine {
                 "poly fill",
                 &[gpu::color_attachment(&self.stroke.view, wgpu::LoadOp::Load)],
             );
-            pass.set_pipeline(&self.p.poly);
             pass.set_vertex_buffer(0, vertices.slice(..));
-            pass.draw(0..uv_tris.len() as u32, 0..1);
+            pass.set_pipeline(&self.p.poly);
+            pass.draw(0..faces.len() as u32, 0..1);
+            // Padding only where no UV island is: never onto a neighbor's texels.
+            if !padding.is_empty() {
+                pass.set_pipeline(&self.p.poly_pad);
+                pass.set_bind_group(0, &pos_map, &[]);
+                pass.draw(faces.len() as u32..all.len() as u32, 0..1);
+            }
         }
         self.encode_apply(&mut encoder, paint);
         self.queue.submit([encoder.finish()]);
@@ -2768,18 +2937,20 @@ impl Engine {
     fn encode_apply(&mut self, encoder: &mut wgpu::CommandEncoder, paint: &BrushPaint) {
         let Some(active) = &self.active else { return };
         let (target, channels, layer_id) = (active.target, active.channels.clone(), active.layer_id);
-        let mut ch = [0.0f32; 4];
+        let mut ch = [0.0f32; CHANNELS];
         for &c in &channels {
             ch[c] = 1.0;
         }
         let m = &paint.mat;
         let au = ApplyUniform {
-            color: [m.color[0], m.color[1], m.color[2], 1.0],
+            color: [m.color[0], m.color[1], m.color[2], m.opacity],
             rmh: [m.rough, m.metal, m.height, paint.mask_value],
-            ch,
-            p: [paint.opacity, if paint.erase { 1.0 } else { 0.0 }, 0.0, 0.0],
+            ch: [ch[0], ch[1], ch[2], ch[3]],
+            p: [paint.opacity, if paint.erase { 1.0 } else { 0.0 }, ch[OPACITY], 0.0],
             // Bake fixes paint exact values; grain would only get in the way.
             g: if matches!(target, StrokeTarget::BakeFix(_)) { [0.0; 4] } else { paint.grain },
+            e: [m.emission[0], m.emission[1], m.emission[2], ch[EMISSION]],
+            s: [m.specular, ch[SPECULAR], ch[NORMAL], 0.0],
         };
         self.queue.write_buffer(&self.apply_ubuf, 0, bytemuck::bytes_of(&au));
 
@@ -2811,6 +2982,10 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.nrm.view) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.brush_grain.view) },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(snap_view(OPACITY)) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(snap_view(EMISSION)) },
+                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(snap_view(NORMAL)) },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(snap_view(SPECULAR)) },
             ],
         });
 
@@ -2821,7 +2996,7 @@ impl Engine {
                     (&self.p.apply_mask, vec![gpu::color_attachment(&textures[0].view, wgpu::LoadOp::Load)])
                 }
                 _ => {
-                    let mut att = vec![None, None, None, None];
+                    let mut att = vec![None; CHANNELS];
                     for (tex, &c) in textures.iter().zip(&channels) {
                         att[c] = gpu::color_attachment(&tex.view, wgpu::LoadOp::Load);
                     }
@@ -3008,12 +3183,12 @@ impl Engine {
 
     fn layer_uniform(&self, layer: &Layer) -> LayerUniform {
         let mut u: LayerUniform = bytemuck::Zeroable::zeroed();
-        let flags = |b: [bool; 4]| b.map(|v| if v { 1.0 } else { 0.0 });
+        let flags = |b: [bool; CHANNELS]| b.map(|v| if v { 1.0 } else { 0.0 });
         let (kind, ch) = match &layer.content {
-            Content::Paint(ch) => (0.0, flags([0, 1, 2, 3].map(|i| ch[i].is_some()))),
+            Content::Paint(ch) => (0.0, flags(std::array::from_fn(|i| ch[i].is_some()))),
             Content::Fill(f) => {
                 let m = &f.mat;
-                u.fill_color = [m.color[0], m.color[1], m.color[2], 1.0];
+                u.fill_color = [m.color[0], m.color[1], m.color[2], m.opacity];
                 u.fill_rmh = [m.rough, m.metal, m.height, 0.0];
                 u.var0 = [f.color_var, f.var_scale, f.rough_var, f.height_var];
                 let mut bits = (0..4).filter(|&i| layer.images[i].is_some()).fold(0u32, |b, i| b | 1 << i);
@@ -3021,14 +3196,33 @@ impl Engine {
                 if layer.images[0].as_ref().is_some_and(|im| im.tex.format == F::R8Unorm) {
                     bits |= 16;
                 }
+                if layer.images[OPACITY].is_some() {
+                    bits |= 32;
+                }
+                if layer.images[EMISSION].is_some() {
+                    bits |= 64;
+                }
+                if layer.images[NORMAL].is_some() {
+                    bits |= 128;
+                }
+                if layer.images[SPECULAR].is_some() {
+                    bits |= 256;
+                }
+                u.emis = [m.emission[0], m.emission[1], m.emission[2], 0.0];
+                u.ns = [m.normal, 0.0, m.specular, 0.0];
                 u.var1 = [f.seed, f.part_var, f.projection as u32 as f32, bits as f32];
                 u.img = [f.tiling, f.rotation, f.offset[0], f.offset[1]];
                 u.gx[2] = f.tri_sharpness;
                 (1.0, flags(m.enabled))
             }
-            Content::Folder(_) => (2.0, [0.0; 4]),
+            Content::Folder(_) => (2.0, [0.0; CHANNELS]),
         };
-        u.ch = ch;
+        u.ch = [ch[0], ch[1], ch[2], ch[3]];
+        // Opacity's flag rides in the w of the fill values, emission's in its own.
+        u.fill_rmh[3] = ch[OPACITY];
+        u.emis[3] = ch[EMISSION];
+        u.ns[1] = ch[NORMAL];
+        u.ns[3] = ch[SPECULAR];
         let mut has_paint_mask = 0.0;
         if let Some(mask) = &layer.mask {
             if mask.paint.is_some() {
@@ -3248,6 +3442,10 @@ impl Engine {
                     gpu::color_attachment(&a[1].view, c(0.5)),
                     gpu::color_attachment(&a[2].view, c(0.0)),
                     gpu::color_attachment(&a[3].view, c(0.0)),
+                    gpu::color_attachment(&a[4].view, c(0.0)),
+                    // A flat normal.
+                    gpu::color_attachment(&a[5].view, wgpu::LoadOp::Clear(wgpu::Color { r: 0.5, g: 0.5, b: 1.0, a: 1.0 })),
+                    gpu::color_attachment(&a[6].view, c(0.5)),
                 ],
             );
         }
@@ -3331,11 +3529,19 @@ impl Engine {
                 wgpu::BindingResource::TextureView(t.map_or(dummy, |t| &t.view))
             }
             let view = |t| or_dummy(t, dummy);
-            let chans: [Option<&Tex>; 4] = match &layer.content {
-                Content::Paint(ch) => [0, 1, 2, 3].map(|i| ch[i].as_ref()),
-                // A folder merge reads the stack below it in the layer slots.
-                Content::Folder(_) => [0, 1, 2, 3].map(|i| Some(&self.folder_below[depth][i])),
-                Content::Fill(_) => [0, 1, 2, 3].map(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
+            let chans: [Option<&Tex>; CHANNELS] = match &layer.content {
+                Content::Paint(ch) => std::array::from_fn(|i| ch[i].as_ref()),
+                // A folder merge reads the stack below it in the layer slots
+                // (opacity is in its color's alpha).
+                Content::Folder(_) => {
+                    let below = &self.folder_below[depth];
+                    let mut c: [Option<&Tex>; CHANNELS] = std::array::from_fn(|i| below.get(i).filter(|_| i < 4));
+                    c[EMISSION] = below.get(FINAL_EMISSION);
+                    c[NORMAL] = below.get(FINAL_NORMAL);
+                    c[SPECULAR] = below.get(FINAL_SPECULAR);
+                    c
+                }
+                Content::Fill(_) => std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref())),
             };
             let mask = layer.mask.as_ref().and_then(|m| m.paint.as_ref());
             let prev = if from_cache { self.prefix_cache.as_ref().expect("prefix cache") } else { &self.accum[src] };
@@ -3370,6 +3576,14 @@ impl Engine {
                     wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                     wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                    wgpu::BindGroupEntry { binding: 19, resource: view(chans[OPACITY]) },
+                    wgpu::BindGroupEntry { binding: 20, resource: view(Some(&prev[FINAL_EMISSION])) },
+                    wgpu::BindGroupEntry { binding: 21, resource: view(chans[EMISSION]) },
+                    wgpu::BindGroupEntry { binding: 22, resource: view(Some(&prev[FINAL_NORMAL])) },
+                    wgpu::BindGroupEntry { binding: 23, resource: view(chans[NORMAL]) },
+                    wgpu::BindGroupEntry { binding: 24, resource: view(Some(&prev[FINAL_SPECULAR])) },
+                    wgpu::BindGroupEntry { binding: 25, resource: view(chans[SPECULAR]) },
+                    wgpu::BindGroupEntry { binding: 26, resource: view(Some(&self.tan)) },
                 ],
             });
             // Mask filters: render the mask, run its filters, then read the result.
@@ -3401,6 +3615,9 @@ impl Engine {
                     gpu::color_attachment(&out[1].view, load),
                     gpu::color_attachment(&out[2].view, load),
                     gpu::color_attachment(&out[3].view, load),
+                    gpu::color_attachment(&out[4].view, load),
+                    gpu::color_attachment(&out[5].view, load),
+                    gpu::color_attachment(&out[6].view, load),
                 ],
             );
             if let Some([x0, y0, x1, y1]) = scissor {
@@ -3426,7 +3643,47 @@ impl Engine {
         self.update_thumbs();
     }
 
-    /// Final composited channels: base color (sRGB-encoded), roughness, metallic, height.
+    /// Whether any visible layer sets opacity: only then can the result be
+    /// see-through (the 3D view skips its see-through pass otherwise).
+    pub fn uses_opacity(&self) -> bool {
+        self.layers.iter().any(|l| {
+            l.visible
+                && match &l.content {
+                    Content::Paint(ch) => ch[OPACITY].is_some(),
+                    Content::Fill(f) => f.mat.enabled[OPACITY] || l.images[OPACITY].is_some(),
+                    Content::Folder(_) => false,
+                }
+        })
+    }
+
+    /// Whether any visible layer sets emission (exports skip the map otherwise).
+    pub fn uses_emission(&self) -> bool {
+        self.layers.iter().any(|l| {
+            l.visible
+                && match &l.content {
+                    Content::Paint(ch) => ch[EMISSION].is_some(),
+                    Content::Fill(f) => f.mat.enabled[EMISSION] || l.images[EMISSION].is_some(),
+                    Content::Folder(_) => false,
+                }
+        })
+    }
+
+    /// Whether any visible layer sets normals or specular (exports skip
+    /// the maps otherwise: flat normal, 0.5 specular).
+    pub fn uses_channel(&self, ch: usize) -> bool {
+        self.layers.iter().any(|l| {
+            l.visible
+                && match &l.content {
+                    Content::Paint(c) => c[ch].is_some(),
+                    Content::Fill(f) => f.mat.enabled[ch] || l.images[ch].is_some(),
+                    Content::Folder(_) => false,
+                }
+        })
+    }
+
+    /// Final composited channels: base color (sRGB-encoded, with opacity in
+    /// alpha), roughness, metallic, height, emission (sRGB-encoded), normal
+    /// (tangent space, encoded 0..1), specular level.
     /// (A [`Pass`] list drives [`Engine::composite`].)
     pub fn final_tex(&self, ch: usize) -> &Tex {
         &self.accum[self.final_idx][ch]
@@ -3495,7 +3752,7 @@ impl Engine {
         let mut new_layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let content = match &layer.content {
-                Content::Paint(ch) => Some([0, 1, 2, 3].map(|i| ch[i].as_ref().map(|t| self.resample(&mut encoder, t, res)))),
+                Content::Paint(ch) => Some(std::array::from_fn(|i| ch[i].as_ref().map(|t| self.resample(&mut encoder, t, res)))),
                 Content::Fill(_) | Content::Folder(_) => None,
             };
             let mask = layer.mask.as_ref().and_then(|m| m.paint.as_ref()).map(|t| self.resample(&mut encoder, t, res));
@@ -3537,9 +3794,10 @@ impl Engine {
         self.uv_version += 1;
         self.pos = Tex::new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE);
         self.nrm = Tex::new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE);
+        self.tan = Tex::new(&self.device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE);
         self.accum = [accum_set(&self.device, res, "accum A"), accum_set(&self.device, res, "accum B")];
         self.stroke = Tex::new(&self.device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE);
-        self.snap = [None, None, None, None];
+        self.snap = Default::default();
         self.snap_mask = None;
         undo.clear();
         self.bake_uv(mesh);
@@ -3550,6 +3808,7 @@ impl Engine {
     pub fn vram_bytes(&self) -> u64 {
         let fixed = self.pos.bytes()
             + self.nrm.bytes()
+            + self.tan.bytes()
             + self.stroke.bytes()
             + self.maps.iter().map(|t| t.bytes()).sum::<u64>()
             + self.resolved.iter().flatten().map(|t| t.bytes()).sum::<u64>()
@@ -3562,5 +3821,34 @@ impl Engine {
 
     pub fn layer_vram_bytes(&self, idx: usize) -> u64 {
         self.layers.get(idx).map_or(0, |l| l.vram_bytes())
+    }
+    /// Where the texture memory goes, in MB (offscreen tests).
+    #[cfg(test)]
+    pub fn vram_breakdown(&self) -> Vec<(&'static str, u64)> {
+        let mb = |b: u64| b >> 20;
+        let set = |s: &[Tex; ACCUM]| s.iter().map(|t| t.bytes()).sum::<u64>();
+        // Layers can share one image texture: count each once.
+        let unique_images: u64 = {
+            let mut seen = Vec::new();
+            let mut sum = 0;
+            for i in self.layers.iter().flat_map(|l| l.images.iter().flatten()) {
+                let p = Arc::as_ptr(&i.tex);
+                if !seen.contains(&p) {
+                    seen.push(p);
+                    sum += i.tex.bytes();
+                }
+            }
+            sum
+        };
+        vec![
+            ("surface maps", mb(self.pos.bytes() + self.nrm.bytes() + self.tan.bytes() + self.stroke.bytes())),
+            ("mesh maps", mb(self.maps.iter().map(|t| t.bytes()).sum::<u64>() + self.resolved.iter().flatten().map(|t| t.bytes()).sum::<u64>())),
+            ("accum (2 sets)", mb(self.accum.iter().map(set).sum())),
+            ("folder below", mb(self.folder_below.iter().map(set).sum())),
+            ("prefix cache", mb(self.prefix_cache.as_ref().map_or(0, set))),
+            ("filtered masks", mb(self.mask_out.values().flat_map(|t| t.iter()).map(|t| t.bytes()).sum())),
+            ("paint layers", mb(self.layers.iter().map(|l| l.vram_bytes()).sum())),
+            ("fill images", mb(unique_images)),
+        ]
     }
 }

@@ -114,7 +114,17 @@ impl PainterApp {
             let rt = gal.rt.get_or_insert_with(|| Runtime::new(&self.rs.device, &self.rs.queue));
             let engine = &self.engine;
             let maps = |m: usize| engine.mesh_map(m);
-            rt.evaluate(&self.rs.device, &self.rs.queue, gal.graph.as_ref().expect("built"), gal.lib.as_ref().expect("built"), &maps, engine.maps_version);
+            let surface = engine.graph_surface();
+            rt.evaluate(
+                &self.rs.device,
+                &self.rs.queue,
+                gal.graph.as_ref().expect("built"),
+                gal.lib.as_ref().expect("built"),
+                &maps,
+                Some(&surface),
+                engine.maps_version,
+                false,
+            );
             gal.maps_seen = engine.maps_version;
         }
         // egui textures for the thumbnails.

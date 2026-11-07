@@ -13,11 +13,13 @@ fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-// Keeps what is above the threshold, with a soft knee below it.
+// Keeps what is above the threshold, with a soft knee below it. Brightness
+// is the strongest channel, not luminance: pure red or blue light (luminance
+// 0.21 and 0.07 of white's) blooms as soon as white of the same peak does.
 fn bright(c: vec3<f32>) -> vec3<f32> {
     let thr = bu.p.z;
     let knee = thr * 0.5 + 1e-4;
-    let l = luma(c);
+    let l = max(c.r, max(c.g, c.b));
     var soft = clamp(l - thr + knee, 0.0, 2.0 * knee);
     soft = soft * soft / (4.0 * knee);
     return c * max(soft, l - thr) / max(l, 1e-4);

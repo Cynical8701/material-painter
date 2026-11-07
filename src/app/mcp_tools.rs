@@ -260,16 +260,14 @@ impl PainterApp {
                 let mut images = Vec::new();
                 if let Some(obj) = args.get("images").and_then(Value::as_object) {
                     for (key, v) in obj {
-                        let ch = ["color", "roughness", "metallic", "height"]
-                            .iter()
-                            .position(|c| c == key)
-                            .ok_or(format!("unknown image channel '{key}' (color, roughness, metallic, height)"))?;
+                        const NAMES: [&str; crate::engine::CHANNELS] = ["color", "roughness", "metallic", "height", "opacity", "emission", "normal", "specular"];
+                        let ch = NAMES.iter().position(|c| c == key).ok_or(format!("unknown image channel '{key}' ({})", NAMES.join(", ")))?;
                         let img = match v.as_str() {
                             None => None,
                             Some(path) => {
                                 let bytes = std::fs::read(path).map_err(|e| format!("can't read {path}: {e}"))?;
                                 let name = std::path::Path::new(path).file_name().map_or("image".into(), |n| n.to_string_lossy().into_owned());
-                                Some(self.engine.decode_fill_image(name, std::sync::Arc::new(bytes))?)
+                                Some(self.engine.decode_channel_image(ch, name, std::sync::Arc::new(bytes))?)
                             }
                         };
                         images.push((ch, img));
@@ -288,8 +286,11 @@ impl PainterApp {
                 if let Some(b) = blend {
                     layer.blend = b;
                 }
-                const FILL_KEYS: [&str; 16] = [
+                const FILL_KEYS: [&str; 19] = [
                     "images",
+                    "emission",
+                    "specular",
+                    "normal_strength",
                     "projection",
                     "tiling",
                     "rotation",
@@ -323,6 +324,19 @@ impl PainterApp {
                         if let Some(h) = f32_arg(args, "height") {
                             f.mat.height = h.clamp(-1.0, 1.0);
                             f.mat.enabled[3] = true;
+                        }
+                        if let Some(c) = args.get("emission").and_then(Value::as_array) {
+                            for (k, v) in c.iter().take(3).enumerate() {
+                                f.mat.emission[k] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                            }
+                            f.mat.enabled[crate::engine::EMISSION] = true;
+                        }
+                        if let Some(v) = f32_arg(args, "specular") {
+                            f.mat.specular = v.clamp(0.0, 1.0);
+                            f.mat.enabled[crate::engine::SPECULAR] = true;
+                        }
+                        if let Some(v) = f32_arg(args, "normal_strength") {
+                            f.mat.normal = v.clamp(0.0, 4.0);
                         }
                         if let Some(v) = f32_arg(args, "color_variation") {
                             f.color_var = v.clamp(0.0, 1.0);
@@ -497,18 +511,29 @@ impl PainterApp {
                     return Err("'points' needs at least one [x, y] pixel position".into());
                 }
                 // Channels: the ones given are painted, the rest left alone.
-                let mut mat = crate::engine::MatValues { enabled: [false; 4], ..Default::default() };
+                let mut mat = crate::engine::MatValues { enabled: [false; crate::engine::CHANNELS], ..Default::default() };
                 if let Some(c) = args.get("color").and_then(Value::as_array) {
                     for (k, v) in c.iter().take(3).enumerate() {
                         mat.color[k] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
                     }
                     mat.enabled[0] = true;
                 }
-                for (k, key) in [(1, "roughness"), (2, "metallic"), (3, "height")] {
+                if let Some(c) = args.get("emission").and_then(Value::as_array) {
+                    for (k, v) in c.iter().take(3).enumerate() {
+                        mat.emission[k] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                    }
+                    mat.enabled[crate::engine::EMISSION] = true;
+                }
+                if let Some(v) = f32_arg(args, "specular") {
+                    mat.specular = v.clamp(0.0, 1.0);
+                    mat.enabled[crate::engine::SPECULAR] = true;
+                }
+                for (k, key) in [(1, "roughness"), (2, "metallic"), (3, "height"), (4, "opacity")] {
                     if let Some(v) = f32_arg(args, key) {
                         match k {
                             1 => mat.rough = v.clamp(0.0, 1.0),
                             2 => mat.metal = v.clamp(0.0, 1.0),
+                            4 => mat.opacity = v.clamp(0.0, 1.0),
                             _ => mat.height = v.clamp(-1.0, 1.0),
                         }
                         mat.enabled[k] = true;
@@ -516,7 +541,7 @@ impl PainterApp {
                 }
                 let erase = args.get("erase").and_then(Value::as_bool).unwrap_or(false);
                 if target == StrokeTarget::Content && !erase && !mat.enabled.contains(&true) {
-                    return Err("give at least one of color, roughness, metallic, height".into());
+                    return Err("give at least one of color, roughness, metallic, height, opacity, emission, specular".into());
                 }
                 let symmetry = match str_arg(args, "symmetry").unwrap_or("off") {
                     "off" => 0.0,
@@ -635,18 +660,29 @@ impl PainterApp {
                     let (o, d) = cam.ray(glam::Vec2::new(x, y), glam::Vec2::new(w as f32, h as f32));
                     self.bvh.raycast(o, d).ok_or("no mesh under that pixel")?.tri
                 };
-                let mut mat = crate::engine::MatValues { enabled: [false; 4], ..Default::default() };
+                let mut mat = crate::engine::MatValues { enabled: [false; crate::engine::CHANNELS], ..Default::default() };
                 if let Some(c) = args.get("color").and_then(Value::as_array) {
                     for (k, v) in c.iter().take(3).enumerate() {
                         mat.color[k] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
                     }
                     mat.enabled[0] = true;
                 }
-                for (k, key) in [(1, "roughness"), (2, "metallic"), (3, "height")] {
+                if let Some(c) = args.get("emission").and_then(Value::as_array) {
+                    for (k, v) in c.iter().take(3).enumerate() {
+                        mat.emission[k] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                    }
+                    mat.enabled[crate::engine::EMISSION] = true;
+                }
+                if let Some(v) = f32_arg(args, "specular") {
+                    mat.specular = v.clamp(0.0, 1.0);
+                    mat.enabled[crate::engine::SPECULAR] = true;
+                }
+                for (k, key) in [(1, "roughness"), (2, "metallic"), (3, "height"), (4, "opacity")] {
                     if let Some(v) = f32_arg(args, key) {
                         match k {
                             1 => mat.rough = v.clamp(0.0, 1.0),
                             2 => mat.metal = v.clamp(0.0, 1.0),
+                            4 => mat.opacity = v.clamp(0.0, 1.0),
                             _ => mat.height = v.clamp(-1.0, 1.0),
                         }
                         mat.enabled[k] = true;
@@ -654,7 +690,7 @@ impl PainterApp {
                 }
                 let erase = args.get("erase").and_then(Value::as_bool).unwrap_or(false);
                 if target == StrokeTarget::Content && !erase && !mat.enabled.contains(&true) {
-                    return Err("give at least one of color, roughness, metallic, height".into());
+                    return Err("give at least one of color, roughness, metallic, height, opacity, emission, specular".into());
                 }
                 if !self.engine.begin_stroke(i, target, mat.enabled, erase) {
                     return Err("nothing to fill: check the channels (or, erasing, that the layer has paint)".into());

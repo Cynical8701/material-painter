@@ -217,12 +217,19 @@ fn export_templates() {
                 use_baked_normal: true,
             };
             let files = export::export(&snap, t, &settings).unwrap_or_else(|e| panic!("{} {}: {e}", t.name, format.name()));
-            assert_eq!(files.len(), t.maps.len());
-            for (f, m) in files.iter().zip(&t.maps) {
+            // This cube emits nothing and keeps the default specular: its
+            // emission and specular level maps are left out.
+            let optional = |c: &export::Chan| matches!(c.src, export::Source::Emission | export::Source::SpecularLevel);
+            let maps: Vec<_> = t.maps.iter().filter(|m| !m.chans.iter().any(optional)).collect();
+            assert_eq!(files.len(), maps.len());
+            for (f, m) in files.iter().zip(maps) {
                 let img = image::open(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
                 let size = settings.size.unwrap_or(res);
                 assert_eq!((img.width(), img.height()), (size, size), "{}", f.display());
+                // Opacity in alpha is left out on this opaque cube.
+                let opacity_alpha = m.layout == export::Layout::Rgba && m.chans[3].src == export::Source::Opacity;
                 let want = match (m.layout, format) {
+                    (export::Layout::Rgba, _) if opacity_alpha => 3,
                     (export::Layout::Rgba, Format::Jpeg) => 3,
                     (export::Layout::Gray, Format::Exr) => 3,
                     (l, _) => l.channels(),
@@ -291,7 +298,7 @@ fn paint_projections() {
             engine.set_brush_grain(Some((&px, 256)));
         }
         views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
-        assert!(engine.begin_stroke(0, StrokeTarget::Content, [true, false, false, false], false));
+        assert!(engine.begin_stroke(0, StrokeTarget::Content, [true, false, false, false, false, false, false, false], false));
         let radius = 28.0;
         let raw: Vec<([f32; 4], f32)> = (0..60).map(|i| ([180.0 + i as f32 * 5.0, 250.0, 1.0, 0.0], 1.0)).collect();
         let fsize = Vec2::new(size[0] as f32, size[1] as f32);
@@ -307,7 +314,7 @@ fn paint_projections() {
             proj: [projection as u32 as f32, 0.0, 85f32.to_radians().cos(), 0.0],
         };
         let paint = BrushPaint {
-            mat: MatValues { enabled: [true, false, false, false], color: [0.9, 0.1, 0.05], ..Default::default() },
+            mat: MatValues { enabled: [true, false, false, false, false, false, false, false], color: [0.9, 0.1, 0.05], ..Default::default() },
             mask_value: 1.0,
             opacity: 1.0,
             erase: false,
@@ -411,14 +418,14 @@ fn perf_4k() {
         proj: [0.0, 0.0, 85f32.to_radians().cos(), 0.0],
     };
     let paint = BrushPaint {
-        mat: MatValues { enabled: [true, true, true, false], color: [0.9, 0.1, 0.05], ..Default::default() },
+        mat: MatValues { enabled: [true, true, true, false, false, false, false, false], color: [0.9, 0.1, 0.05], ..Default::default() },
         mask_value: 1.0,
         opacity: 1.0,
         erase: false,
         grain: [0.0; 4],
     };
     for (name, layer) in [("top layer", top), ("bottom layer", 0)] {
-    assert!(engine.begin_stroke(layer, StrokeTarget::Content, [true, true, true, false], false));
+    assert!(engine.begin_stroke(layer, StrokeTarget::Content, [true, true, true, false, false, false, false, false], false));
     let frames = 30;
     let (mut t_stroke, mut t_comp, mut t_view) = (0.0, 0.0, 0.0);
     for f in 0..frames {
@@ -496,7 +503,11 @@ fn graph_nodes_render() {
         if def.params.iter().any(|p| p.kind == crate::graph::ParamKind::Image) {
             g.node_mut(n).unwrap().params.insert("image".into(), Value::Image(Some(picture.clone())));
         }
-        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+        let surface = engine.graph_surface();
+        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, Some(&surface), 0, false);
+        // Images decode on a worker: render again once they're in.
+        rt.wait_images(&rs.device, &rs.queue);
+        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, Some(&surface), 0, false);
         assert!(rt.errors.is_empty(), "{}: {:?}", def.id, rt.errors);
         let tex = rt.output(n).unwrap_or_else(|| panic!("{} rendered nothing", def.id));
         let bytes = read_texture(&rs.device, &rs.queue, tex);
@@ -517,12 +528,12 @@ fn graph_nodes_render() {
 
     // The starter graph feeds base color and roughness.
     let g = Graph::starter("Starter");
-    rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+    rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, None, 0, false);
     assert!(rt.errors.is_empty(), "{:?}", rt.errors);
     let outs = g.outputs(&lib);
     assert!(rt.output(outs[0].unwrap()).is_some() && rt.output(outs[1].unwrap()).is_some());
     // Nothing changed: nothing re-renders.
-    assert!(!rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0));
+    assert!(!rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, None, 0, false));
 
     // Through a fill layer: the composite shows the graph's base color, and
     // a graph's output written into a mask varies across it.
@@ -531,7 +542,7 @@ fn graph_nodes_render() {
     let fill = crate::engine::FillParams { graph: Some(1), ..Default::default() };
     let idx = engine.add_fill_layer(0, None, "Graph".into(), fill, &mut undo);
     let out = |u: usize| outs[u].and_then(|n| rt.output(n).cloned());
-    engine.set_graph_images(idx, [out(0), out(1), out(2), out(3)], "Starter");
+    engine.set_graph_images(idx, [out(0), out(1), out(2), out(3), None, None, None, None], "Starter");
     engine.composite();
     let color = read_texture(&rs.device, &rs.queue, engine.final_tex(0));
     let distinct: std::collections::HashSet<[u8; 3]> = color.chunks(4).map(|p| [p[0], p[1], p[2]]).collect();
@@ -579,7 +590,7 @@ fn graph_presets_render() {
         let mut g = (p.build)();
         g.res = 256;
         let mut rt = Runtime::new(&rs.device, &rs.queue);
-        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, 0);
+        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, None, 0, false);
         assert!(rt.errors.is_empty(), "{}: {:?}", p.name, rt.errors);
         let base = g.outputs(&lib)[0].unwrap();
         let thumb = rt.thumb(base).unwrap();
@@ -734,7 +745,7 @@ fn mask_filters_apply() {
     let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
     let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 256);
     let mut undo = crate::undo::UndoStack::default();
-    let fill = FillParams { mat: MatValues { enabled: [true, false, false, false], color: [1.0, 0.0, 0.0], ..Default::default() }, ..Default::default() };
+    let fill = FillParams { mat: MatValues { enabled: [true, false, false, false, false, false, false, false], color: [1.0, 0.0, 0.0], ..Default::default() }, ..Default::default() };
     let idx = engine.add_fill_layer(0, None, "Red".into(), fill, &mut undo);
     engine.add_mask(idx, true, None, &mut undo);
     let red = |e: &mut Engine| {
@@ -1522,6 +1533,10 @@ fn open_spp_projects() {
         .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
     harness.run_steps(4);
     harness.state_mut().test_close_welcome();
+    // MP_PREFS: a preferences.json to run with (bake quality, default size) instead of the defaults.
+    if let Some(json) = std::env::var("MP_PREFS").ok().and_then(|p| std::fs::read_to_string(p).ok()) {
+        harness.state_mut().test_user_prefs(&json);
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/spp");
     std::fs::create_dir_all(&dir).unwrap();
     for (k, path) in paths.split(';').filter(|p| !p.is_empty()).enumerate() {
@@ -1556,6 +1571,10 @@ fn open_spp_projects() {
         }
         assert!(!harness.state().test_baking(), "{path}: the bakes finished");
         harness.run_steps(2);
+        for (name, parts) in harness.state().test_vram() {
+            let total: u64 = parts.iter().map(|p| p.1).sum();
+            println!("    vram {name}: {total} MB {parts:?}");
+        }
         harness.render().expect("renders").save(dir.join(format!("spp_{k}.png"))).unwrap();
         // The path tracer reads every set.
         harness.state_mut().test_ray_trace(true);
@@ -1607,7 +1626,7 @@ fn texture_sets_paint_apart() {
     views.render_3d(&rs, size, &[&left, &right], &env, &gpu_mesh, &cam, &settings, None);
 
     // A stroke across the middle of the view, over both halves.
-    assert!(left.begin_stroke(0, StrokeTarget::Content, [true, false, false, false], false));
+    assert!(left.begin_stroke(0, StrokeTarget::Content, [true, false, false, false, false, false, false, false], false));
     let radius = 40.0;
     let raw: Vec<([f32; 4], f32)> = (0..90).map(|i| ([30.0 + i as f32 * 5.0, 256.0, 1.0, 0.0], 1.0)).collect();
     let fsize = Vec2::new(size[0] as f32, size[1] as f32);
@@ -1624,7 +1643,7 @@ fn texture_sets_paint_apart() {
         proj: [BrushProjection::Screen as u32 as f32, 0.0, 85f32.to_radians().cos(), 0.0],
     };
     let paint = BrushPaint {
-        mat: MatValues { enabled: [true, false, false, false], color: [0.9, 0.1, 0.05], ..Default::default() },
+        mat: MatValues { enabled: [true, false, false, false, false, false, false, false], color: [0.9, 0.1, 0.05], ..Default::default() },
         mask_value: 1.0,
         opacity: 1.0,
         erase: false,
@@ -1665,6 +1684,1175 @@ fn texture_sets_paint_apart() {
     println!("  view: {bluish} blue pixels (right set), {reddish} red (the stroke)");
     assert!(bluish > 5000, "the right set draws with its own textures ({bluish})");
     assert!(reddish > 500, "the stroke shows ({reddish})");
+
+    // Hidden, the right set isn't drawn; highlighted, the left one turns toward the accent.
+    let looks = |views: &mut ViewRenderer, l: [crate::viewport::SetLook; 2]| {
+        views.set_looks = l.to_vec();
+        views.render_3d(&rs, size, &[&left, &right], &env, &gpu_mesh, &cam, &settings, None);
+        read_texture(&rs.device, &rs.queue, views.view3d.image())
+    };
+    use crate::viewport::SetLook;
+    let hidden = looks(&mut views, [SetLook::default(), SetLook { hidden: true, highlight: 0.0 }]);
+    let bluish_hidden = hidden.chunks(4).filter(|p| p[2] as i32 > p[0] as i32 + 40 && p[2] as i32 > p[1] as i32 + 40).count();
+    println!("  right set hidden: {bluish_hidden} blue pixels");
+    assert!(bluish_hidden < bluish / 20, "a hidden set isn't drawn ({bluish_hidden})");
+    let lit = looks(&mut views, [SetLook { hidden: false, highlight: 1.0 }, SetLook { hidden: true, highlight: 0.0 }]);
+    image::save_buffer(dir.join("texture_sets_highlight.png"), &lit, size[0], size[1], image::ExtendedColorType::Rgba8).unwrap();
+    // How far the image leans toward the accent (blue over red), summed.
+    let lean = |px: &[u8]| px.chunks(4).map(|p| (p[2] as i64 - p[0] as i64).max(0)).sum::<i64>();
+    println!("  left set highlighted: lean {} (before {})", lean(&lit), lean(&hidden));
+    assert!(lean(&lit) > lean(&hidden) + 1_000_000, "the highlight tints the set");
+}
+
+/// A smart material dropped as a layer folder and edited through its live
+/// graph: the graph shows the layers, layer edits show in it, graph edits
+/// reach the layers (as undoable edits), and the artist's own nodes wired
+/// into a layer's mask become its mask graph. Frames go to
+/// `target/bake_test/ui/folder_graph*.png`.
+#[test]
+#[ignore]
+fn smart_folder_live_graph() {
+    use crate::app::PainterApp;
+    use crate::engine::Content;
+    use crate::graph::smart::NODE_CHANNEL;
+    use crate::graph::{Role, Value};
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_dialogs();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let k = presets::SMART_MATERIALS.iter().position(|s| s.layers.iter().filter(|l| l.generator().is_some()).count() >= 2).unwrap();
+    let folder = harness.state_mut().test_add_smart_folder(k);
+    let doc = harness.state_mut().test_open_folder_graph(folder).expect("a live graph");
+    harness.run_steps(3);
+    let folder_id = harness.state_mut().test_engine_mut().layers[folder].id;
+    // (index, id, enabled channels, smart mask) of the fill layers inside.
+    let kids = |h: &mut egui_kittest::Harness<'_, PainterApp>| -> Vec<(usize, u64, [bool; crate::engine::CHANNELS], bool)> {
+        let e = h.state_mut().test_engine_mut();
+        e.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.parent == Some(folder_id))
+            .filter_map(|(i, l)| match &l.content {
+                Content::Fill(f) => Some((i, l.id, f.mat.enabled, l.mask.as_ref().is_some_and(|m| m.generator.is_some()))),
+                _ => None,
+            })
+            .collect()
+    };
+    let layers = kids(&mut harness);
+    {
+        let g = harness.state_mut().test_graph_mut(doc).unwrap().clone();
+        for (_, id, enabled, masked) in &layers {
+            for (nk, ch) in NODE_CHANNEL.iter().enumerate() {
+                assert_eq!(g.tagged(*id, Role::Channel(nk)).is_some(), enabled[*ch], "a node per channel the layer writes");
+            }
+            assert_eq!(g.tagged(*id, Role::Mask).is_some(), *masked, "a Smart Mask node per smart mask");
+        }
+    }
+    harness.render().expect("renders").save(dir.join("folder_graph.png")).unwrap();
+
+    // A layer edited in the layer stack shows in the graph.
+    let (top_idx, top, ..) = *layers.iter().rev().find(|l| l.2[0]).expect("a layer with base color");
+    harness.state_mut().test_engine_mut().layers[top_idx].opacity = 0.4;
+    harness.run_steps(2);
+    {
+        let g = harness.state_mut().test_graph_mut(doc).unwrap();
+        let n = g.tagged(top, Role::Channel(0)).expect("base color node");
+        assert_eq!(g.node(n).unwrap().params.get("opacity"), Some(&Value::Float(0.4)), "the graph follows the layer");
+    }
+
+    // An edit in the graph reaches the layer, as an undoable edit.
+    let serial = harness.state().test_undo_serial();
+    {
+        let g = harness.state_mut().test_graph_mut(doc).unwrap();
+        let n = g.tagged(top, Role::Channel(0)).unwrap();
+        g.node_mut(n).unwrap().params.insert("color".into(), Value::Color([0.9, 0.1, 0.1]));
+    }
+    harness.run_steps(2);
+    match &harness.state_mut().test_engine_mut().layers[top_idx].content {
+        Content::Fill(f) => assert_eq!(f.mat.color, [0.9, 0.1, 0.1], "the layer follows the graph"),
+        _ => panic!("still a fill layer"),
+    }
+    assert_ne!(harness.state().test_undo_serial(), serial, "recorded for undo");
+
+    // A blur of the smart mask wired into the layer's mask: a mask graph.
+    let (m_idx, m_id, ..) = *layers.iter().find(|l| l.3).unwrap();
+    let blur = {
+        let g = harness.state_mut().test_graph_mut(doc).unwrap();
+        let smart = g.tagged(m_id, Role::Mask).unwrap();
+        let blur = g.add("blur", [0.0, -600.0]);
+        assert!(g.connect(smart, blur, "input"));
+        let first = (0..5).find_map(|nk| g.tagged(m_id, Role::Channel(nk))).unwrap();
+        assert!(g.connect(blur, first, "mask"));
+        blur
+    };
+    let mut steps = 0;
+    while harness.state_mut().test_engine_mut().layers[m_idx].mask.as_ref().is_none_or(|m| m.paint.is_none()) && steps < 200 {
+        harness.run_steps(1);
+        steps += 1;
+    }
+    {
+        let mask = harness.state_mut().test_engine_mut().layers[m_idx].mask.as_ref().unwrap();
+        assert!(mask.graph.is_some() && mask.generator.is_none(), "the mask is a graph now");
+        assert!(mask.paint.is_some(), "and it rendered");
+        let g = harness.state_mut().test_graph_mut(doc).unwrap();
+        for nk in 0..5 {
+            if let Some(n) = g.tagged(m_id, Role::Channel(nk)) {
+                assert_eq!(g.node(n).unwrap().links.get("mask"), Some(&blur), "every channel of the layer reads it");
+            }
+        }
+    }
+    harness.render().expect("renders").save(dir.join("folder_graph_custom_mask.png")).unwrap();
+
+    // Undo brings the smart mask back, in the layer and in the graph.
+    harness.state_mut().test_undo_step();
+    harness.run_steps(2);
+    let generator = harness.state_mut().test_engine_mut().layers[m_idx].mask.as_ref().and_then(|m| m.generator);
+    assert!(generator.is_some(), "the smart mask is back");
+    let g = harness.state_mut().test_graph_mut(doc).unwrap();
+    let smart = g.tagged(m_id, Role::Mask).expect("a Smart Mask node again");
+    let first = (0..5).find_map(|nk| g.tagged(m_id, Role::Channel(nk))).unwrap();
+    assert_eq!(g.node(first).unwrap().links.get("mask"), Some(&smart));
+    let tags = g.tags.len();
+
+    // Saved with the project: the folder keeps its graph, tags and all.
+    let file = dir.join("folder_graph.mpp");
+    let ctx = harness.ctx.clone();
+    harness.state_mut().test_save_and_reopen(&file, &ctx).expect("saves and opens");
+    harness.run_steps(2);
+    let e = harness.state_mut().test_engine_mut();
+    let fi = e.layers.iter().position(|l| l.id == folder_id).expect("the folder");
+    let Content::Folder(f) = &e.layers[fi].content else { panic!("still a folder") };
+    let doc = f.graph.expect("its graph");
+    assert_eq!(harness.state_mut().test_graph_mut(doc).expect("loaded").tags.len(), tags);
+}
+
+/// The polygon fill toolbar (every selection mode, box and lasso) and the
+/// texture set list (hide, highlight, flash on click), offscreen. Frames go to
+/// `target/bake_test/ui/poly_tool.png` and `texture_set_list.png`.
+#[test]
+#[ignore]
+fn texture_set_list_and_poly_tool() {
+    use crate::app::PainterApp;
+    use egui_kittest::kittest::Queryable;
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_dialogs();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().test_load_mesh(crate::mesh::set_tests::split_plane(), &ctx);
+    harness.state_mut().test_poly_tool(crate::polyfill::FillMode::Loop, true);
+    harness.run_steps(3);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+    harness.render().expect("renders").save(dir.join("poly_tool.png")).unwrap();
+    assert!(harness.query_all_by_label_contains("Face loop").count() > 0, "the active mode is named");
+
+    // Shift+drag a box over the 3D view fills the faces inside on release,
+    // with the 2D view open too (each view runs its input every frame).
+    harness.state_mut().test_poly_tool(crate::polyfill::FillMode::Triangle, false);
+    harness.run_steps(2);
+    let rect = harness.state().test_view_rect().expect("the 3D view");
+    let before = harness.state().test_undo_serial();
+    let shift = egui::Modifiers::SHIFT;
+    let event = |h: &mut egui_kittest::Harness<'_, PainterApp>, e: egui::Event| h.input_mut().events.push(e);
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: shift };
+    let (from, to) = (rect.center() - egui::vec2(60.0, 60.0), rect.center() + egui::vec2(60.0, 60.0));
+    event(&mut harness, egui::Event::ModifiersChanged(shift));
+    event(&mut harness, egui::Event::PointerMoved(from));
+    harness.run_steps(1);
+    event(&mut harness, button(from, true));
+    for i in 1..=10 {
+        event(&mut harness, egui::Event::PointerMoved(from + (to - from) * (i as f32 / 10.0)));
+        harness.run_steps(1);
+    }
+    harness.render().expect("renders").save(dir.join("poly_box_drag.png")).unwrap();
+    event(&mut harness, button(to, false));
+    harness.run_steps(2);
+    event(&mut harness, egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    harness.run_steps(1);
+    assert_ne!(harness.state().test_undo_serial(), before, "Shift+drag box filled faces");
+
+    // The texture set list: hiding a set takes it out of picking.
+    harness.get_by_label_contains("Texture Set").click();
+    harness.run_steps(2);
+    let all = harness.state().test_pickable();
+    assert!(harness.query_all_by_label_contains("Left").count() > 0, "the sets are listed");
+    harness.get_by_label_contains("Right").click();
+    harness.run_steps(1);
+    assert_eq!(harness.state().test_set_state(), [(false, false), (false, true)], "the picked set flashes");
+    harness.render().expect("renders").save(dir.join("texture_set_list.png")).unwrap();
+
+    // A material dragged from the shelf lands in the set under the pointer,
+    // not the edited one (Right): here, Left.
+    assert_eq!(harness.state().test_active_set(), 1);
+    let left = (0..40)
+        .map(|i| egui::pos2(rect.left() + rect.width() * (i as f32 + 0.5) / 40.0, rect.center().y))
+        .find(|p| harness.state_mut().test_set_at(*p) == Some(0))
+        .expect("Left shows in the 3D view");
+    let layers = |h: &egui_kittest::Harness<'_, PainterApp>| h.state().test_sets().iter().map(|s| s.2.len()).collect::<Vec<_>>();
+    let before = layers(&harness);
+    let plain = egui::Modifiers::NONE;
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: plain };
+    // Pressed on a tile (outside the view), dragged over the view, released.
+    let tile = egui::pos2(rect.left() - 40.0, rect.top() + 10.0);
+    event(&mut harness, egui::Event::PointerMoved(tile));
+    harness.run_steps(1);
+    event(&mut harness, button(tile, true));
+    harness.run_steps(1);
+    harness.state().test_drag_material(&ctx);
+    for i in 1..=5 {
+        event(&mut harness, egui::Event::PointerMoved(tile + (left - tile) * (i as f32 / 5.0)));
+        harness.run_steps(1);
+    }
+    harness.render().expect("renders").save(dir.join("drop_on_set.png")).unwrap();
+    event(&mut harness, button(left, false));
+    harness.run_steps(3);
+    assert_eq!(harness.state().test_active_set(), 0, "the set under the pointer is edited");
+    let after = layers(&harness);
+    assert_eq!(after[0], before[0] + 1, "the material went into Left");
+    assert_eq!(after[1], before[1], "Right kept its layers");
+    harness.state_mut().set_hidden_for_test(1, true);
+    harness.run_steps(2);
+    assert!(harness.state().test_pickable() < all, "a hidden set isn't pickable");
+    harness.render().expect("renders").save(dir.join("texture_set_hidden.png")).unwrap();
+}
+
+/// Shelf items dragged onto the layer list and the fill layer's Images rows,
+/// offscreen: a generator masks the row's layer, a smart material lands as a
+/// folder beside it, a material as a fill, and a texture feeds the channel
+/// row it's dropped on. Frames go to `target/bake_test/ui/drop_*.png`.
+#[test]
+#[ignore]
+fn shelf_drops_on_layers_and_images() {
+    use crate::app::{PainterApp, ShelfItem};
+    use egui_kittest::kittest::{NodeT, Queryable};
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_dialogs();
+    harness.run_steps(2);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = harness.ctx.clone();
+
+    // A drag as the shelf starts one: pressed on a tile, moved, released on `to`.
+    let drag = |h: &mut egui_kittest::Harness<'_, PainterApp>, item: ShelfItem, to: egui::Pos2, shot: &str| {
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        // An empty spot of the menu bar: no widget there starts a drag of its own.
+        let tile = egui::pos2(700.0, 18.0);
+        h.input_mut().events.push(egui::Event::PointerMoved(tile));
+        h.run_steps(1);
+        h.input_mut().events.push(button(tile, true));
+        h.run_steps(1);
+        h.state().test_drag(&ctx, item);
+        for i in 1..=5 {
+            h.input_mut().events.push(egui::Event::PointerMoved(tile + (to - tile) * (i as f32 / 5.0)));
+            h.run_steps(1);
+        }
+        h.render().expect("renders").save(dir.join(shot)).unwrap();
+        h.input_mut().events.push(button(to, false));
+        h.run_steps(3);
+    };
+    let row = |h: &egui_kittest::Harness<'_, PainterApp>, name: &str| h.get_by_label(name).rect();
+    // The dock tab, by its icon and title (not the shelf hint naming Layers).
+    harness
+        .query_all_by_label_contains("Layers")
+        .find(|n| n.accesskit_node().label().is_some_and(|l| l.ends_with(" Layers")))
+        .expect("the Layers tab")
+        .click();
+    harness.run_steps(2);
+    let layers = harness.state().test_layers();
+    let first = layers.last().expect("a layer").0.clone();
+
+    // A generator on a row masks that layer.
+    let r = row(&harness, &first);
+    drag(&mut harness, ShelfItem::Generator(crate::engine::GenKind::EdgeWear), r.center(), "drop_generator.png");
+    let top = harness.state().test_layers().len() - 1;
+    assert!(harness.state().test_layer_sources()[top].0, "the generator masks the row's layer");
+
+    // A smart material above a row lands as a folder.
+    let n = harness.state().test_layers().len();
+    let r = row(&harness, &first);
+    drag(&mut harness, ShelfItem::Smart(0), egui::pos2(r.center().x, r.top() + 4.0), "drop_smart.png");
+    let after = harness.state().test_layers();
+    assert!(after.len() > n, "the smart material's layers were added");
+    assert!(after.iter().any(|l| l.1 == "folder"), "as a folder");
+
+    // A material dropped on the top row becomes a fill (selected), and a
+    // texture on its Color row feeds the color.
+    let name = after.last().unwrap().0.clone();
+    let r = row(&harness, &name);
+    drag(&mut harness, ShelfItem::Material(0), egui::pos2(r.center().x, r.top() + 4.0), "drop_material.png");
+    let top = harness.state().test_layers().len() - 1;
+    assert_eq!(harness.state().test_layers()[top].1, "fill", "the material is a fill on top");
+    harness.run_steps(2);
+    let load = harness.query_all_by_label_contains("Load image").next().expect("the Images rows show").rect();
+    drag(&mut harness, ShelfItem::Texture(0), load.center(), "drop_texture.png");
+    assert_eq!(harness.state().test_layer_sources()[top].1, [0], "the texture feeds the color");
+    // The fill's channels include normal and specular, with image rows of their own.
+    assert!(harness.query_by_label("specular").is_some() && harness.query_by_label("normal").is_some(), "channel toggles");
+    assert_eq!(harness.query_all_by_label_contains("Load image").count(), 7, "one image row per channel without an image");
+    harness.render().expect("renders").save(dir.join("drop_fill_channels.png")).unwrap();
+}
+
+/// The bake window's cage tools, offscreen: the probe colors the cage,
+/// Auto-fix fits it so nothing misses, and the cage brush pushes it out under
+/// a drag over the model. Frames go to `target/bake_test/ui/cage_*.png`.
+#[test]
+#[ignore]
+fn cage_paint_and_auto_fix() {
+    use crate::app::PainterApp;
+    use egui_kittest::kittest::Queryable;
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_dialogs();
+    // A sphere, and a high poly bulging past the front distance where x > 0.5.
+    let low = crate::mesh::Primitive::Sphere.build();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+    let obj = dir.join("cage_bulge_high.obj");
+    let mut s = String::new();
+    for v in &low.vertices {
+        let p = glam::Vec3::from_array(v.pos);
+        let p = p * if p.x > 0.5 { 1.3 } else { 1.03 } / low.scale + low.center;
+        s.push_str(&format!("v {} {} {}\n", p.x, p.y, p.z));
+    }
+    for t in low.indices.chunks_exact(3) {
+        s.push_str(&format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1));
+    }
+    std::fs::write(&obj, s).unwrap();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().test_load_mesh(low, &ctx);
+    harness.state_mut().test_cage_setup(obj, 0.08, false);
+    // The probe runs on a worker thread; it repaints when it lands.
+    let mut steps = 0;
+    while harness.state().test_cage_missed().is_none() && steps < 20_000 {
+        harness.run_steps(1);
+        steps += 1;
+    }
+    let before = harness.state().test_cage_missed().expect("probed");
+    harness.render().expect("renders").save(dir.join("cage_probe.png")).unwrap();
+    println!("  cage: {:.1}% missed before the fix", before * 100.0);
+    assert!(before > 0.05, "the bulge misses");
+
+    harness.get_by_label_contains("Auto-fix").click();
+    harness.run_steps(3);
+    let after = harness.state().test_cage_missed().expect("still probed");
+    harness.render().expect("renders").save(dir.join("cage_fixed.png")).unwrap();
+    println!("  cage: {:.1}% missed after Auto-fix, multipliers {:?}", after * 100.0, harness.state().test_cage_paint_range());
+    assert!(after < before * 0.2, "Auto-fix reaches the bulge ({after})");
+
+    // Reset, then paint the cage out over the middle of the model.
+    harness.get_by_label("Reset").click();
+    harness.run_steps(2);
+    assert!(harness.state().test_cage_paint_range().is_none(), "reset");
+    harness.get_by_label_contains("Paint cage").click();
+    harness.run_steps(2);
+    let rect = harness.state().test_view_rect().expect("the 3D view");
+    let at = rect.center();
+    let event = |h: &mut egui_kittest::Harness<'_, PainterApp>, e: egui::Event| h.input_mut().events.push(e);
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    event(&mut harness, egui::Event::PointerMoved(at));
+    harness.run_steps(1);
+    event(&mut harness, button(at, true));
+    for i in 0..20 {
+        event(&mut harness, egui::Event::PointerMoved(at + egui::vec2(i as f32, 0.0)));
+        harness.run_steps(1);
+    }
+    harness.render().expect("renders").save(dir.join("cage_painting.png")).unwrap();
+    event(&mut harness, button(at + egui::vec2(20.0, 0.0), false));
+    harness.run_steps(2);
+    harness.render().expect("renders").save(dir.join("cage_painted.png")).unwrap();
+    let (_, hi) = harness.state().test_cage_paint_range().expect("painted");
+    println!("  cage brush: most raised multiplier {hi:.2}");
+    assert!(hi > 1.05, "dragging pushed the cage out");
+
+    // Shift+drag over the same spot puts the cage back to the front distance.
+    let shift = egui::Modifiers::SHIFT;
+    let shift_button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: shift };
+    event(&mut harness, egui::Event::ModifiersChanged(shift));
+    event(&mut harness, egui::Event::PointerMoved(at));
+    harness.run_steps(1);
+    event(&mut harness, shift_button(at, true));
+    for i in 0..60 {
+        event(&mut harness, egui::Event::ModifiersChanged(shift));
+        event(&mut harness, egui::Event::PointerMoved(at + egui::vec2((i % 20) as f32, 0.0)));
+        harness.run_steps(1);
+    }
+    event(&mut harness, shift_button(at, false));
+    harness.run_steps(2);
+    event(&mut harness, egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    let (_, hi_after) = harness.state().test_cage_paint_range().expect("still painted");
+    println!("  cage brush: most raised multiplier after Shift+drag {hi_after:.2}");
+    assert!(hi_after < 1.0 + (hi - 1.0) * 0.3, "Shift+drag puts the cage back ({hi:.2} -> {hi_after:.2})");
+}
+
+/// Opacity: a fill at opacity 0 makes its texture set see-through (the view
+/// shows what a hidden set shows: the backdrop), a brush stroke on the
+/// opacity channel paints the opaque set see-through along the stroke, and
+/// exports carry opacity as the base color's alpha. Frames go to
+/// `target/bake_test/transparency_*.png`.
+#[test]
+#[ignore]
+fn transparency_paints_shows_and_exports() {
+    use crate::app::{BrushProjection, resolve_stamps};
+    use crate::engine::{BrushPaint, CHANNELS, FillParams, MatValues, OPACITY, StampUniform};
+    use crate::undo::{StrokeTarget, UndoStack};
+    use crate::viewport::SetLook;
+    use glam::Vec2;
+
+    let mesh = Arc::new(crate::mesh::set_tests::split_plane());
+    let bvh = crate::bvh::Bvh::from_mesh(&mesh);
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 256;
+    let mut left = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    left.set_triangles(mesh.sets[0].index_range(), &gpu_mesh);
+    let mut right = left.sibling(&gpu_mesh, mesh.sets[1].index_range(), res);
+    let mut undo = UndoStack::default();
+    // Left: opaque red, with a paint layer on top. Right: blue at opacity 0.
+    let red = MatValues { color: [0.9, 0.1, 0.05], ..Default::default() };
+    left.add_fill_layer(0, None, "Red".into(), FillParams { mat: red, ..Default::default() }, &mut undo);
+    left.add_paint_layer(1, None, None, &mut undo);
+    let mut glass = MatValues { color: [0.05, 0.1, 0.9], opacity: 0.0, ..Default::default() };
+    glass.enabled[OPACITY] = true;
+    right.add_fill_layer(0, None, "Glass".into(), FillParams { mat: glass, ..Default::default() }, &mut undo);
+    assert!(right.uses_opacity() && !left.uses_opacity());
+    left.composite();
+    right.composite();
+    // The final color's alpha is the opacity.
+    let alpha = |e: &Engine| read_texture(&rs.device, &rs.queue, e.final_tex(0)).chunks(4).map(|p| p[3]).collect::<Vec<u8>>();
+    assert!(alpha(&right).iter().all(|&a| a == 0), "the glass fill is see-through");
+    assert!(alpha(&left).iter().all(|&a| a == 255), "the red fill is opaque");
+
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let cam = OrbitCam { pitch: 1.5, dist: 3.2, ..Default::default() };
+    let size = [512u32, 512u32];
+    let settings = ViewSettings::default();
+    let frame = |views: &mut ViewRenderer, left: &Engine, right: &Engine, looks: Vec<SetLook>| {
+        views.set_looks = looks;
+        views.render_3d(&rs, size, &[left, right], &env, &gpu_mesh, &cam, &settings, None);
+        read_texture(&rs.device, &rs.queue, views.view3d.image())
+    };
+    let see_through = frame(&mut views, &left, &right, Vec::new());
+    let hidden = frame(&mut views, &left, &right, vec![SetLook::default(), SetLook { hidden: true, highlight: 0.0 }]);
+    let diff = see_through.iter().zip(&hidden).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs()).max().unwrap_or(0);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    image::save_buffer(dir.join("transparency_glass.png"), &see_through, size[0], size[1], image::ExtendedColorType::Rgba8).unwrap();
+    println!("  see-through set vs hidden set: largest difference {diff}");
+    assert!(diff <= 2, "opacity 0 shows what's behind, as if hidden ({diff})");
+
+    // A stroke on the left set's opacity channel only: see-through along it.
+    let mut only_opacity = [false; CHANNELS];
+    only_opacity[OPACITY] = true;
+    assert!(left.begin_stroke(1, StrokeTarget::Content, only_opacity, false));
+    let radius = 30.0;
+    let raw: Vec<([f32; 4], f32)> = (0..40).map(|i| ([60.0 + i as f32 * 4.0, 256.0, 1.0, 0.0], 1.0)).collect();
+    let fsize = Vec2::new(size[0] as f32, size[1] as f32);
+    let stamps = resolve_stamps(&mesh, &bvh, &cam, fsize, BrushProjection::Screen, 1, radius, &raw);
+    let su = StampUniform {
+        view_proj: cam.view_proj(fsize.x / fsize.y).to_cols_array_2d(),
+        cam_pos: cam.eye().extend(1.0).to_array(),
+        view: [fsize.x, fsize.y, 0.0, 0.0],
+        view2d: [0.0; 4],
+        brush: [radius, 0.6, 1.0, 0.0],
+        clip: [crate::viewport::NEAR, crate::viewport::FAR, 0.0, 0.0],
+        proj: [BrushProjection::Screen as u32 as f32, 0.0, 85f32.to_radians().cos(), 0.0],
+    };
+    let mut clear = MatValues { opacity: 0.0, ..Default::default() };
+    clear.enabled = only_opacity;
+    let paint = BrushPaint { mat: clear, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4] };
+    left.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
+    left.end_stroke();
+    left.composite();
+    let a = alpha(&left);
+    let cleared = a.iter().filter(|&&v| v < 20).count();
+    println!("  stroke on opacity: {cleared} see-through texels");
+    assert!(cleared > 500, "the stroke made the red see-through ({cleared})");
+    assert!(a.iter().filter(|&&v| v > 235).count() > cleared, "the rest stays opaque");
+    // The color under the stroke is untouched: only opacity was painted.
+    let color = read_texture(&rs.device, &rs.queue, left.final_tex(0));
+    let i = a.iter().position(|&v| v < 20).unwrap();
+    assert!(color[i * 4] > 200 && color[i * 4 + 2] < 60, "still red under the stroke");
+    let stroked = frame(&mut views, &left, &right, Vec::new());
+    image::save_buffer(dir.join("transparency_stroke.png"), &stroked, size[0], size[1], image::ExtendedColorType::Rgba8).unwrap();
+    let reds = |px: &[u8]| px.chunks(4).filter(|p| p[0] as i32 > p[1] as i32 + 80 && p[0] as i32 > p[2] as i32 + 80).count();
+    println!("  red pixels: {} before the stroke, {} after", reds(&see_through), reds(&stroked));
+    assert!(reds(&stroked) + 2000 < reds(&see_through), "the backdrop shows through the stroke");
+
+    // Export: base color as RGBA with the opacity in alpha (an opaque set stays RGB).
+    use crate::export::{self, Format, Padding, Settings};
+    let folder = dir.join("transparency_export");
+    let _ = std::fs::remove_dir_all(&folder);
+    let glb = export::builtin_templates().into_iter().find(|t| t.name.starts_with("glTF")).unwrap();
+    for (name, engine, want) in [("Glass", &right, 4), ("Red", &left, 4)] {
+        let snap = export::snapshot(engine, &rs.device, &rs.queue, mesh.clone());
+        let settings = Settings {
+            folder: folder.clone(),
+            mesh_name: "Plane".into(),
+            project_name: "Test".into(),
+            set_name: name.into(),
+            set_count: 2,
+            format: Format::Png,
+            depth: export::Depth::U8,
+            size: None,
+            padding: Padding::Infinite,
+            normal_strength: 1.0,
+            use_baked_normal: false,
+        };
+        let files = export::export(&snap, &glb, &settings).expect("exports");
+        let base = files.iter().find(|f| f.to_string_lossy().contains("baseColor")).expect("a base color file");
+        let img = image::open(base).unwrap();
+        assert_eq!(img.color().channel_count(), want, "{}", base.display());
+        let min_alpha = img.to_rgba8().pixels().map(|p| p[3]).min().unwrap();
+        println!("  {}: {} channels, least alpha {min_alpha}", base.display(), img.color().channel_count());
+    }
+    let mut opaque = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    opaque.add_fill_layer(0, None, "Red".into(), FillParams { mat: red, ..Default::default() }, &mut undo);
+    opaque.composite();
+    let snap = export::snapshot(&opaque, &rs.device, &rs.queue, mesh.clone());
+    let settings = Settings {
+        folder: folder.clone(),
+        mesh_name: "Opaque".into(),
+        project_name: "Test".into(),
+        set_name: "Opaque".into(),
+        set_count: 1,
+        format: Format::Png,
+        depth: export::Depth::U8,
+        size: None,
+        padding: Padding::Infinite,
+        normal_strength: 1.0,
+        use_baked_normal: false,
+    };
+    let files = export::export(&snap, &glb, &settings).expect("exports");
+    let base = files.iter().find(|f| f.to_string_lossy().contains("baseColor")).unwrap();
+    assert_eq!(image::open(base).unwrap().color().channel_count(), 3, "an opaque set's base color stays RGB");
+}
+
+/// A smart material as a graph (`graph::smart`) looks the same as the
+/// folder of fill layers with smart masks it was: same masks, variation and
+/// blending, compared texel by texel. Side-by-side pictures go to
+/// `target/bake_test/smart_graph/`.
+#[test]
+#[ignore]
+fn smart_material_graphs_match_their_layers() {
+    use crate::engine::{CHANNELS, FillParams};
+    use crate::graph::{self, Library, Runtime};
+    use crate::undo::UndoStack;
+
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::RoundedCube.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 512;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &BakeSettings::default(), res);
+    engine.set_maps(maps, report);
+    let lib = Library::load(None);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/smart_graph");
+    std::fs::create_dir_all(&dir).unwrap();
+    let read = |e: &Engine| [0, 1, 2, 3].map(|c| read_texture(&rs.device, &rs.queue, e.final_tex(c)));
+    // Texels on the mesh (the rest is padding either way).
+    let pos = read_texture(&rs.device, &rs.queue, engine.surface_maps().0);
+    let covered: Vec<bool> = pos.chunks(8).map(|p| p[6] != 0 || p[7] != 0).collect();
+
+    let mut names: Vec<&str> = vec!["Painted Steel Worn", "Oak Aged", "Rusty Iron", "Brass Aged", "Concrete Weathered"];
+    let scanned = presets::SMART_MATERIALS.iter().find(|s| s.is_scanned() && crate::environment::asset_dir("pbr").is_some());
+    names.extend(scanned.map(|s| s.name));
+    for name in names {
+        let smart = presets::SMART_MATERIALS.iter().find(|s| s.name == name).unwrap();
+        let mut undo = UndoStack::default();
+        engine.layers.clear();
+        let folder = crate::app::add_smart_material(&mut engine, &mut undo, smart, 0, None);
+        engine.composite();
+        let layers = read(&engine);
+
+        let mut g = graph::smart::graph(smart, &lib);
+        g.res = res;
+        let mut rt = Runtime::new(&rs.device, &rs.queue);
+        let maps = |m: usize| engine.mesh_map(m);
+        let surface = engine.graph_surface();
+        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, Some(&surface), engine.maps_version, true);
+        rt.wait_images(&rs.device, &rs.queue);
+        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, Some(&surface), engine.maps_version, true);
+        assert!(rt.errors.is_empty(), "{name}: {:?}", rt.errors);
+        let outs = g.outputs(&lib).map(|o| o.and_then(|n| rt.output(n).cloned()));
+        let chans: [Option<std::sync::Arc<crate::gpu::Tex>>; CHANNELS] = graph::channel_outputs(&outs);
+        let mut fill = FillParams { graph: Some(1), ..FillParams::default() };
+        fill.mat.enabled = chans.clone().map(|o| o.is_some());
+        engine.layers[folder].visible = false;
+        let top = engine.layers.len();
+        let idx = engine.add_fill_layer(top, None, "Graph".into(), fill, &mut undo);
+        engine.set_graph_images(idx, chans, name);
+        engine.composite();
+        let graph = read(&engine);
+
+        // Color: layers left, graph right.
+        let mut sheet = image::RgbaImage::new(res * 2, res);
+        for (k, src) in [&layers[0], &graph[0]].into_iter().enumerate() {
+            for (i, px) in src.chunks(4).enumerate() {
+                let (x, y) = ((i as u32 % res) + k as u32 * res, i as u32 / res);
+                sheet.put_pixel(x, y, image::Rgba([px[0], px[1], px[2], 255]));
+            }
+        }
+        sheet.save(dir.join(format!("{}.png", name.replace(' ', "_")))).unwrap();
+        let mut report = Vec::new();
+        for (c, cname) in [(0, "color"), (1, "roughness"), (2, "metallic")] {
+            let (a, b) = (&layers[c], &graph[c]);
+            let step = if c == 0 { 4 } else { 1 };
+            let mut diffs: Vec<i32> = Vec::new();
+            for (i, _) in covered.iter().enumerate().filter(|(_, c)| **c) {
+                let k = i * step;
+                let d = (0..if c == 0 { 3 } else { 1 }).map(|j| (a[k + j] as i32 - b[k + j] as i32).abs()).max().unwrap();
+                diffs.push(d);
+            }
+            diffs.sort_unstable();
+            let mean = diffs.iter().sum::<i32>() as f32 / diffs.len().max(1) as f32;
+            let p99 = diffs[(diffs.len() as f32 * 0.99) as usize];
+            report.push(format!("{cname} mean {mean:.2} p99 {p99}"));
+            assert!(mean < 2.5 && p99 < 24, "{name} {cname}: layers and graph differ (mean {mean:.2}, 99th percentile {p99})");
+        }
+        println!("  {name}: {}", report.join(", "));
+    }
+}
+
+/// The skin, organic and eye smart materials, each as the graph layer the
+/// shelf adds, on a sphere seen from its front (+Z): a contact sheet in
+/// `target/bake_test/smart_graph/organic.png` (names in the test output,
+/// left to right, top to bottom).
+#[test]
+#[ignore]
+fn organic_smart_materials_sheet() {
+    use crate::engine::{CHANNELS, FillParams};
+    use crate::graph::{self, Library, Runtime};
+    use crate::undo::UndoStack;
+
+    let rs = render_state();
+    let mesh = crate::mesh::Primitive::Sphere.build();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 1024;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let (maps, report, _) = run_bake(&rs.device, &rs.queue, &mesh, &gpu_mesh, &BakeSettings::default(), res);
+    engine.set_maps(maps, report);
+    let lib = Library::load(None);
+    let names = [
+        "Skin Realistic",
+        "Skin Dark",
+        "Skin Stylized",
+        "Flesh Raw",
+        "Reptile Scales",
+        "Fungus Spotted",
+        "Insect Chitin",
+        "Eyeball Blue",
+        "Eyeball Brown",
+    ];
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let cam = OrbitCam { yaw: 0.35, pitch: 0.2, dist: 2.9, ..Default::default() };
+    let tile = 320u32;
+    let cols = 3u32;
+    let mut sheet = image::RgbaImage::new(tile * cols, tile * names.len().div_ceil(cols as usize) as u32);
+    for (k, name) in names.iter().enumerate() {
+        let smart = presets::SMART_MATERIALS.iter().find(|s| s.name == *name).unwrap_or_else(|| panic!("no smart material {name}"));
+        assert_eq!(smart.kind(), presets::MaterialType::Organic, "{name} sorts under skin & organic");
+        let mut g = graph::smart::graph(smart, &lib);
+        g.res = res;
+        let mut rt = Runtime::new(&rs.device, &rs.queue);
+        let maps = |m: usize| engine.mesh_map(m);
+        let surface = engine.graph_surface();
+        rt.evaluate(&rs.device, &rs.queue, &g, &lib, &maps, Some(&surface), engine.maps_version, true);
+        assert!(rt.errors.is_empty(), "{name}: {:?}", rt.errors);
+        let outs = g.outputs(&lib).map(|o| o.and_then(|n| rt.output(n).cloned()));
+        let chans: [Option<std::sync::Arc<crate::gpu::Tex>>; CHANNELS] = graph::channel_outputs(&outs);
+        let mut fill = FillParams { graph: Some(1), ..FillParams::default() };
+        fill.mat.enabled = chans.clone().map(|o| o.is_some());
+        engine.layers.clear();
+        let idx = engine.add_fill_layer(0, None, "Graph".into(), fill, &mut UndoStack::default());
+        engine.set_graph_images(idx, chans, name);
+        engine.composite();
+        let settings = ViewSettings::default();
+        views.render_3d(&rs, [tile, tile], &[&engine], &env, &gpu_mesh, &cam, &settings, None);
+        let px = read_texture(&rs.device, &rs.queue, views.view3d.image());
+        let (x0, y0) = ((k as u32 % cols) * tile, (k as u32 / cols) * tile);
+        for (i, p) in px.chunks(4).enumerate() {
+            sheet.put_pixel(x0 + i as u32 % tile, y0 + i as u32 / tile, image::Rgba([p[0], p[1], p[2], 255]));
+        }
+        println!("  {k}: {name}, {} nodes, {} parameters", g.nodes.len(), g.params.len());
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/smart_graph");
+    std::fs::create_dir_all(&dir).unwrap();
+    sheet.save(dir.join("organic.png")).unwrap();
+}
+
+/// Normal and specular channels: the final normal is flat and specular 0.5
+/// until a layer sets them; a fill's normal-map image comes out as
+/// authored in tangent space whether it's laid by UV or tri-planar (the
+/// tangent map turns world slopes back); layers add their normal detail;
+/// specular raises the reflection of non-metals in the view; exports carry
+/// the painted normal and write a specular map only when one is set.
+/// Frames go to `target/bake_test/normal_spec_*.png`.
+#[test]
+#[ignore]
+fn normal_and_specular_channels() {
+    use crate::engine::{FINAL_NORMAL, FINAL_SPECULAR, FillParams, MatValues, NORMAL, Projection, SPECULAR};
+    use crate::undo::UndoStack;
+
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 256;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = UndoStack::default();
+    let grey = MatValues { color: [0.5, 0.5, 0.5], rough: 0.35, ..Default::default() };
+    engine.add_fill_layer(0, None, "Base".into(), FillParams { mat: grey, ..Default::default() }, &mut undo);
+    engine.composite();
+    let texel = |e: &Engine, ch: usize| {
+        let px = read_texture(&rs.device, &rs.queue, e.final_tex(ch));
+        let bpp = px.len() / (res * res) as usize;
+        let i = ((res / 2) * res + res / 2) as usize * bpp;
+        px[i..i + bpp].to_vec()
+    };
+    let decode = |t: &[u8]| Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32) / 127.5 - Vec3::ONE;
+    assert!(decode(&texel(&engine, FINAL_NORMAL)).distance(Vec3::Z) < 0.02, "flat until a layer sets normals");
+    assert!((texel(&engine, FINAL_SPECULAR)[0] as i32 - 128).abs() <= 1, "specular 0.5 until a layer sets it");
+    assert!(!engine.uses_channel(NORMAL) && !engine.uses_channel(SPECULAR));
+
+    // A normal-map image tilted one way, everywhere.
+    let tilted = |n: Vec3| {
+        let n = n.normalize();
+        let c = ((n * 0.5 + Vec3::splat(0.5)) * 255.0).round();
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([c.x as u8, c.y as u8, c.z as u8]));
+        let mut bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        bytes
+    };
+    let layer_with = |engine: &mut Engine, undo: &mut UndoStack, n: Vec3, projection: Projection| {
+        let mut mat = MatValues { enabled: [false; crate::engine::CHANNELS], ..Default::default() };
+        mat.enabled[NORMAL] = true;
+        let at = engine.layers.len();
+        let idx = engine.add_fill_layer(at, None, "Normal".into(), FillParams { mat, projection, ..Default::default() }, undo);
+        let img = engine.decode_channel_image(NORMAL, "tilt.png".into(), Arc::new(tilted(n))).unwrap();
+        engine.set_fill_image(idx, NORMAL, Some(img), undo);
+        engine.composite();
+        idx
+    };
+    for (what, tilt) in [("toward +u", Vec3::new(0.5, 0.0, 0.866)), ("toward +v (up the image)", Vec3::new(0.0, 0.5, 0.866))] {
+        let idx = layer_with(&mut engine, &mut undo, tilt, Projection::Uv);
+        let uv = decode(&texel(&engine, FINAL_NORMAL));
+        engine.delete_layer(idx, &mut undo);
+        let idx = layer_with(&mut engine, &mut undo, tilt, Projection::Triplanar);
+        let tri = decode(&texel(&engine, FINAL_NORMAL));
+        engine.delete_layer(idx, &mut undo);
+        println!("  tilt {what}: by UV {uv:.3}, tri-planar {tri:.3}");
+        assert!(uv.distance(tilt.normalize()) < 0.03, "a UV normal image comes out as authored ({what}: {uv})");
+        assert!(tri.distance(uv) < 0.05, "tri-planar matches UV on a plane laid out along its axes ({what}: {tri} vs {uv})");
+    }
+    assert!(engine.uses_channel(NORMAL) == false, "deleted layers leave no normals");
+
+    // Two layers add their detail.
+    let one = layer_with(&mut engine, &mut undo, Vec3::new(0.3, 0.0, 0.95), Projection::Uv);
+    let single = decode(&texel(&engine, FINAL_NORMAL));
+    layer_with(&mut engine, &mut undo, Vec3::new(0.3, 0.0, 0.95), Projection::Uv);
+    let both = decode(&texel(&engine, FINAL_NORMAL));
+    println!("  one layer x {:.3}, two layers x {:.3}", single.x, both.x);
+    assert!(both.x > single.x + 0.1, "layers add normal detail");
+    assert!(engine.uses_channel(NORMAL));
+    let _ = one;
+
+    // Specular: a fill sets it, and non-metals reflect more for it.
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let cam = OrbitCam { pitch: 0.5, dist: 3.0, ..Default::default() };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut frame = |engine: &Engine, name: &str| {
+        // A black backdrop: only the surface counts.
+        let s = ViewSettings { background: crate::viewport::Background::Color, bg_color: [0.0; 3], ..ViewSettings::default() };
+        views.render_3d(&rs, [400, 400], &[engine], &env, &gpu_mesh, &cam, &s, None);
+        let px = read_texture(&rs.device, &rs.queue, views.view3d.image());
+        image::save_buffer(dir.join(name), &px, 400, 400, image::ExtendedColorType::Rgba8).unwrap();
+        px.chunks(4).map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64).sum::<u64>()
+    };
+    let spec_layer = |engine: &mut Engine, undo: &mut UndoStack, v: f32| {
+        // A dark, glossy non-metal: what it shows is mostly its reflection.
+        let mut mat = MatValues { color: [0.02; 3], rough: 0.2, specular: v, ..Default::default() };
+        mat.enabled[SPECULAR] = true;
+        let at = engine.layers.len();
+        let idx = engine.add_fill_layer(at, None, "Specular".into(), FillParams { mat, ..Default::default() }, undo);
+        engine.composite();
+        idx
+    };
+    let none = spec_layer(&mut engine, &mut undo, 0.0);
+    assert!(texel(&engine, FINAL_SPECULAR)[0] <= 1, "a fill sets specular");
+    let dull = frame(&engine, "normal_spec_dull.png");
+    engine.delete_layer(none, &mut undo);
+    spec_layer(&mut engine, &mut undo, 1.0);
+    assert!(texel(&engine, FINAL_SPECULAR)[0] >= 254);
+    let shiny = frame(&engine, "normal_spec_shiny.png");
+    println!("  view brightness: specular 0 {dull}, specular 1 {shiny}");
+    assert!(shiny > dull * 3 / 2, "more specular reflects more");
+
+    // Export: the normal map carries the painted normal; a specular map only when set.
+    use crate::export::{self, Format, Padding, Settings};
+    let folder = dir.join("normal_spec_export");
+    let _ = std::fs::remove_dir_all(&folder);
+    let template = export::builtin_templates().into_iter().find(|t| t.name.starts_with("PBR Metallic Roughness")).unwrap();
+    let settings = |name: &str| Settings {
+        folder: folder.clone(),
+        mesh_name: name.into(),
+        project_name: "Test".into(),
+        set_name: name.into(),
+        set_count: 1,
+        format: Format::Png,
+        depth: export::Depth::U8,
+        size: None,
+        padding: Padding::Infinite,
+        normal_strength: 1.0,
+        use_baked_normal: false,
+    };
+    let files = export::export(&export::snapshot(&engine, &rs.device, &rs.queue, mesh.clone()), &template, &settings("Set")).unwrap();
+    let normal = files.iter().find(|f| f.to_string_lossy().contains("Normal")).expect("a normal map");
+    let n = image::open(normal).unwrap().to_rgb8();
+    let c = n.get_pixel(res / 2, res / 2);
+    println!("  exported normal at the center: {c:?}");
+    assert!(c[0] > 160, "the exported normal leans the painted way");
+    let spec = files.iter().find(|f| f.to_string_lossy().contains("Specular")).expect("a specular map, since one is set");
+    assert!(image::open(spec).unwrap().to_luma8().get_pixel(res / 2, res / 2)[0] >= 250);
+
+    let mut plain = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    plain.add_fill_layer(0, None, "Base".into(), FillParams { mat: grey, ..Default::default() }, &mut undo);
+    plain.composite();
+    let files = export::export(&export::snapshot(&plain, &rs.device, &rs.queue, mesh.clone()), &template, &settings("Plain")).unwrap();
+    assert!(!files.iter().any(|f| f.to_string_lossy().contains("Specular")), "no specular map when none is set");
+}
+
+/// The shelf in a narrow window: categories as icons, a header that packs
+/// tight (no hint, - / + for the size) without overlapping, and small
+/// thumbnails without names. Frames go to `target/bake_test/ui/shelf_*.png`.
+#[test]
+#[ignore]
+fn shelf_compact_when_narrow() {
+    use crate::app::PainterApp;
+    use egui_kittest::kittest::Queryable;
+    let build = |w: f32| {
+        let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+        setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+            label: Some("ui test device"),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        });
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([w, 800.0])
+            .with_pixels_per_point(1.0)
+            .with_accessibility_check(false)
+            .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+            .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+        h.run_steps(4);
+        h.state_mut().test_close_dialogs();
+        h.run_steps(2);
+        h
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut wide = build(1600.0);
+    wide.render().expect("renders").save(dir.join("shelf_wide.png")).unwrap();
+    assert!(wide.query_all_by_label_contains("Get more assets").count() > 0, "a wide shelf names the button");
+    assert!(wide.query_by_label("+").is_none(), "and sizes with the slider");
+
+    let mut narrow = build(1000.0);
+    narrow.render().expect("renders").save(dir.join("shelf_narrow.png")).unwrap();
+    assert!(narrow.query_by_label("+").is_some() && narrow.query_by_label("-").is_some(), "a narrow shelf sizes with - / +");
+    for _ in 0..3 {
+        narrow.get_by_label("-").click();
+        narrow.run_steps(2);
+    }
+    narrow.render().expect("renders").save(dir.join("shelf_narrow_small.png")).unwrap();
+}
+
+/// Polygon fill padding in a tight UV layout: two islands a texel apart,
+/// one filled with wide padding. The padding fills the empty gutter around
+/// the filled island but never the texels of its neighbor.
+#[test]
+#[ignore]
+fn poly_fill_padding_stays_off_other_islands() {
+    use crate::engine::{BrushPaint, CHANNELS, FillParams, MatValues};
+    use crate::undo::{StrokeTarget, UndoStack};
+    use glam::Vec2;
+
+    // Two quads apart in space; in UV, A spans u 0.10..0.495 and B
+    // 0.505..0.90 (about a texel apart at 128²), both v 0.1..0.9.
+    let quad = |x0: f32, x1: f32, u0: f32, u1: f32| {
+        let p = [Vec3::new(x0, 0.0, -1.0), Vec3::new(x1, 0.0, -1.0), Vec3::new(x1, 0.0, 1.0), Vec3::new(x0, 0.0, 1.0)];
+        let uv = [Vec2::new(u0, 0.1), Vec2::new(u1, 0.1), Vec2::new(u1, 0.9), Vec2::new(u0, 0.9)];
+        (p, uv)
+    };
+    let (pa, ua) = quad(-1.0, -0.1, 0.10, 0.495);
+    let (pb, ub) = quad(0.1, 1.0, 0.505, 0.90);
+    let positions: Vec<Vec3> = pa.into_iter().chain(pb).collect();
+    let uvs: Vec<Vec2> = ua.into_iter().chain(ub).collect();
+    let indices = vec![0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6];
+    let mesh = Mesh::from_parts("Two islands".into(), positions, Some(vec![Vec3::Y; 8]), uvs, indices);
+    let topo = crate::polyfill::Topology::build(&mesh);
+
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 128;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = UndoStack::default();
+    let black = MatValues { color: [0.0; 3], ..Default::default() };
+    engine.add_fill_layer(0, None, "Black".into(), FillParams { mat: black, ..Default::default() }, &mut undo);
+    engine.add_paint_layer(1, None, None, &mut undo);
+    let mut only = [false; CHANNELS];
+    only[0] = true;
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, only, false));
+    // Island A's triangles (the first two), padded 8 texels.
+    let a: Vec<u32> = (0..topo.triangle_count() as u32).filter(|&t| topo.uv_centroid(t).x < 0.5).collect();
+    assert_eq!(a.len(), 2);
+    let geometry = topo.uv_geometry(&a, 8.0 / res as f32);
+    assert!(!geometry.padding.is_empty(), "A's outline is padded");
+    let red = MatValues { color: [1.0, 0.0, 0.0], enabled: only, ..Default::default() };
+    engine.stroke_polys(&geometry, &BrushPaint { mat: red, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4] });
+    engine.end_stroke();
+    engine.composite();
+
+    let color = read_texture(&rs.device, &rs.queue, engine.final_tex(0));
+    let at = |u: f32, v: f32| {
+        let (x, y) = ((u * res as f32) as usize, (v * res as f32) as usize);
+        color[(y * res as usize + x) * 4]
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    image::save_buffer(dir.join("poly_padding_islands.png"), &color, res, res, image::ExtendedColorType::Rgba8).unwrap();
+    assert!(at(0.3, 0.5) > 200, "island A is filled");
+    assert!(at(0.07, 0.5) > 200 && at(0.3, 0.06) > 200, "the empty gutter around A is padded");
+    // Every texel of B, including the ones right at its edge facing A.
+    let spill: Vec<f32> = (0..20).map(|i| 0.51 + i as f32 * 0.02).filter(|&u| u < 0.9 && at(u, 0.5) > 40).collect();
+    assert!(spill.is_empty(), "padding spilled onto island B at u = {spill:?}");
+}
+
+/// Bloom around emission: with Bloom on at its default threshold, a plane
+/// giving off pure red light (the hardest case for a luminance threshold:
+/// 0.21 of white's) spreads a red glow onto the background around it, at
+/// the default emission strength. Frames go to `target/bake_test/bloom_*.png`.
+#[test]
+#[ignore]
+fn bloom_glows_around_red_emission() {
+    use crate::engine::{CHANNELS, EMISSION, FillParams, MatValues};
+    use crate::undo::UndoStack;
+
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 256);
+    let mut undo = UndoStack::default();
+    let mut enabled = [false; CHANNELS];
+    enabled[0] = true;
+    enabled[EMISSION] = true;
+    let mat = MatValues { color: [0.05, 0.05, 0.05], emission: [1.0, 0.0, 0.0], enabled, ..Default::default() };
+    engine.add_fill_layer(0, None, "Red light".into(), FillParams { mat, ..Default::default() }, &mut undo);
+    engine.composite();
+    assert!(engine.uses_emission());
+
+    // The plane fills the middle of the frame; background all around.
+    let cam = OrbitCam { pitch: 1.2, dist: 5.0, ..Default::default() };
+    let size = [512u32, 512u32];
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut frame = |bloom: f32, emission: f32, name: &str| {
+        let mut s = ViewSettings::default();
+        s.post.bloom = bloom;
+        s.emission = emission;
+        views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &s, None);
+        let px = read_texture(&rs.device, &rs.queue, views.view3d.image());
+        image::save_buffer(dir.join(name), &px, size[0], size[1], image::ExtendedColorType::Rgba8).unwrap();
+        px
+    };
+    let strength = ViewSettings::default().emission;
+    let plain = frame(0.0, strength, "bloom_off.png");
+    // Background: pixels that aren't red without bloom.
+    let redness = |p: &[u8]| p[0] as i32 - (p[1] as i32 + p[2] as i32) / 2;
+    let background: Vec<usize> = plain.chunks(4).enumerate().filter(|(_, p)| redness(p) < 20).map(|(i, _)| i).collect();
+    assert!(background.len() > 20_000 && background.len() < plain.len() / 4 - 20_000, "the plane and the background both show");
+    let halo = |px: &[u8]| background.iter().filter(|&&i| redness(&px[i * 4..i * 4 + 4]) - redness(&plain[i * 4..i * 4 + 4]) > 12).count();
+    for s in [1.0, 2.0, 4.0] {
+        let px = frame(1.0, s, &format!("bloom_strength_{s}.png"));
+        println!("  emission strength {s}: {} background pixels glow red", halo(&px));
+    }
+    let glow = frame(1.0, strength, "bloom_on.png");
+    let n = halo(&glow);
+    println!("  default strength {strength}: {n} background pixels glow red");
+    assert!(n > 3000, "red emission blooms onto the background at the default settings ({n})");
+}
+
+/// Emission: a fill that emits fills the final emission texture, a stroke
+/// on the emission channel paints only where it goes, the 3D view glows
+/// there (and brighter with the view's emission strength), and exports write
+/// an emission map only for a set that emits. Frames go to
+/// `target/bake_test/emission_*.png`.
+#[test]
+#[ignore]
+fn emission_paints_glows_and_exports() {
+    use crate::app::{BrushProjection, resolve_stamps};
+    use crate::engine::{BrushPaint, CHANNELS, EMISSION, FINAL_EMISSION, FillParams, MatValues, StampUniform};
+    use crate::undo::{StrokeTarget, UndoStack};
+    use glam::Vec2;
+
+    let mesh = Arc::new(crate::mesh::Primitive::Plane.build());
+    let bvh = crate::bvh::Bvh::from_mesh(&mesh);
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 256);
+    let mut undo = UndoStack::default();
+    let dark = MatValues { color: [0.05, 0.05, 0.05], rough: 0.8, ..Default::default() };
+    engine.add_fill_layer(0, None, "Dark".into(), FillParams { mat: dark, ..Default::default() }, &mut undo);
+    engine.add_paint_layer(1, None, None, &mut undo);
+    engine.composite();
+    assert!(!engine.uses_emission());
+    let emission = |e: &Engine| read_texture(&rs.device, &rs.queue, e.final_tex(FINAL_EMISSION));
+    assert!(emission(&engine).chunks(4).all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0), "nothing emits yet");
+
+    // A stroke of green light across the middle.
+    let mut only = [false; CHANNELS];
+    only[EMISSION] = true;
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, only, false));
+    let cam = OrbitCam { pitch: 1.5, dist: 3.2, ..Default::default() };
+    let size = [512u32, 512u32];
+    let fsize = Vec2::new(size[0] as f32, size[1] as f32);
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let settings = ViewSettings::default();
+    views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
+    let dark_frame = read_texture(&rs.device, &rs.queue, views.view3d.image());
+    let radius = 30.0;
+    let raw: Vec<([f32; 4], f32)> = (0..40).map(|i| ([100.0 + i as f32 * 8.0, 256.0, 1.0, 0.0], 1.0)).collect();
+    let stamps = resolve_stamps(&mesh, &bvh, &cam, fsize, BrushProjection::Screen, 1, radius, &raw);
+    let su = StampUniform {
+        view_proj: cam.view_proj(fsize.x / fsize.y).to_cols_array_2d(),
+        cam_pos: cam.eye().extend(1.0).to_array(),
+        view: [fsize.x, fsize.y, 0.0, 0.0],
+        view2d: [0.0; 4],
+        brush: [radius, 0.6, 1.0, 0.0],
+        clip: [crate::viewport::NEAR, crate::viewport::FAR, 0.0, 0.0],
+        proj: [BrushProjection::Screen as u32 as f32, 0.0, 85f32.to_radians().cos(), 0.0],
+    };
+    let mut green = MatValues { emission: [0.1, 1.0, 0.2], ..Default::default() };
+    green.enabled = only;
+    let paint = BrushPaint { mat: green, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4] };
+    engine.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
+    engine.end_stroke();
+    engine.composite();
+    assert!(engine.uses_emission());
+    let e = emission(&engine);
+    let lit = e.chunks(4).filter(|p| p[1] > 200 && p[0] < 80).count();
+    println!("  emission stroke: {lit} glowing texels of {}", e.len() / 4);
+    assert!(lit > 500 && lit < e.len() / 4 / 2, "the stroke emits, the rest doesn't ({lit})");
+    // Only emission was painted: the color under it is still dark.
+    let color = read_texture(&rs.device, &rs.queue, engine.final_tex(0));
+    let i = e.chunks(4).position(|p| p[1] > 200).unwrap();
+    assert!(color[i * 4 + 1] < 40, "base color untouched under the stroke");
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut frame = |strength: f32| {
+        let s = ViewSettings { emission: strength, ..ViewSettings::default() };
+        views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &s, None);
+        read_texture(&rs.device, &rs.queue, views.view3d.image())
+    };
+    let glow = frame(1.0);
+    let bright = frame(4.0);
+    image::save_buffer(dir.join("emission_glow.png"), &glow, size[0], size[1], image::ExtendedColorType::Rgba8).unwrap();
+    image::save_buffer(dir.join("emission_bright.png"), &bright, size[0], size[1], image::ExtendedColorType::Rgba8).unwrap();
+    let green_px = |px: &[u8]| px.chunks(4).filter(|p| p[1] as i32 > p[0] as i32 + 60 && p[1] as i32 > p[2] as i32 + 40).count();
+    let sum_g = |px: &[u8]| px.chunks(4).map(|p| p[1] as u64).sum::<u64>();
+    println!("  green pixels: {} dark, {} glowing; green sum x1 {} x4 {}", green_px(&dark_frame), green_px(&glow), sum_g(&glow), sum_g(&bright));
+    assert!(green_px(&glow) > green_px(&dark_frame) + 2000, "the stroke glows in the 3D view");
+    assert!(sum_g(&bright) > sum_g(&glow), "a stronger emission setting glows brighter");
+
+    // Export: an emission map for this set; none for a set that emits nothing.
+    use crate::export::{self, Format, Padding, Settings};
+    let folder = dir.join("emission_export");
+    let _ = std::fs::remove_dir_all(&folder);
+    let gltf = export::builtin_templates().into_iter().find(|t| t.name.starts_with("glTF")).unwrap();
+    let settings = |name: &str| Settings {
+        folder: folder.clone(),
+        mesh_name: name.into(),
+        project_name: "Test".into(),
+        set_name: name.into(),
+        set_count: 1,
+        format: Format::Png,
+        depth: export::Depth::U8,
+        size: None,
+        padding: Padding::Infinite,
+        normal_strength: 1.0,
+        use_baked_normal: false,
+    };
+    let snap = export::snapshot(&engine, &rs.device, &rs.queue, mesh.clone());
+    let files = export::export(&snap, &gltf, &settings("Glow")).expect("exports");
+    let file = files.iter().find(|f| f.to_string_lossy().contains("emissive")).expect("an emission map");
+    let img = image::open(file).unwrap().to_rgb8();
+    let max_g = img.pixels().map(|p| p[1]).max().unwrap();
+    println!("  {}: brightest green {max_g}", file.display());
+    assert!(max_g > 200, "the emission map carries the stroke");
+
+    let mut plain = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), 64);
+    plain.add_fill_layer(0, None, "Dark".into(), FillParams { mat: dark, ..Default::default() }, &mut undo);
+    plain.composite();
+    let snap = export::snapshot(&plain, &rs.device, &rs.queue, mesh.clone());
+    let files = export::export(&snap, &gltf, &settings("Plain")).expect("exports");
+    assert!(!files.iter().any(|f| f.to_string_lossy().contains("emissive")), "no emission map for a set that emits nothing: {files:?}");
 }
 
 /// A clean picture of a Painter project opened in Material Painter (`MP_SPP_SHOT=a.spp`): no

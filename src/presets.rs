@@ -97,11 +97,14 @@ impl MaterialPreset {
     pub fn fill(&self) -> FillParams {
         FillParams {
             mat: MatValues {
-                enabled: [true, true, true, self.height_var > 0.0],
+                enabled: [true, true, true, self.height_var > 0.0, false, false, false, false],
                 color: self.color,
                 rough: self.rough,
                 metal: self.metal,
                 height: 0.0,
+                opacity: 1.0,
+                emission: [0.0; 3],
+                ..MatValues::default()
             },
             color_var: self.color_var,
             var_scale: self.var_scale,
@@ -146,6 +149,7 @@ const fn mix(kind: GenKind, weights: &'static [(usize, f32)], level: f32, contra
 pub const COLOR_ONLY: [bool; 4] = [true, false, false, false];
 pub const HEIGHT_ONLY: [bool; 4] = [false, false, false, true];
 pub const ROUGH_ONLY: [bool; 4] = [false, true, false, false];
+// (Smart layers name their channels among the first four; opacity stays off.)
 
 pub struct SmartLayer {
     pub name: &'static str,
@@ -295,6 +299,110 @@ pub const MICRO_DETAIL: [SmartLayer; 2] = [
 
 /// Lighter grime for scanned sets, which already carry their own dirt.
 const SCAN_GRIME: SmartLayer = SmartLayer { color: Some([0.12, 0.09, 0.06]), opacity: 0.4, ..GRIME_LAYER };
+
+// Skin: shared layers. Blood under the skin shows where it's thin or creased.
+const SKIN_FLUSH: SmartLayer = SmartLayer {
+    color: Some([0.78, 0.40, 0.34]),
+    opacity: 0.45,
+    channels: Some(COLOR_ONLY),
+    mask: Some(SmartMask { noise: Some(0.6), scale: Some(3.0), ..mix(GenKind::Clouds, &[(NOISE, 0.7), (THIN, 0.6), (CONCAVE, 0.8)], 0.55, 0.25) }),
+    ..layer("Flush", "Skin")
+};
+/// Faint bluish veins.
+const SKIN_VEINS: SmartLayer = SmartLayer {
+    color: Some([0.52, 0.55, 0.66]),
+    opacity: 0.18,
+    channels: Some(COLOR_ONLY),
+    mask: Some(SmartMask { scale: Some(1.5), noise: Some(0.2), ..mix(GenKind::Clouds, &[(SCRATCHES, 1.0), (THIN, 0.4)], 0.35, 0.12) }),
+    ..layer("Veins", "Skin")
+};
+/// Pores: tiny pits, a little rougher.
+const SKIN_PORES: SmartLayer = SmartLayer {
+    height: Some(-0.12),
+    rough: Some(0.55),
+    opacity: 0.8,
+    channels: Some([false, true, false, true]),
+    mask: Some(SmartMask { scale: Some(40.0), noise: Some(0.0), invert: true, ..mix(GenKind::Clouds, &[(CELLS, 1.0)], 0.15, 0.05) }),
+    ..layer("Pores", "Skin")
+};
+/// Darker skin in folds and creases.
+const SKIN_FOLDS: SmartLayer = SmartLayer {
+    color: Some([0.55, 0.36, 0.29]),
+    opacity: 0.4,
+    channels: Some(COLOR_ONLY),
+    mask: Some(SmartMask { noise: Some(0.3), edge_width: Some(0.01), ..mix(GenKind::CreaseGrime, &[(CAVITY, 1.5), (CREASE, 1.0), (OCCLUSION, 0.8)], 0.5, 0.2) }),
+    ..layer("Folds", "Skin")
+};
+/// Oil: shinier on the high points (nose, cheekbones, forehead).
+const SKIN_SHEEN: SmartLayer = SmartLayer {
+    rough: Some(0.28),
+    opacity: 0.7,
+    channels: Some(ROUGH_ONLY),
+    mask: Some(SmartMask { noise: Some(0.4), scale: Some(2.0), ..mix(GenKind::Clouds, &[(CONVEX, 1.5), (SKY, 0.4), (NOISE, 0.3)], 0.55, 0.2) }),
+    ..layer("Oily Sheen", "Skin")
+};
+
+// Eyes: a sphere looking down +Z. The Front distance input (the angle from
+// the front) draws the rings: iris, limbal ring, pupil, cornea.
+const fn eye_ring(level: f32, contrast: f32) -> SmartMask {
+    SmartMask { invert: true, noise: Some(0.0), ..mix(GenKind::Clouds, &[(FRONT, 1.0)], level, contrast) }
+}
+const EYE_SCLERA: SmartLayer = SmartLayer { color: Some([0.93, 0.90, 0.86]), rough: Some(0.12), color_var: Some(0.03), var_scale: Some(6.0), ..layer("Sclera", "Porcelain") };
+/// Pinker toward the back.
+const EYE_BACK: SmartLayer = SmartLayer {
+    color: Some([0.90, 0.72, 0.68]),
+    opacity: 0.5,
+    channels: Some(COLOR_ONLY),
+    mask: Some(SmartMask { noise: Some(0.2), scale: Some(3.0), ..mix(GenKind::Clouds, &[(FRONT, 1.0)], 0.5, 0.2) }),
+    ..layer("Pink Back", "Porcelain")
+};
+/// Veins, more of them toward the sides.
+const EYE_VEINS: SmartLayer = SmartLayer {
+    color: Some([0.72, 0.14, 0.12]),
+    opacity: 0.85,
+    channels: Some(COLOR_ONLY),
+    mask: Some(SmartMask { scale: Some(1.2), noise: Some(0.0), ..mix(GenKind::Clouds, &[(SCRATCHES, 1.6), (FRONT, 0.7)], 0.5, 0.1) }),
+    ..layer("Veins", "Porcelain")
+};
+/// The dark band round the iris.
+const EYE_LIMBAL: SmartLayer = SmartLayer {
+    color: Some([0.08, 0.09, 0.10]),
+    channels: Some(COLOR_ONLY),
+    mask: Some(eye_ring(0.165, 0.012)),
+    ..layer("Limbal Ring", "Porcelain")
+};
+/// The iris: fibrous color, set a little back.
+const EYE_IRIS: SmartLayer = SmartLayer {
+    color: Some([0.25, 0.45, 0.62]),
+    color_var: Some(0.35),
+    var_scale: Some(40.0),
+    height: Some(-0.15),
+    channels: Some([true, false, false, true]),
+    mask: Some(eye_ring(0.145, 0.008)),
+    ..layer("Iris", "Porcelain")
+};
+/// A lighter ring round the pupil.
+const EYE_INNER: SmartLayer = SmartLayer {
+    color: Some([0.55, 0.50, 0.30]),
+    opacity: 0.5,
+    channels: Some(COLOR_ONLY),
+    mask: Some(eye_ring(0.085, 0.03)),
+    ..layer("Inner Iris", "Porcelain")
+};
+const EYE_PUPIL: SmartLayer = SmartLayer { color: Some([0.01, 0.01, 0.012]), channels: Some(COLOR_ONLY), mask: Some(eye_ring(0.055, 0.006)), ..layer("Pupil", "Porcelain") };
+/// The cornea: glassy over the iris.
+const EYE_CORNEA: SmartLayer = SmartLayer { rough: Some(0.02), channels: Some(ROUGH_ONLY), mask: Some(eye_ring(0.2, 0.03)), ..layer("Cornea", "Porcelain") };
+const EYE_BLUE: [SmartLayer; 8] = [EYE_SCLERA, EYE_BACK, EYE_VEINS, EYE_LIMBAL, EYE_IRIS, EYE_INNER, EYE_PUPIL, EYE_CORNEA];
+const EYE_BROWN: [SmartLayer; 8] = [
+    EYE_SCLERA,
+    EYE_BACK,
+    EYE_VEINS,
+    EYE_LIMBAL,
+    SmartLayer { color: Some([0.33, 0.18, 0.08]), ..EYE_IRIS },
+    SmartLayer { color: Some([0.50, 0.32, 0.12]), ..EYE_INNER },
+    EYE_PUPIL,
+    EYE_CORNEA,
+];
 
 pub const SMART_MATERIALS: &[SmartMaterial] = &[
     SmartMaterial {
@@ -1538,6 +1646,189 @@ pub const SMART_MATERIALS: &[SmartMaterial] = &[
             },
         ],
     },
+    // ---------------------------------------------------------------- skin
+    SmartMaterial {
+        name: "Skin Realistic",
+        layers: &[
+            SmartLayer { color: Some([0.80, 0.58, 0.47]), rough: Some(0.45), color_var: Some(0.05), var_scale: Some(12.0), ..layer("Skin", "Skin") },
+            SKIN_FLUSH,
+            SKIN_VEINS,
+            SmartLayer {
+                color: Some([0.50, 0.31, 0.20]),
+                opacity: 0.5,
+                channels: Some(COLOR_ONLY),
+                mask: Some(SmartMask { scale: Some(8.0), noise: Some(0.0), invert: true, ..mix(GenKind::Clouds, &[(CELLS, 1.0), (NOISE, -0.5)], -0.12, 0.03) }),
+                ..layer("Freckles", "Skin")
+            },
+            SKIN_PORES,
+            SKIN_FOLDS,
+            SKIN_SHEEN,
+        ],
+    },
+    SmartMaterial {
+        name: "Skin Dark",
+        layers: &[
+            SmartLayer { color: Some([0.45, 0.30, 0.22]), rough: Some(0.5), color_var: Some(0.06), var_scale: Some(12.0), ..layer("Skin", "Skin") },
+            SmartLayer { color: Some([0.44, 0.24, 0.18]), opacity: 0.3, ..SKIN_FLUSH },
+            SKIN_PORES,
+            SmartLayer { color: Some([0.20, 0.12, 0.08]), ..SKIN_FOLDS },
+            SmartLayer { rough: Some(0.34), opacity: 0.6, ..SKIN_SHEEN },
+        ],
+    },
+    SmartMaterial {
+        name: "Skin Stylized",
+        layers: &[
+            SmartLayer { color: Some([0.95, 0.74, 0.62]), rough: Some(0.55), ..layer("Skin", "Skin") },
+            // Painted-on blush on the high points.
+            SmartLayer {
+                color: Some([0.96, 0.56, 0.50]),
+                opacity: 0.45,
+                channels: Some(COLOR_ONLY),
+                mask: Some(SmartMask { noise: Some(0.0), ..mix(GenKind::Clouds, &[(CONVEX, 1.2), (NOISE, 0.6)], 0.55, 0.3) }),
+                ..layer("Blush", "Skin")
+            },
+            // Warm, soft shadow color in the hollows.
+            SmartLayer {
+                color: Some([0.78, 0.46, 0.40]),
+                opacity: 0.5,
+                channels: Some(COLOR_ONLY),
+                mask: Some(SmartMask { noise: Some(0.0), ..mix(GenKind::Dirt, &[(OCCLUSION, 1.5), (CAVITY, 0.8)], 0.45, 0.3) }),
+                ..layer("Warm Shadows", "Skin")
+            },
+        ],
+    },
+    // ---------------------------------------------------------------- organic
+    SmartMaterial {
+        name: "Flesh Raw",
+        layers: &[
+            SmartLayer { color: Some([0.55, 0.12, 0.11]), rough: Some(0.25), color_var: Some(0.15), var_scale: Some(6.0), part_var: 0.1, ..layer("Muscle", "Skin") },
+            // Muscle fibers running along the part.
+            SmartLayer {
+                color: Some([0.38, 0.06, 0.06]),
+                height: Some(-0.12),
+                opacity: 0.35,
+                channels: Some([true, false, false, true]),
+                mask: Some(SmartMask { scale: Some(3.0), noise: Some(0.1), ..mix(GenKind::Clouds, &[(GRAIN, 1.0)], 0.45, 0.2) }),
+                ..layer("Fibers", "Skin")
+            },
+            // Fat marbling.
+            SmartLayer {
+                color: Some([0.92, 0.84, 0.74]),
+                rough: Some(0.4),
+                height: Some(0.08),
+                opacity: 0.85,
+                mask: Some(SmartMask { scale: Some(4.0), noise: Some(0.3), ..mix(GenKind::Clouds, &[(NOISE, 1.0), (STREAKS, 0.3)], 0.78, 0.04) }),
+                ..layer("Fat", "Wax")
+            },
+            // Dark blood pooled in the hollows.
+            SmartLayer {
+                color: Some([0.25, 0.02, 0.02]),
+                rough: Some(0.1),
+                opacity: 0.7,
+                mask: Some(SmartMask { noise: Some(0.5), edge_width: Some(0.02), ..mix(GenKind::CavityGrime, &[(CAVITY, 2.0), (OCCLUSION, 1.0)], 0.55, 0.15) }),
+                ..layer("Blood", "Skin")
+            },
+            // Wet: glossy wherever it isn't tucked away.
+            SmartLayer {
+                rough: Some(0.08),
+                channels: Some(ROUGH_ONLY),
+                opacity: 0.6,
+                mask: Some(SmartMask { noise: Some(0.6), scale: Some(5.0), ..mix(GenKind::Clouds, &[(SKY, 0.6), (CONVEX, 0.8), (NOISE, 0.5)], 0.5, 0.2) }),
+                ..layer("Wet", "Skin")
+            },
+        ],
+    },
+    SmartMaterial {
+        name: "Reptile Scales",
+        layers: &[
+            SmartLayer { color: Some([0.25, 0.32, 0.15]), rough: Some(0.45), color_var: Some(0.2), var_scale: Some(5.0), part_var: 0.1, ..layer("Skin", "Skin") },
+            // Domed scales: highest at each scale's center.
+            SmartLayer {
+                height: Some(0.35),
+                channels: Some(HEIGHT_ONLY),
+                mask: Some(SmartMask { scale: Some(3.5), noise: Some(0.0), seed: 3.0, ..mix(GenKind::Clouds, &[(CELLS, -1.0)], -0.35, 0.35) }),
+                ..layer("Scales", "Skin")
+            },
+            // Dark skin between the scales.
+            SmartLayer {
+                color: Some([0.08, 0.10, 0.05]),
+                rough: Some(0.7),
+                opacity: 0.85,
+                mask: Some(SmartMask { scale: Some(3.5), noise: Some(0.0), seed: 3.0, ..mix(GenKind::Clouds, &[(CELLS, 1.0)], 0.6, 0.06) }),
+                ..layer("Gaps", "Skin")
+            },
+            // Pale belly, underneath.
+            SmartLayer {
+                color: Some([0.70, 0.66, 0.45]),
+                opacity: 0.9,
+                channels: Some(COLOR_ONLY),
+                mask: Some(SmartMask { noise: Some(0.5), scale: Some(3.0), ..mix(GenKind::Clouds, &[(OVERHANG, 1.4), (NOISE, 0.3)], 0.55, 0.15) }),
+                ..layer("Belly", "Skin")
+            },
+            // Blotches along the back.
+            SmartLayer {
+                color: Some([0.12, 0.18, 0.08]),
+                opacity: 0.7,
+                channels: Some(COLOR_ONLY),
+                mask: Some(SmartMask { noise: Some(0.4), scale: Some(2.0), ..mix(GenKind::Clouds, &[(NOISE, 1.0), (UP, 0.5)], 0.7, 0.06) }),
+                ..layer("Blotches", "Skin")
+            },
+            SmartLayer { rough: Some(0.25), channels: Some(ROUGH_ONLY), opacity: 0.6, mask: Some(SmartMask { noise: Some(0.3), ..mix(GenKind::Clouds, &[(CONVEX, 1.5)], 0.4, 0.2) }), ..layer("Sheen", "Skin") },
+        ],
+    },
+    SmartMaterial {
+        name: "Fungus Spotted",
+        layers: &[
+            SmartLayer { color: Some([0.70, 0.10, 0.06]), rough: Some(0.45), color_var: Some(0.12), var_scale: Some(3.0), ..layer("Cap", "Skin") },
+            // Cream gills and stem underneath.
+            SmartLayer {
+                color: Some([0.88, 0.82, 0.68]),
+                rough: Some(0.7),
+                mask: Some(SmartMask { noise: Some(0.3), ..mix(GenKind::Clouds, &[(OVERHANG, 1.5), (THIN, 0.4)], 0.35, 0.12) }),
+                ..layer("Gills", "Wax")
+            },
+            // Raised white warts on top.
+            SmartLayer {
+                color: Some([0.94, 0.91, 0.84]),
+                rough: Some(0.8),
+                height: Some(0.2),
+                mask: Some(SmartMask { scale: Some(2.0), noise: Some(0.2), invert: true, ..mix(GenKind::Clouds, &[(CELLS, 1.0), (UP, -0.2)], 0.06, 0.03) }),
+                ..layer("Spots", "Wax")
+            },
+            SmartLayer {
+                color: Some([0.30, 0.20, 0.10]),
+                opacity: 0.4,
+                mask: Some(SmartMask { noise: Some(0.6), ..mix(GenKind::Dirt, &[(OCCLUSION, 1.5), (CAVITY, 1.0)], 0.6, 0.2) }),
+                ..layer("Soil", "Concrete")
+            },
+        ],
+    },
+    SmartMaterial {
+        name: "Insect Chitin",
+        layers: &[
+            SmartLayer { color: Some([0.07, 0.06, 0.05]), rough: Some(0.18), color_var: Some(0.15), var_scale: Some(4.0), part_var: 0.15, ..layer("Shell", "Plastic Black") },
+            // Amber where the shell thins at the edges.
+            SmartLayer {
+                color: Some([0.45, 0.25, 0.08]),
+                opacity: 0.8,
+                channels: Some(COLOR_ONLY),
+                mask: Some(SmartMask { noise: Some(0.4), edge_width: Some(0.03), ..mix(GenKind::EdgeWear, &[(EDGE, 1.0), (THIN, 0.8)], 0.5, 0.25) }),
+                ..layer("Amber Edges", "Plastic Black")
+            },
+            // Fine pits.
+            SmartLayer {
+                height: Some(-0.1),
+                rough: Some(0.35),
+                channels: Some([false, true, false, true]),
+                mask: Some(SmartMask { scale: Some(25.0), noise: Some(0.0), invert: true, ..mix(GenKind::Clouds, &[(CELLS, 1.0)], 0.12, 0.04) }),
+                ..layer("Pits", "Plastic Black")
+            },
+            SmartLayer { opacity: 0.5, ..DUST_LAYER },
+        ],
+    },
+    // ---------------------------------------------------------------- eyes
+    SmartMaterial { name: "Eyeball Blue", layers: &EYE_BLUE },
+    SmartMaterial { name: "Eyeball Brown", layers: &EYE_BROWN },
 ];
 
 #[cfg(test)]
@@ -1584,7 +1875,7 @@ impl SmartLayer {
             f.mat.enabled[3] = true;
         }
         if let Some(ch) = self.channels {
-            f.mat.enabled = ch;
+            f.mat.enabled = crate::engine::channels4(ch);
         }
         f.part_var = self.part_var;
         f.seed = self.seed;
@@ -1593,7 +1884,7 @@ impl SmartLayer {
             f.tiling = scan.tiling;
             // With a height image, the height value is its strength.
             f.mat.height = scan.height;
-            f.mat.enabled = [true, true, true, true];
+            f.mat.enabled = [true, true, true, true, false, false, false, false];
             f.color_var = 0.0;
             f.rough_var = 0.0;
             f.height_var = 0.0;
@@ -1656,7 +1947,7 @@ fn fbm(p: Vec3) -> f32 {
     s / 0.9375
 }
 
-/// Straight tapered scratches on a plane, as `scratch_plane` in composite.wgsl.
+/// Straight tapered scratches on a plane, as `scratch_plane` in wear.wgsl.
 fn scratch_plane(x: f32, y: f32, seed: f32) -> f32 {
     let (cx, cy) = (x.floor(), y.floor());
     let s = (seed * 1000.0) as i32;
@@ -1740,6 +2031,7 @@ fn preview_mask(g: &Generator, p: Vec3, n: Vec3) -> f32 {
     inp[GRAIN] = smoothstep(0.35, 0.75, fbm(Vec3::new(q.x * 0.5, q.y * 30.0, q.z * 30.0)));
     inp[CELLS] = cellular(q * 4.0);
     inp[SCRATCHES] = scratch_plane(q.x * 5.0, q.y * 5.0, g.seed);
+    inp[FRONT] = p.normalize_or(Vec3::Z).z.clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
     let mut v: f32 = g.weights.iter().zip(inp).map(|(w, x)| w * x).sum();
     v += (fbm(q * 2.0) - 0.5) * g.noise;
     let m = smoothstep(g.level - g.contrast, g.level + g.contrast, v);
@@ -1820,7 +2112,7 @@ pub fn render_generator_preview(kind: GenKind) -> egui::ColorImage {
     let g = kind.default_generator();
     let white = PreviewLayer {
         fill: FillParams {
-            mat: MatValues { enabled: [true, true, true, false], color: [0.92, 0.92, 0.9], rough: 0.6, metal: 0.0, height: 0.0 },
+            mat: MatValues { color: [0.92, 0.92, 0.9], rough: 0.6, ..MatValues::default() },
             ..Default::default()
         },
         opacity: 1.0,
@@ -1828,7 +2120,7 @@ pub fn render_generator_preview(kind: GenKind) -> egui::ColorImage {
     };
     let black = PreviewLayer {
         fill: FillParams {
-            mat: MatValues { enabled: [true, true, true, false], color: [0.06, 0.06, 0.06], rough: 0.6, metal: 0.0, height: 0.0 },
+            mat: MatValues { color: [0.06, 0.06, 0.06], rough: 0.6, ..MatValues::default() },
             ..Default::default()
         },
         opacity: 1.0,
@@ -1847,12 +2139,13 @@ pub enum MaterialType {
     Fabric,
     Plastic,
     Glass,
+    Organic,
     Nature,
     Other,
 }
 
 impl MaterialType {
-    pub const ALL: [MaterialType; 9] = [
+    pub const ALL: [MaterialType; 10] = [
         MaterialType::Paint,
         MaterialType::Metal,
         MaterialType::Wood,
@@ -1860,6 +2153,7 @@ impl MaterialType {
         MaterialType::Fabric,
         MaterialType::Plastic,
         MaterialType::Glass,
+        MaterialType::Organic,
         MaterialType::Nature,
         MaterialType::Other,
     ];
@@ -1873,6 +2167,7 @@ impl MaterialType {
             MaterialType::Fabric => "Fabric, leather & paper",
             MaterialType::Plastic => "Plastic, rubber & wax",
             MaterialType::Glass => "Glass & ceramic",
+            MaterialType::Organic => "Skin & organic",
             MaterialType::Nature => "Nature & ground",
             MaterialType::Other => "Other",
         }
@@ -1881,7 +2176,8 @@ impl MaterialType {
     /// From a material's name (painted surfaces count as paint: "Painted Steel" is paint
     /// first); `metal` (its metallic value) decides for names that say nothing.
     pub fn of(name: &str, metal: Option<f32>) -> MaterialType {
-        const WORDS: [(MaterialType, &[&str]); 8] = [
+        const WORDS: [(MaterialType, &[&str]); 9] = [
+            (MaterialType::Organic, &["skin", "flesh", "eye", "scale", "fungus", "mushroom", "chitin", "insect", "organic", "bone"]),
             (MaterialType::Paint, &["paint", "lacquer", "enamel", "coating", "powder coat"]),
             (
                 MaterialType::Metal,
@@ -1895,7 +2191,7 @@ impl MaterialType {
             (MaterialType::Fabric, &["fabric", "cloth", "leather", "denim", "cotton", "wool", "silk", "carpet", "canvas", "felt", "velvet", "linen", "suede", "paper", "cardboard"]),
             (MaterialType::Plastic, &["plastic", "rubber", "vinyl", "silicone", "acrylic", "polymer", "foam", "carbon fiber", "wax"]),
             (MaterialType::Glass, &["glass", "ceramic", "porcelain", "crystal", "terracotta"]),
-            (MaterialType::Nature, &["ground", "soil", "dirt", "mud", "sand", "grass", "moss", "snow", "ice", "leaf", "leaves", "bone", "skin", "organic", "forest", "rock"]),
+            (MaterialType::Nature, &["ground", "soil", "dirt", "mud", "sand", "grass", "moss", "snow", "ice", "leaf", "leaves", "forest", "rock"]),
         ];
         let n = format!("{} ", name.to_lowercase());
         for (kind, words) in WORDS {

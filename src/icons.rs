@@ -57,3 +57,7 @@ pub const MAGNET: &str = "\u{E680}";
 pub const CROSSHAIR: &str = "\u{E1D6}";
 pub const PLUS: &str = "\u{E3D4}";
 pub const LIGHTNING: &str = "\u{E2DE}";
+pub const LIGHTBULB: &str = "\u{E2DC}";
+pub const LASSO: &str = "\u{EDC6}";
+pub const SELECTION: &str = "\u{E69A}";
+pub const SELECTION_ALL: &str = "\u{E746}";

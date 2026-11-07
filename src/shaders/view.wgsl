@@ -9,12 +9,12 @@ struct Globals {
     light: vec4<f32>,    // env rotation (radians), exposure, env intensity, radiance max lod
     params: vec4<f32>,   // view mode, height strength, texel size, texture resolution
     view2d: vec4<f32>,   // zoom (px per uv), pan x, pan y, unused
-    size: vec4<f32>,     // viewport width, height, baked AO strength, unused
+    size: vec4<f32>,     // viewport width, height, baked AO strength, texture set highlight (0..1)
     extra: vec4<f32>,    // use baked normal, has bake, custom map shown (view mode 22), wireframe opacity
     bmin: vec4<f32>,
     bsize: vec4<f32>,
     bg: vec4<f32>,       // background color (linear), background intensity
-    bg2: vec4<f32>,      // background blur, background mode (0 environment, 1 color, 2 transparent)
+    bg2: vec4<f32>,      // background blur, background mode (0 environment, 1 color, 2 transparent), emission strength
     light_vp: mat4x4<f32>, // key light shadow projection
     sun: vec4<f32>,      // direction toward the key light, intensity
     sun_c: vec4<f32>,    // key light color (linear), on (1) / off (0)
@@ -41,6 +41,9 @@ struct Globals {
 @group(0) @binding(15) var<uniform> env_sh: array<vec4<f32>, 9>;
 // Parameters of a custom preview shader (a shading graph), 4 floats each.
 @group(0) @binding(18) var<uniform> cp: array<vec4<f32>, 128>;
+@group(0) @binding(20) var t_emission: texture_2d<f32>;  // sRGB view: reads linear
+@group(0) @binding(21) var t_normal: texture_2d<f32>;  // painted normal detail, tangent space, encoded 0..1
+@group(0) @binding(22) var t_spec: texture_2d<f32>;  // specular level (0.5: 4% reflectance)
 
 const PI: f32 = 3.14159265;
 
@@ -82,10 +85,17 @@ fn env_brdf(f0: vec3<f32>, rough: f32, nv: f32) -> vec3<f32> {
 
 struct Surface {
     albedo: vec3<f32>,
+    // Opacity (the base color's alpha): 1 opaque.
+    alpha: f32,
+    // Emitted light (linear, at 1 strength).
+    emission: vec3<f32>,
     rough: f32,
     metal: f32,
     height: f32,
-    // Final tangent-space normal (OpenGL convention): baked normal + painted height detail.
+    // Specular level of non-metals (0.5: 4% reflectance).
+    spec: f32,
+    // Final tangent-space normal (OpenGL convention): baked normal, painted
+    // normal and painted height detail.
     ts: vec3<f32>,
     a: vec4<f32>,
     b: vec4<f32>,
@@ -99,10 +109,14 @@ struct Surface {
 
 fn sample_surface(uv: vec2<f32>) -> Surface {
     var s: Surface;
-    s.albedo = textureSampleLevel(t_color, samp, uv, 0.0).rgb;
+    let col = textureSampleLevel(t_color, samp, uv, 0.0);
+    s.albedo = col.rgb;
+    s.alpha = col.a;
+    s.emission = textureSampleLevel(t_emission, samp, uv, 0.0).rgb;
     s.rough = textureSampleLevel(t_rough, samp, uv, 0.0).r;
     s.metal = textureSampleLevel(t_metal, samp, uv, 0.0).r;
     s.height = textureSampleLevel(t_height, samp, uv, 0.0).r;
+    s.spec = textureSampleLevel(t_spec, samp, uv, 0.0).r;
     s.a = textureSampleLevel(map_a, samp, uv, 0.0);
     s.b = textureSampleLevel(map_b, samp, uv, 0.0);
     s.c = textureSampleLevel(map_c, samp, uv, 0.0);
@@ -127,7 +141,9 @@ fn sample_surface(uv: vec2<f32>) -> Surface {
         let by = s.d.y;
         base = vec3<f32>(bx, by, sqrt(max(1.0 - bx * bx - by * by, 0.0)));
     }
-    // Whiteout blend of baked normal and height detail.
+    // Whiteout blends: the painted normal on the baked one, then height detail.
+    let pn = normalize(textureSampleLevel(t_normal, samp, uv, 0.0).xyz * 2.0 - 1.0);
+    base = normalize(vec3<f32>(base.xy + pn.xy, base.z * pn.z));
     s.ts = normalize(vec3<f32>(base.xy + vec2<f32>(-hu, ht), base.z));
     return s;
 }
@@ -186,7 +202,7 @@ fn key_light(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
     let d = a2 / (PI * dd * dd);
     let k = a * 0.5;
     let vis = 1.0 / ((nv * (1.0 - k) + k) * (nl * (1.0 - k) + k) * 4.0);
-    let f0 = mix(vec3<f32>(0.04), s.albedo, s.metal);
+    let f0 = mix(vec3<f32>(0.08 * s.spec), s.albedo, s.metal);
     let f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
     let diffuse = s.albedo * (1.0 - s.metal) * (1.0 - f) / PI;
     return (diffuse + d * vis * f) * g.sun_c.rgb * g.sun.w * nl * shadow;
@@ -199,6 +215,9 @@ fn shade(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
         case 2: { return lin(s.rough); }
         case 3: { return lin(s.metal); }
         case 4: { return lin(clamp(s.height * 0.5 + 0.5, 0.0, 1.0)); }
+        case 23: { return lin(s.alpha); }
+        case 24: { return s.emission; }
+        case 25: { return lin(s.spec); }
         case 5: { let c = s.ts * 0.5 + 0.5; return c * c; }
         case 6: { return lin(s.a.r); }
         case 7: { return lin(s.a.g); }
@@ -232,7 +251,7 @@ fn shade(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
 fn shade_pbr(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
     let rough = clamp(s.rough, 0.03, 1.0);
     let a = rough * rough;
-    let f0 = mix(vec3<f32>(0.04), s.albedo, s.metal);
+    let f0 = mix(vec3<f32>(0.08 * s.spec), s.albedo, s.metal);
     let diffuse_c = s.albedo * (1.0 - s.metal);
     let nv = max(dot(n, v), 1e-4);
 
@@ -248,6 +267,7 @@ fn shade_pbr(s: Surface, n: vec3<f32>, v: vec3<f32>, shadow: f32) -> vec3<f32> {
     col += env(r, rough) * spec * spec_ao;
     // Baked AO darkens the key light only a little: it's mostly sky occlusion.
     col += key_light(s, n, v, shadow) * mix(1.0, ao, 0.35);
+    col += s.emission * g.bg2.z;
     return col;
 }
 
@@ -335,10 +355,44 @@ fn mesh_shade_inputs(in: MeshOut, front: bool) -> Shade {
     return c;
 }
 
+// A highlighted texture set: tinted toward a bright accent, so it reads
+// against any material and lighting.
+fn highlighted(col: vec3<f32>) -> vec3<f32> {
+    let h = clamp(g.size.w, 0.0, 1.0);
+    let accent = vec3<f32>(0.1, 0.55, 1.0);
+    // The surface's brightness in the accent's hue, so shading and detail stay readable.
+    let l = dot(col, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return mix(col, accent * (l * 1.3 + 0.03), h * 0.75);
+}
+
+// Opacity from which a surface draws in the opaque pass. Below it, the
+// transparent pass blends it over what's behind (still writing depth, so
+// brushes and picking find see-through surfaces).
+const OPAQUE: f32 = 0.999;
+
+// The surface's opacity as the view shows it: only the Material view is see-through.
+fn view_alpha(s: Surface) -> f32 {
+    return select(1.0, s.alpha, i32(g.params.x) == 0);
+}
+
 @fragment
 fn fs_mesh(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let c = mesh_shade_inputs(in, front);
-    return vec4<f32>(shade(c.s, c.n, c.v, c.shadow), 1.0);
+    if (view_alpha(c.s) < OPAQUE) {
+        discard;
+    }
+    return vec4<f32>(highlighted(shade(c.s, c.n, c.v, c.shadow)), 1.0);
+}
+
+// The see-through part of the mesh, blended (after everything opaque).
+@fragment
+fn fs_mesh_t(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let c = mesh_shade_inputs(in, front);
+    let a = view_alpha(c.s);
+    if (a >= OPAQUE) {
+        discard;
+    }
+    return vec4<f32>(highlighted(shade(c.s, c.n, c.v, c.shadow)), a);
 }
 
 // ---------------------------------------------------------------- 2D view
@@ -376,6 +430,10 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
     var lit = shade(s, pn, vec3<f32>(0.0, 0.0, 1.0), 0.0);
     if (i32(g.params.x) == 0) {
         lit = aces(lit * g.light.y);
+        // See-through texels over a checkerboard.
+        let cell = vec2<i32>(floor(in.clip.xy / 8.0));
+        let checker = select(0.18, 0.32, (cell.x + cell.y) % 2 == 0);
+        lit = mix(vec3<f32>(checker), lit, s.alpha);
     }
     return vec4<f32>(lit, 1.0);
 }

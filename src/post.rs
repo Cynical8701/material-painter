@@ -48,7 +48,7 @@ pub struct PostSettings {
     pub tint: f32,
     pub vignette: f32,
     pub bloom: f32,
-    /// Scene brightness where bloom starts.
+    /// Scene brightness (its strongest channel) where bloom starts.
     pub bloom_threshold: f32,
     pub chromatic: f32,
     pub grain: f32,

@@ -26,13 +26,20 @@ pub enum Source {
     Diffuse,
     /// Specular/glossiness workflow: reflectance color.
     Specular,
+    /// The painted specular level of non-metals (0.5: 4% reflectance), as
+    /// Unreal's and Blender's Specular inputs take it.
+    SpecularLevel,
     Roughness,
     /// 1 - roughness.
     Glossiness,
     Metallic,
     /// Painted height, mid-gray at rest.
     Height,
-    /// Final tangent-space normal (baked plus painted height), OpenGL (Y+).
+    /// 1 opaque, 0 see-through (the base color's alpha).
+    Opacity,
+    /// Emitted light color (black where nothing emits).
+    Emission,
+    /// Final tangent-space normal (baked, painted normal and height), OpenGL (Y+).
     NormalGl,
     /// The same normal with Y flipped (DirectX, Y-).
     NormalDx,
@@ -54,7 +61,10 @@ impl Source {
             Source::Roughness,
             Source::Glossiness,
             Source::Metallic,
+            Source::SpecularLevel,
             Source::Height,
+            Source::Opacity,
+            Source::Emission,
             Source::NormalGl,
             Source::NormalDx,
         ];
@@ -71,7 +81,10 @@ impl Source {
             Source::Roughness => "Roughness".into(),
             Source::Glossiness => "Glossiness".into(),
             Source::Metallic => "Metallic".into(),
+            Source::SpecularLevel => "Specular level".into(),
             Source::Height => "Height".into(),
+            Source::Opacity => "Opacity".into(),
+            Source::Emission => "Emission".into(),
             Source::NormalGl => "Normal (OpenGL)".into(),
             Source::NormalDx => "Normal (DirectX)".into(),
             Source::Mesh(i) => format!("Baked {}", MAPS[i].name),
@@ -174,6 +187,15 @@ impl OutputMap {
     fn rgb(name: &str, src: Source) -> OutputMap {
         OutputMap { name: name.into(), layout: Layout::Rgb, chans: [Chan::of(src, 0), Chan::of(src, 1), Chan::of(src, 2), Chan::of(Source::One, 0)], force_16: false }
     }
+    /// A color with opacity in alpha (written RGB when the texture set is opaque).
+    fn rgb_opacity(name: &str, src: Source) -> OutputMap {
+        OutputMap { layout: Layout::Rgba, chans: [Chan::of(src, 0), Chan::of(src, 1), Chan::of(src, 2), Chan::of(Source::Opacity, 0)], ..OutputMap::rgb(name, src) }
+    }
+
+    /// Its alpha is only opacity: nothing to keep when everything is opaque.
+    fn alpha_is_opacity(&self) -> bool {
+        self.layout == Layout::Rgba && self.chans[3] == Chan::of(Source::Opacity, 0)
+    }
     fn gray(name: &str, c: Chan) -> OutputMap {
         OutputMap { name: name.into(), layout: Layout::Gray, chans: [c, Chan::of(Source::Zero, 0), Chan::of(Source::Zero, 0), Chan::of(Source::One, 0)], force_16: false }
     }
@@ -182,6 +204,21 @@ impl OutputMap {
     }
     fn height(name: &str) -> OutputMap {
         OutputMap { force_16: true, ..OutputMap::gray(name, Chan::of(Source::Height, 0)) }
+    }
+
+    /// Only emission or specular level, where the texture set has none of
+    /// it (nothing emits, or specular is the default everywhere): not written.
+    fn left_out(&self, s: &Snapshot) -> bool {
+        let chans = &self.chans[..self.layout.channels()];
+        let optional = |src: Source| match src {
+            Source::Emission => Some(s.emissive),
+            Source::SpecularLevel => Some(s.specular),
+            Source::Zero | Source::One => Some(false),
+            _ => None,
+        };
+        chans.iter().all(|c| optional(c.src).is_some())
+            && chans.iter().any(|c| matches!(c.src, Source::Emission | Source::SpecularLevel))
+            && !chans.iter().any(|c| optional(c.src) == Some(true))
     }
 }
 
@@ -223,60 +260,67 @@ pub fn builtin_templates() -> Vec<Template> {
         t(
             "Unreal Engine (packed ORM)",
             vec![
-                OutputMap::rgb("T_$mesh_BaseColor", BaseColor),
+                OutputMap::rgb_opacity("T_$mesh_BaseColor", BaseColor),
                 OutputMap::rgb("T_$mesh_Normal", NormalDx),
                 OutputMap::packed("T_$mesh_OcclusionRoughnessMetallic", Layout::Rgb, [ao, rough, metal, C1]),
+                OutputMap::rgb("T_$mesh_Emissive", Emission),
+                OutputMap::gray("T_$mesh_Specular", Chan::of(SpecularLevel, 0)),
             ],
         ),
         t(
             "Unity URP (metallic)",
             vec![
-                OutputMap::rgb("$mesh_BaseMap", BaseColor),
+                OutputMap::rgb_opacity("$mesh_BaseMap", BaseColor),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::packed("$mesh_MaskMap", Layout::Rgba, [metal, ao, C0, smooth]),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emission),
             ],
         ),
         t(
             "Unity HDRP",
             vec![
-                OutputMap::rgb("$mesh_BaseMap", BaseColor),
+                OutputMap::rgb_opacity("$mesh_BaseMap", BaseColor),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::packed("$mesh_MaskMap", Layout::Rgba, [metal, ao, C1, smooth]),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emissive", Emission),
             ],
         ),
         t(
             "Unity Built-in (Standard)",
             vec![
-                OutputMap::rgb("$mesh_Albedo", BaseColor),
+                OutputMap::rgb_opacity("$mesh_Albedo", BaseColor),
                 OutputMap::packed("$mesh_MetallicSmoothness", Layout::Rgba, [metal, metal, metal, smooth]),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::gray("$mesh_Occlusion", ao),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emission),
             ],
         ),
         t(
             "Godot 4 (ORM)",
             vec![
-                OutputMap::rgb("$mesh_Albedo", BaseColor),
+                OutputMap::rgb_opacity("$mesh_Albedo", BaseColor),
                 OutputMap::packed("$mesh_ORM", Layout::Rgb, [ao, rough, metal, C1]),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emission),
             ],
         ),
         t(
             "glTF PBR (metal/rough)",
             vec![
-                OutputMap::rgb("$mesh_baseColor", BaseColor),
+                OutputMap::rgb_opacity("$mesh_baseColor", BaseColor),
                 OutputMap::packed("$mesh_occlusionRoughnessMetallic", Layout::Rgb, [ao, rough, metal, C1]),
                 OutputMap::rgb("$mesh_normal", NormalGl),
+                OutputMap::rgb("$mesh_emissive", Emission),
             ],
         ),
         t(
             "Roblox SurfaceAppearance",
             vec![
-                OutputMap::rgb("$mesh_Color", BaseColor),
+                OutputMap::rgb_opacity("$mesh_Color", BaseColor),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::gray("$mesh_Roughness", rough),
                 OutputMap::gray("$mesh_Metalness", metal),
@@ -285,33 +329,38 @@ pub fn builtin_templates() -> Vec<Template> {
         t(
             "Blender (Principled BSDF)",
             vec![
-                OutputMap::rgb("$mesh_BaseColor", BaseColor),
+                OutputMap::rgb_opacity("$mesh_BaseColor", BaseColor),
                 OutputMap::gray("$mesh_Roughness", rough),
                 OutputMap::gray("$mesh_Metallic", metal),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emission", Emission),
+                OutputMap::gray("$mesh_Specular", Chan::of(SpecularLevel, 0)),
             ],
         ),
         t(
             "PBR Metallic Roughness (separate)",
             vec![
-                OutputMap::rgb("$mesh_BaseColor", BaseColor),
+                OutputMap::rgb_opacity("$mesh_BaseColor", BaseColor),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::gray("$mesh_Roughness", rough),
                 OutputMap::gray("$mesh_Metallic", metal),
                 OutputMap::gray("$mesh_AmbientOcclusion", ao),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emissive", Emission),
+                OutputMap::gray("$mesh_Specular", Chan::of(SpecularLevel, 0)),
             ],
         ),
         t(
             "PBR Specular Glossiness",
             vec![
-                OutputMap::rgb("$mesh_Diffuse", Diffuse),
+                OutputMap::rgb_opacity("$mesh_Diffuse", Diffuse),
                 OutputMap::rgb("$mesh_Specular", Specular),
                 OutputMap::gray("$mesh_Glossiness", Chan::of(Glossiness, 0)),
                 OutputMap::rgb("$mesh_Normal", NormalGl),
                 OutputMap::gray("$mesh_AmbientOcclusion", ao),
                 OutputMap::height("$mesh_Height"),
+                OutputMap::rgb("$mesh_Emissive", Emission),
             ],
         ),
         t("Baked mesh maps (all)", mesh_maps),
@@ -570,7 +619,20 @@ fn resample(p: Plane, w: u32, res: u32) -> Plane {
 /// worker thread.
 pub struct Snapshot {
     res: u32,
+    /// Base color, with opacity in alpha.
     color: Plane,
+    /// No layer sets opacity: color maps with opacity alpha are written RGB.
+    opaque: bool,
+    /// Emission, sRGB-encoded (black where nothing emits).
+    emission: Plane,
+    /// Some layer emits: only then are emission maps written.
+    emissive: bool,
+    /// Final tangent-space painted normal, encoded 0..1 (flat where no layer sets it).
+    normal: Plane,
+    /// Specular level (0.5 where no layer sets it).
+    spec: Plane,
+    /// Some layer sets specular: only then are specular level maps written.
+    specular: bool,
     rough: Plane,
     metal: Plane,
     height: Plane,
@@ -596,6 +658,12 @@ pub fn snapshot(engine: &Engine, device: &wgpu::Device, queue: &wgpu::Queue, mes
     Snapshot {
         res,
         color: read_plane(device, queue, engine.final_tex(0)),
+        opaque: !engine.uses_opacity(),
+        emission: read_plane(device, queue, engine.final_tex(crate::engine::FINAL_EMISSION)),
+        emissive: engine.uses_emission(),
+        normal: read_plane(device, queue, engine.final_tex(crate::engine::FINAL_NORMAL)),
+        spec: read_plane(device, queue, engine.final_tex(crate::engine::FINAL_SPECULAR)),
+        specular: engine.uses_channel(crate::engine::SPECULAR),
         rough: read_plane(device, queue, engine.final_tex(1)),
         metal: read_plane(device, queue, engine.final_tex(2)),
         height: read_plane(device, queue, engine.final_tex(3)),
@@ -661,21 +729,32 @@ impl Sources<'_> {
                 .into_par_iter()
                 .map(|i| {
                     let m = s.metal.data[i][0];
-                    enc(base_lin(i).map(|c| 0.04 + (c - 0.04) * m), linear)
+                    // Non-metals reflect 8% times the specular level (4% at 0.5).
+                    let f0 = 0.08 * s.spec.data[i][0];
+                    enc(base_lin(i).map(|c| f0 + (c - f0) * m), linear)
                 })
                 .collect(),
+            Source::SpecularLevel => (0..n).map(|i| [s.spec.data[i][0]; 3]).collect(),
             Source::Roughness => (0..n).map(|i| [s.rough.data[i][0]; 3]).collect(),
             Source::Glossiness => (0..n).map(|i| [1.0 - s.rough.data[i][0]; 3]).collect(),
             Source::Metallic => (0..n).map(|i| [s.metal.data[i][0]; 3]).collect(),
             Source::Height => (0..n).map(|i| [s.height.data[i][0] * 0.5 + 0.5; 3]).collect(),
+            Source::Opacity => (0..n).map(|i| [s.color.data[i][3]; 3]).collect(),
+            Source::Emission => (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let c = s.emission.data[i];
+                    enc([c[0], c[1], c[2]].map(srgb_to_linear), linear)
+                })
+                .collect(),
             Source::NormalGl | Source::NormalDx => {
                 let use_baked = self.settings.use_baked_normal && s.has_bake;
-                normal_map(s, self.settings.normal_strength, use_baked, src == Source::NormalDx)
+                normal_map(s, self.settings.normal_strength, use_baked, true, src == Source::NormalDx)
             }
             Source::Mesh(i) => {
                 let info = &MAPS[i];
                 if info.kind == MapKind::Normal {
-                    return normal_map(s, 0.0, true, false);
+                    return normal_map(s, 0.0, true, false, false);
                 }
                 let p = &s.mesh[info.tex];
                 if info.kind == MapKind::Scalar {
@@ -707,7 +786,7 @@ impl Sources<'_> {
 
 /// Final tangent-space normal, encoded 0..1: baked normal plus painted
 /// height detail, matching the viewport.
-fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool) -> Vec<[f32; 3]> {
+fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, painted: bool, directx: bool) -> Vec<[f32; 3]> {
     let r = m.res as i64;
     let h = |x: i64, y: i64| m.height.data[(y.clamp(0, r - 1) * r + x.clamp(0, r - 1)) as usize][0];
     let k = strength * m.res as f32 / 256.0;
@@ -718,7 +797,13 @@ fn normal_map(m: &Snapshot, strength: f32, use_baked: bool, directx: bool) -> Ve
             let hu = (h(x + 1, y) - h(x - 1, y)) * 0.5 * k;
             let ht = (h(x, y + 1) - h(x, y - 1)) * 0.5 * k;
             let d = m.mesh[3].data[i];
-            let base = if use_baked { Vec3::new(d[0], d[1], (1.0 - d[0] * d[0] - d[1] * d[1]).max(0.0).sqrt()) } else { Vec3::Z };
+            let mut base = if use_baked { Vec3::new(d[0], d[1], (1.0 - d[0] * d[0] - d[1] * d[1]).max(0.0).sqrt()) } else { Vec3::Z };
+            // The painted normal on the baked one (whiteout), as the view does.
+            if painted {
+                let p = m.normal.data[i];
+                let p = Vec3::new(p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0, p[2] * 2.0 - 1.0).normalize_or(Vec3::Z);
+                base = Vec3::new(base.x + p.x, base.y + p.y, base.z * p.z).normalize_or(Vec3::Z);
+            }
             let mut n = Vec3::new(base.x - hu, base.y + ht, base.z).normalize();
             if directx {
                 n.y = -n.y;
@@ -810,21 +895,26 @@ pub fn export(s: &Snapshot, template: &Template, settings: &Settings) -> Result<
     let cover = padding.map(|_| coverage(&s.uvs, s.tris.clone(), res));
     let nearest = padding.zip(cover.as_ref()).map(|(limit, c)| nearest_covered(c, res, limit));
 
+    // Emission maps of a texture set that emits nothing are left out, and
+    // specular level maps of one that keeps the default.
+    let maps: Vec<&OutputMap> = template.maps.iter().filter(|m| !m.left_out(s)).collect();
     // Evaluate every needed source once, then build the maps in parallel.
     let linear = settings.format == Format::Exr;
     let mut sources = Sources { s, settings, linear, cache: HashMap::new() };
-    for m in &template.maps {
+    for m in &maps {
         for c in &m.chans[..m.layout.channels()] {
             sources.get(c.src);
         }
     }
     let cache = sources.cache;
     let out_size = settings.size.unwrap_or(res);
+    let opaque = s.opaque;
 
-    template
-        .maps
-        .par_iter()
-        .map(|map| {
+    maps.par_iter()
+        .map(|&map| {
+            // A color whose alpha is only opacity stays RGB on an opaque texture set.
+            let rgb = (map.alpha_is_opacity() && opaque).then(|| OutputMap { layout: Layout::Rgb, ..map.clone() });
+            let map = rgb.as_ref().unwrap_or(map);
             let chans = map.layout.channels();
             let mut px = vec![[0.0f32, 0.0, 0.0, 1.0]; n];
             for (k, c) in map.chans[..chans].iter().enumerate() {

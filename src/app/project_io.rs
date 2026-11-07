@@ -184,6 +184,10 @@ pub(super) fn fill_json(p: &FillParams) -> Value {
         "roughness": p.mat.rough,
         "metallic": p.mat.metal,
         "height": p.mat.height,
+        "opacity": p.mat.opacity,
+        "emission": p.mat.emission,
+        "normal_strength": p.mat.normal,
+        "specular": p.mat.specular,
         "color_variation": p.color_var,
         "variation_scale": p.var_scale,
         "roughness_variation": p.rough_var,
@@ -201,8 +205,10 @@ pub(super) fn fill_json(p: &FillParams) -> Value {
 
 pub(super) fn fill_from(v: &Value) -> FillParams {
     let d = FillParams::default();
+    // Four channels before opacity existed, five before emission, six before
+    // normal and specular (the missing ones stay off).
     let enabled = match v.get("enabled").and_then(Value::as_array) {
-        Some(a) if a.len() == 4 => std::array::from_fn(|i| a[i].as_bool().unwrap_or(true)),
+        Some(a) if a.len() >= 4 => std::array::from_fn(|i| a.get(i).map_or(false, |x| x.as_bool().unwrap_or(true))),
         _ => d.mat.enabled,
     };
     FillParams {
@@ -212,6 +218,10 @@ pub(super) fn fill_from(v: &Value) -> FillParams {
             rough: f(v, "roughness", d.mat.rough),
             metal: f(v, "metallic", d.mat.metal),
             height: f(v, "height", d.mat.height),
+            opacity: f(v, "opacity", d.mat.opacity),
+            emission: arr(v, "emission", d.mat.emission),
+            normal: f(v, "normal_strength", d.mat.normal),
+            specular: f(v, "specular", d.mat.specular),
         },
         color_var: f(v, "color_variation", d.color_var),
         var_scale: f(v, "variation_scale", d.var_scale),
@@ -301,6 +311,9 @@ pub(super) fn mask_layers_from(v: &Value) -> Vec<crate::engine::MaskLayer> {
         .collect()
 }
 
+/// Built-in smart mask inputs when projects stored custom slots after them.
+const LEGACY_INPUTS: usize = 19;
+
 pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
     let name = s(v, "kind").ok_or("generator without a kind")?;
     let kind = GenKind::ALL.into_iter().find(|k| k.name() == name).ok_or(format!("unknown generator '{name}'"))?;
@@ -308,13 +321,16 @@ pub(super) fn generator_from(v: &Value) -> Result<Generator, String> {
     let mut weights = [0.0; crate::engine::GEN_INPUT_COUNT];
     let mut custom = [crate::engine::CustomInput::default(); crate::engine::MAX_CUSTOM_INPUTS];
     if let Some(a) = v.get("weights").and_then(Value::as_array) {
+        // Projects from the four fixed custom slots (no "custom" list) kept
+        // their weights after the 19 built-in inputs of the time: slot k is
+        // the map with id k + 1.
+        let legacy = v.get("custom").is_none() && a.len() > LEGACY_INPUTS;
+        let builtin = if legacy { LEGACY_INPUTS } else { crate::engine::GEN_INPUT_COUNT };
         // Older projects have fewer inputs; new ones default to 0.
-        for (w, x) in weights.iter_mut().zip(a) {
+        for (w, x) in weights.iter_mut().zip(a.iter().take(builtin)) {
             *w = x.as_f64().unwrap_or(0.0) as f32;
         }
-        // Projects from the four fixed custom slots kept their weights after
-        // the built-in inputs: slot k is the map with id k + 1.
-        let old = a.iter().skip(crate::engine::GEN_INPUT_COUNT).map(|x| x.as_f64().unwrap_or(0.0) as f32);
+        let old = a.iter().skip(builtin).filter(|_| legacy).map(|x| x.as_f64().unwrap_or(0.0) as f32);
         let used = old.enumerate().filter(|(_, w)| *w != 0.0).take(crate::engine::MAX_CUSTOM_INPUTS);
         for (slot, (k, w)) in custom.iter_mut().zip(used) {
             *slot = crate::engine::CustomInput { id: k as u32 + 1, weight: w };
@@ -372,7 +388,7 @@ impl PainterApp {
                     json!({"kind": "paint", "channels": channels})
                 }
                 Content::Fill(p) => json!({"kind": "fill", "fill": fill_json(p)}),
-                Content::Folder(fo) => json!({"kind": "folder", "open": fo.open}),
+                Content::Folder(fo) => json!({"kind": "folder", "open": fo.open, "graph": fo.graph}),
             };
             let mask = l.mask.as_ref().map(|m| {
                 json!({
@@ -490,6 +506,11 @@ impl PainterApp {
             "edge_auto": bs.edge_auto, "hard_edge_angle": bs.hard_edge_angle,
             "match_by_name": bs.match_by_name,
             "cage": bs.cage.as_ref().map(|p| p.display().to_string()),
+            "average_normals": bs.average_normals,
+            "ignore_backfaces": bs.ignore_backfaces,
+            "fill_misses": bs.fill_misses,
+            // Rounded: three decimals are finer than a brush stroke.
+            "cage_paint": bs.cage_paint.as_ref().map(|p| p.scales().iter().map(|s| (s * 1000.0).round() / 1000.0).collect::<Vec<_>>()),
             "maps": bs.maps,
             "custom": bs.custom.iter().map(custom_map_json).collect::<Vec<_>>(),
         });
@@ -505,7 +526,7 @@ impl PainterApp {
             "exposure": v.exposure, "env_rotation": v.env_rotation, "env_intensity": v.env_intensity,
             "background": format!("{:?}", v.background), "bg_blur": v.bg_blur, "bg_intensity": v.bg_intensity,
             "bg_color": v.bg_color, "height_strength": v.height_strength,
-            "show_wire": v.show_wire, "use_baked_normal": v.use_baked_normal, "ao_strength": v.ao_strength,
+            "show_wire": v.show_wire, "use_baked_normal": v.use_baked_normal, "ao_strength": v.ao_strength, "emission": v.emission,
             "key_light": {"on": v.key.on, "azimuth": v.key.azimuth, "elevation": v.key.elevation,
                 "intensity": v.key.intensity, "color": v.key.color},
             "tonemap": format!("{:?}", p.tonemap), "contrast": p.contrast, "saturation": p.saturation,
@@ -626,6 +647,12 @@ impl PainterApp {
         bs.hard_edge_angle = f(bv, "hard_edge_angle", bs.hard_edge_angle);
         bs.match_by_name = b(bv, "match_by_name", bs.match_by_name);
         bs.cage = s(bv, "cage").map(PathBuf::from).filter(|p| p.is_file());
+        bs.average_normals = b(bv, "average_normals", bs.average_normals);
+        bs.ignore_backfaces = b(bv, "ignore_backfaces", bs.ignore_backfaces);
+        bs.fill_misses = b(bv, "fill_misses", bs.fill_misses);
+        bs.cage_paint = bv["cage_paint"].as_array().map(|a| {
+            std::sync::Arc::new(crate::bake::CagePaint::new(a.iter().map(|x| x.as_f64().unwrap_or(1.0) as f32).collect()))
+        });
         // Projects from before map selection baked everything.
         bs.maps = bv["maps"].as_u64().map_or(crate::bake::ALL_MAPS, |m| m as u32);
         bs.custom = bv["custom"]
@@ -661,7 +688,8 @@ impl PainterApp {
 
         // Switch mesh first, then each set's size: layers are created at it.
         self.bake_settings = bs;
-        self.load_mesh(mesh, ctx);
+        let sizes: Vec<u32> = set_values.iter().map(|sv| sv["resolution"].as_u64().unwrap_or(2048) as u32).collect();
+        self.load_mesh_sized(mesh, ctx, &sizes);
         self.graphs.clear(&self.rs);
         for gv in manifest["graphs"].as_array().into_iter().flatten() {
             let Some(id) = gv["id"].as_u64() else { continue };
@@ -688,8 +716,8 @@ impl PainterApp {
                 let content = match s(c, "kind") {
                     Some("paint") => {
                         let ch = c["channels"].as_array().ok_or_else(bad)?;
-                        let mut out: [Option<Tex>; 4] = [None, None, None, None];
-                        for (k, t) in ch.iter().enumerate().take(4) {
+                        let mut out: [Option<Tex>; crate::engine::CHANNELS] = Default::default();
+                        for (k, t) in ch.iter().enumerate().take(crate::engine::CHANNELS) {
                             if !t.is_null() {
                                 out[k] = Some(self.tex_from(&r, t, "layer")?);
                             }
@@ -697,7 +725,7 @@ impl PainterApp {
                         Content::Paint(out)
                     }
                     Some("fill") => Content::Fill(fill_from(&c["fill"])),
-                    Some("folder") => Content::Folder(Folder { open: b(c, "open", true) }),
+                    Some("folder") => Content::Folder(Folder { open: b(c, "open", true), graph: c["graph"].as_u64() }),
                     _ => return Err(bad()),
                 };
                 let mask = match lv.get("mask").filter(|m| !m.is_null()) {
@@ -716,11 +744,11 @@ impl PainterApp {
                     }),
                     None => None,
                 };
-                let mut images: [Option<crate::engine::FillImage>; 4] = Default::default();
-                for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(4) {
+                let mut images: [Option<crate::engine::FillImage>; crate::engine::CHANNELS] = Default::default();
+                for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(crate::engine::CHANNELS) {
                     if !iv.is_null() {
                         let data = std::sync::Arc::new(r.blob(&iv["data"])?);
-                        images[k] = Some(self.engine.decode_fill_image(s(iv, "name").unwrap_or("image").to_string(), data)?);
+                        images[k] = Some(self.engine.decode_channel_image(k, s(iv, "name").unwrap_or("image").to_string(), data)?);
                     }
                 }
                 let blend_name = s(lv, "blend").unwrap_or("Normal");
@@ -767,6 +795,7 @@ impl PainterApp {
         vs.env_rotation = f(v, "env_rotation", d.env_rotation);
         vs.env_intensity = f(v, "env_intensity", d.env_intensity);
         vs.ao_strength = f(v, "ao_strength", d.ao_strength);
+        vs.emission = f(v, "emission", d.emission);
         vs.background = Background::ALL.into_iter().find(|x| Some(format!("{x:?}").as_str()) == s(v, "background")).unwrap_or(d.background);
         vs.bg_blur = f(v, "bg_blur", d.bg_blur);
         vs.bg_intensity = f(v, "bg_intensity", d.bg_intensity);
@@ -867,7 +896,7 @@ mod tests {
         let maps: Vec<_> = slots.as_array().unwrap().iter().enumerate().filter_map(|(k, v)| custom_map_from(v, k as u32 + 1)).collect();
         assert_eq!(maps.iter().map(|c| (c.id, c.name.as_str())).collect::<Vec<_>>(), vec![(1, "Fluid Flow"), (3, "Wind Deposits")]);
 
-        let mut weights = vec![0.0; crate::engine::GEN_INPUT_COUNT];
+        let mut weights = vec![0.0; LEGACY_INPUTS];
         weights[crate::engine::gin::OCCLUSION] = 0.4;
         weights.extend([0.0, 0.0, 1.0, 0.0]);
         let g = generator_from(&json!({"kind": "Custom Bake Map", "weights": weights})).unwrap();

@@ -3,11 +3,13 @@
 // Paint channels store (value, alpha) pairs; color stores rgb + alpha.
 
 struct ApplyU {
-    color: vec4<f32>,   // sRGB-encoded rgb
+    color: vec4<f32>,   // sRGB-encoded rgb, opacity
     rmh: vec4<f32>,     // roughness, metallic, height, mask value
-    ch: vec4<f32>,      // channel enabled flags
-    p: vec4<f32>,       // stroke opacity, erase, unused, unused
+    ch: vec4<f32>,      // channel enabled flags: color, roughness, metallic, height
+    p: vec4<f32>,       // stroke opacity, erase, opacity channel enabled, unused
     g: vec4<f32>,       // grain strength (0 off), tiling, in uv (else tri-planar world), invert
+    e: vec4<f32>,       // sRGB-encoded emission, emission channel enabled
+    s: vec4<f32>,       // specular level, specular channel enabled, normal channel enabled (paints flat), unused
 };
 
 @group(0) @binding(0) var<uniform> u: ApplyU;
@@ -20,6 +22,10 @@ struct ApplyU {
 @group(0) @binding(7) var nrm_map: texture_2d<f32>;
 @group(0) @binding(8) var grain_tex: texture_2d<f32>;
 @group(0) @binding(9) var grain_samp: sampler;
+@group(0) @binding(10) var b_opacity: texture_2d<f32>;
+@group(0) @binding(11) var b_emission: texture_2d<f32>;
+@group(0) @binding(12) var b_normal: texture_2d<f32>;
+@group(0) @binding(13) var b_spec: texture_2d<f32>;
 
 fn grain_at(q: vec2<f32>) -> f32 {
     return textureSampleLevel(grain_tex, grain_samp, q, 0.0).r;
@@ -66,7 +72,23 @@ struct PaintOut {
     @location(1) rough: vec4<f32>,
     @location(2) metal: vec4<f32>,
     @location(3) height: vec4<f32>,
+    @location(4) opacity: vec4<f32>,
+    @location(5) emission: vec4<f32>,
+    @location(6) normal: vec4<f32>,
+    @location(7) spec: vec4<f32>,
 };
+
+// A color channel's (rgb, coverage) with `v` laid over it by `m` (or erased).
+fn over_rgb(b: vec4<f32>, v: vec3<f32>, m: f32, erase: bool) -> vec4<f32> {
+    if (erase) {
+        return vec4<f32>(b.rgb, b.a * (1.0 - m));
+    }
+    let a = m + b.a * (1.0 - m);
+    if (a > 1e-5) {
+        return vec4<f32>((v * m + b.rgb * b.a * (1.0 - m)) / a, a);
+    }
+    return vec4<f32>(v, a);
+}
 
 @fragment
 fn fs_paint(in: FsOut) -> PaintOut {
@@ -75,20 +97,10 @@ fn fs_paint(in: FsOut) -> PaintOut {
     let erase = u.p.y > 0.5;
     var out: PaintOut;
     if (u.ch.x > 0.5) {
-        let b = textureLoad(b_color, c, 0);
-        var rgb = b.rgb;
-        var a: f32;
-        if (erase) {
-            a = b.a * (1.0 - m);
-        } else {
-            a = m + b.a * (1.0 - m);
-            if (a > 1e-5) {
-                rgb = (u.color.rgb * m + b.rgb * b.a * (1.0 - m)) / a;
-            } else {
-                rgb = u.color.rgb;
-            }
-        }
-        out.color = vec4<f32>(rgb, a);
+        out.color = over_rgb(textureLoad(b_color, c, 0), u.color.rgb, m, erase);
+    }
+    if (u.e.w > 0.5) {
+        out.emission = over_rgb(textureLoad(b_emission, c, 0), u.e.rgb, m, erase);
     }
     if (u.ch.y > 0.5) {
         out.rough = vec4<f32>(over(textureLoad(b_rough, c, 0).rg, u.rmh.x, m, erase), 0.0, 0.0);
@@ -98,6 +110,16 @@ fn fs_paint(in: FsOut) -> PaintOut {
     }
     if (u.ch.w > 0.5) {
         out.height = vec4<f32>(over(textureLoad(b_height, c, 0).rg, u.rmh.z, m, erase), 0.0, 0.0);
+    }
+    if (u.p.z > 0.5) {
+        out.opacity = vec4<f32>(over(textureLoad(b_opacity, c, 0).rg, u.color.w, m, erase), 0.0, 0.0);
+    }
+    if (u.s.z > 0.5) {
+        // A brush lays flat normals: it smooths away the layer's normal detail.
+        out.normal = over_rgb(textureLoad(b_normal, c, 0), vec3<f32>(0.5, 0.5, 1.0), m, erase);
+    }
+    if (u.s.y > 0.5) {
+        out.spec = vec4<f32>(over(textureLoad(b_spec, c, 0).rg, u.s.x, m, erase), 0.0, 0.0);
     }
     return out;
 }

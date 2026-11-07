@@ -343,7 +343,9 @@ impl PainterApp {
         let (name, maps) = (m.name.clone(), m.maps.clone());
         let mut fill = FillParams { projection: Projection::Triplanar, tiling: 1.0, ..FillParams::default() };
         // A material without a metal map is not metal.
-        fill.mat.enabled = [true, maps[1].is_some(), true, maps[3].is_some()];
+        let mut enabled = [true, maps[1].is_some(), true, maps[3].is_some(), false, false, false, false];
+        enabled[crate::engine::NORMAL] = maps[crate::engine::NORMAL].is_some();
+        fill.mat.enabled = enabled;
         fill.mat.metal = 0.0;
         // With a height image the value is its strength, as for the built-in scans.
         fill.mat.height = 0.3;

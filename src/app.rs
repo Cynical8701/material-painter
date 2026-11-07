@@ -14,7 +14,7 @@ use crate::engine::{
 use crate::gpu::GpuMesh;
 use crate::icons;
 use crate::mesh::{Mesh, Primitive};
-use crate::polyfill::{FillMode, Topology};
+use crate::polyfill::{FillMode, SelectOpts, Topology};
 use crate::post::Tonemap;
 use crate::presets::{self, PreviewLayer};
 use crate::raytrace::{RayTracer, RtSettings};
@@ -30,6 +30,7 @@ use std::time::Instant;
 mod export_ui;
 mod dock;
 mod gallery;
+mod folder_graph;
 mod graph_ui;
 mod shader_ui;
 mod library_ui;
@@ -44,6 +45,7 @@ pub(crate) mod prefs;
 mod project_io;
 mod shelf_previews;
 mod texture_sets;
+mod cage_paint;
 
 use export_ui::{ExportDialog, open_in_file_browser};
 use graph_ui::GraphStore;
@@ -74,8 +76,8 @@ struct CagePreview {
     job: Option<(ProbeKey, mpsc::Receiver<Result<CageProbe, String>>)>,
     /// A probe that failed, so it isn't retried until the inputs change.
     failed: Option<(ProbeKey, String)>,
-    /// (front, rear) the overlay was built for.
-    drawn: Option<(f32, f32)>,
+    /// The distances (and painted cage) the overlay was built for.
+    drawn: Option<crate::cage::Reach>,
     stats: Option<CageStats>,
 }
 
@@ -86,23 +88,42 @@ struct PolyFillState {
     erase: bool,
     /// Connectivity of the current mesh, built on first use.
     topo: Option<Arc<Topology>>,
-    /// The triangle under the cursor this frame, from whichever view has it.
-    frame_hover: Option<u32>,
+    /// Flat area: the sharpest edge it spreads across, in degrees.
+    angle: f32,
+    /// Shift+drag draws a lasso instead of a box.
+    lasso: bool,
+    /// Box and lasso also take faces hidden behind others.
+    through: bool,
+    /// The triangle under the cursor this frame and where on it, from whichever view has it.
+    frame_hover: Option<(u32, Vec3)>,
     /// What the selection overlay currently shows.
-    shown: Option<(u32, FillMode, bool)>,
+    shown: Option<PolyShown>,
     /// Triangles filled during the current drag, so each fills once.
     filled: std::collections::HashSet<u32>,
     stroke_erase: bool,
-    /// Shift+drag box selection in progress.
+    /// Shift+drag box or lasso selection in progress.
     box_drag: Option<BoxDrag>,
 }
 
-/// A box drawn with Shift+drag; the faces inside fill on release.
-#[derive(Clone, Copy)]
+/// What the polygon fill highlight was built for: rebuilt when any of it changes.
+#[derive(Clone, Copy, PartialEq)]
+struct PolyShown {
+    tri: u32,
+    mode: FillMode,
+    erase: bool,
+    /// Face loop: the edge it runs through (the pick point decides).
+    edge: Option<usize>,
+    angle: u32,
+}
+
+/// A box or lasso drawn with Shift+drag; the faces inside fill on release.
+#[derive(Clone)]
 struct BoxDrag {
     view: ViewKind,
     start: egui::Pos2,
     end: egui::Pos2,
+    /// The lasso's outline (empty for a box).
+    lasso: Vec<egui::Pos2>,
     erase: bool,
 }
 
@@ -252,7 +273,7 @@ impl Default for Brush {
             flow: 1.0,
             opacity: 1.0,
             spacing: 0.08,
-            mat: MatValues { enabled: [true, true, true, false], color: [0.78, 0.2, 0.12], rough: 0.4, metal: 0.0, height: 0.5 },
+            mat: MatValues { color: [0.78, 0.2, 0.12], rough: 0.4, height: 0.5, ..MatValues::default() },
             mask_value: 1.0,
             fix_value: 0.5,
             symmetry: 0,
@@ -484,6 +505,7 @@ pub struct PainterApp {
     /// Geometry drawn over the 3D view: bake cage, polygon fill selection.
     overlays: Overlays,
     cage_preview: CagePreview,
+    cage_brush: cage_paint::CageBrush,
     poly: PolyFillState,
     /// The brush tip the engine holds (`None` until the first upload).
     uploaded_tip: Option<Option<usize>>,
@@ -522,7 +544,11 @@ fn paint_checker(painter: &egui::Painter, rect: Rect) {
 const IMAGE_EXT: [&str; 9] = ["png", "jpg", "jpeg", "tga", "bmp", "tif", "tiff", "exr", "hdr"];
 
 /// Shelf thumbnail size range, in points.
-const ICON_MIN: f32 = 48.0;
+const ICON_MIN: f32 = 32.0;
+/// Below this thumbnail size the shelf shows thumbnails alone; names show on hover.
+const NAMED_MIN: f32 = 56.0;
+/// Below this shelf width the categories show as icons and the header packs tight.
+const SHELF_COMPACT: f32 = 720.0;
 const ICON_MAX: f32 = 128.0;
 
 /// A card-style section title: semibold white text over a hairline.
@@ -949,15 +975,22 @@ fn color_edit(ui: &mut egui::Ui, c: &mut [f32; 3]) -> bool {
     changed
 }
 
-/// Channel toggles in Substance order: color, height, rough, metal.
-fn channel_toggles(ui: &mut egui::Ui, enabled: &mut [bool; 4]) -> bool {
+/// Channel toggles in Substance order: color, height, rough, metal, opacity.
+fn channel_toggles(ui: &mut egui::Ui, enabled: &mut [bool; crate::engine::CHANNELS]) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        for (c, name) in [(0, "color"), (3, "height"), (1, "rough"), (2, "metal")] {
+    ui.horizontal_wrapped(|ui| {
+        use crate::engine::{NORMAL, SPECULAR};
+        for (c, name) in [(0, "color"), (3, "height"), (1, "rough"), (2, "metal"), (SPECULAR, "specular"), (NORMAL, "normal"), (4, "opacity"), (5, "emission")] {
             let on = enabled[c];
             let text = egui::RichText::new(name).color(if on { Color32::WHITE } else { theme::TEXT_DIM });
             let b = egui::Button::new(text).fill(if on { theme::ACCENT_DIM } else { theme::WIDGET }).min_size(vec2(56.0, 20.0));
-            if ui.add(b).clicked() {
+            let b = ui.add(b);
+            let b = match c {
+                NORMAL => b.on_hover_text("Normal detail from a normal-map image (fill layers). A brush paints it flat, smoothing the layer's normal detail away."),
+                SPECULAR => b.on_hover_text("How much non-metals reflect: 0.5 is the usual 4%"),
+                _ => b,
+            };
+            if b.clicked() {
                 enabled[c] = !on;
                 changed = true;
             }
@@ -983,6 +1016,18 @@ fn material_controls(ui: &mut egui::Ui, m: &mut MatValues, show_values: bool) ->
     }
     if m.enabled[2] {
         changed |= slider(ui, "Metallic", &mut m.metal, 0.0..=1.0);
+    }
+    if m.enabled[crate::engine::SPECULAR] {
+        // 0.5 is the usual 4% reflectance of non-metals; metals reflect their color.
+        changed |= slider(ui, "Specular", &mut m.specular, 0.0..=1.0);
+    }
+    if m.enabled[4] {
+        // 0 is fully see-through; exports as the base color's alpha or an opacity map.
+        changed |= slider(ui, "Opacity", &mut m.opacity, 0.0..=1.0);
+    }
+    if m.enabled[5] {
+        // Black emits nothing; brightness in the view is the view's emission strength.
+        changed |= labeled(ui, "Emission", |ui| color_edit(ui, &mut m.emission));
     }
     changed
 }
@@ -1029,10 +1074,22 @@ pub(crate) fn add_smart_material(
     folder
 }
 
+/// What was dropped on `resp` this frame, if it's a `T`. egui's
+/// `dnd_release_payload` takes the payload whatever its type, so asking a
+/// widget for one kind (a layer being moved) would throw away another (a
+/// shelf item) that a later check on the same widget wants.
+fn dnd_release<T: std::any::Any + Send + Sync>(resp: &egui::Response) -> Option<Arc<T>> {
+    egui::DragAndDrop::has_payload_of_type::<T>(&resp.ctx).then(|| resp.dnd_release_payload::<T>()).flatten()
+}
+
 /// Something dragged off the shelf.
 #[derive(Clone, Copy)]
-enum ShelfItem {
+pub(crate) enum ShelfItem {
+    /// A smart material, as a folder of fill layers with smart masks (its
+    /// live graph opens in the Material Designer).
     Smart(usize),
+    /// A smart material as one graph fill layer.
+    SmartGraph(usize),
     Material(usize),
     Generator(GenKind),
     /// A brush tip (`brushes::BRUSH_ALPHAS`).
@@ -1217,7 +1274,7 @@ impl PainterApp {
         self.brush.size = 34.0;
         self.brush.spacing = 1.25;
         self.brush.angle = 0.0;
-        self.brush.mat.enabled = [true, true, false, true];
+        self.brush.mat.enabled = [true, true, false, true, false, false, false, false];
         self.brush.mat.color = [0.95, 0.85, 0.3];
         self.brush.mat.height = 1.0;
         self.path.clear();
@@ -1393,6 +1450,7 @@ impl PainterApp {
             mcp_views: None,
             overlays: Overlays::default(),
             cage_preview: CagePreview { show: true, probe: None, job: None, failed: None, drawn: None, stats: None },
+            cage_brush: Default::default(),
             poly: PolyFillState {
                 mode: FillMode::Polygon,
                 box_drag: None,
@@ -1402,6 +1460,9 @@ impl PainterApp {
                 shown: None,
                 filled: Default::default(),
                 stroke_erase: false,
+                angle: 30.0,
+                lasso: false,
+                through: false,
             },
             uploaded_tip: None,
             uploaded_grain: None,
@@ -1568,6 +1629,12 @@ impl PainterApp {
     }
 
     fn load_mesh(&mut self, mesh: Mesh, ctx: &egui::Context) {
+        self.load_mesh_sized(mesh, ctx, &[]);
+    }
+
+    /// Loads `mesh`, making its new texture sets at `sizes` (per set, in
+    /// order) instead of the default size.
+    fn load_mesh_sized(&mut self, mesh: Mesh, ctx: &egui::Context, sizes: &[u32]) {
         if self.stroke.is_some() {
             return;
         }
@@ -1584,11 +1651,15 @@ impl PainterApp {
         };
         let old_names: Vec<String> = self.mesh.sets.iter().map(|s| s.name.clone()).collect();
         self.mesh = Arc::new(mesh);
-        self.rebuild_sets(&old_names);
+        self.rebuild_sets(&old_names, sizes);
         // Mesh-dependent helpers rebuild for the new mesh on demand.
         self.poly.topo = None;
         self.poly.shown = None;
         self.overlays.clear(OverlaySlot::Selection);
+        // A painted cage belongs to the mesh it was painted on.
+        if self.bake_settings.cage_paint.as_deref().is_some_and(|p| !p.fits(self.mesh.vertices.len())) {
+            self.bake_settings.cage_paint = None;
+        }
         self.cam = OrbitCam { fov_y: self.cam.fov_y, ..OrbitCam::default() };
         if self.prefs.bake_on_load {
             self.start_bake_all(ctx);
@@ -1712,7 +1783,12 @@ impl PainterApp {
                         let smart = &presets::SMART_MATERIALS[i];
                         self.selected = add_smart_material(&mut self.engine, &mut self.undo, smart, at, parent);
                         self.target = StrokeTarget::Content;
-                        self.status = format!("Added smart material '{}'.", smart.name);
+                        self.status = format!("Added smart material '{}'. Edit its layers, or the folder's graph (Ctrl+G).", smart.name);
+                    }
+                    ShelfItem::SmartGraph(i) => {
+                        let smart = &presets::SMART_MATERIALS[i];
+                        self.add_smart_graph(smart, at, parent);
+                        self.status = format!("Added smart material '{}' as one graph layer. Tune it in the layer properties.", smart.name);
                     }
                     ShelfItem::Material(i) => {
                         let m = &presets::MATERIALS[i];
@@ -2387,18 +2463,42 @@ impl PainterApp {
                     ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(Color32::WHITE));
                     ui.separator();
                     if self.tool == Tool::PolyFill {
+                        ui.spacing_mut().item_spacing.x = 2.0;
                         for (mode, icon, tip) in [
-                            (FillMode::Triangle, icons::TRIANGLE, "Fill one triangle"),
-                            (FillMode::Polygon, icons::SQUARE, "Fill a polygon (a quad: two coplanar triangles)"),
-                            (FillMode::Part, icons::CUBE, "Fill a loose part (a connected piece of one object)"),
-                            (FillMode::Object, icons::CUBE_TRANSPARENT, "Fill a whole imported object"),
-                            (FillMode::UvIsland, icons::GRID_FOUR, "Fill a whole UV island"),
+                            (FillMode::Triangle, icons::TRIANGLE, "Triangle: fill one triangle"),
+                            (FillMode::Polygon, icons::SQUARE, "Polygon: fill a flat quad (two coplanar triangles)"),
+                            (FillMode::Loop, icons::COLUMNS, "Face loop: a strip of quads through the edge nearest the cursor, as far as the quads go (a ring around a cylinder, a row of panels). Point near another edge of the quad to turn it."),
+                            (FillMode::Flat, icons::MAGIC_WAND, "Flat area: spreads from the face until an edge sharper than the angle: a panel, a bevel, a side of a box"),
+                            (FillMode::Part, icons::CUBE, "Loose part: a connected piece of one object"),
+                            (FillMode::Object, icons::CUBE_TRANSPARENT, "Object: a whole imported object"),
+                            (FillMode::UvIsland, icons::GRID_FOUR, "UV island: a whole island of the UV layout"),
+                            (FillMode::Set, icons::SPHERE, "Texture set: every face of the material"),
                         ] {
                             let on = self.poly.mode == mode;
-                            let text = egui::RichText::new(theme::with_icon(icon, mode.name())).color(if on { Color32::WHITE } else { theme::TEXT });
-                            if ui.add(theme::selectable(on, text)).on_hover_text(tip).clicked() {
+                            if theme::icon_button(ui, icon, on, 24.0).on_hover_text(tip).clicked() {
                                 self.poly.mode = mode;
                             }
+                        }
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(self.poly.mode.name()).color(Color32::WHITE));
+                        if self.poly.mode == FillMode::Flat {
+                            ui.add(egui::Slider::new(&mut self.poly.angle, 1.0..=90.0).max_decimals(0).suffix("°"))
+                                .on_hover_text("The sharpest edge a flat area spreads across");
+                        }
+                        ui.separator();
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new("Shift+drag").color(theme::TEXT_DIM));
+                        if theme::icon_button(ui, icons::SELECTION, !self.poly.lasso, 24.0).on_hover_text("Shift+drag a box").clicked() {
+                            self.poly.lasso = false;
+                        }
+                        if theme::icon_button(ui, icons::LASSO, self.poly.lasso, 24.0).on_hover_text("Shift+drag a lasso: a free shape").clicked() {
+                            self.poly.lasso = true;
+                        }
+                        if theme::icon_button(ui, icons::SELECTION_ALL, self.poly.through, 24.0)
+                            .on_hover_text("Select through: the box or lasso also takes faces hidden behind others (in 3D)")
+                            .clicked()
+                        {
+                            self.poly.through = !self.poly.through;
                         }
                         ui.separator();
                         let text = theme::with_icon(icons::ERASER, "Erase");
@@ -2411,7 +2511,7 @@ impl PainterApp {
                         if ui.add(egui::Slider::new(&mut p, 1.0..=100.0).max_decimals(0).suffix("%")).changed() {
                             self.brush.opacity = p / 100.0;
                         }
-                        ui.label(egui::RichText::new("Click or drag across faces, Shift+drag a box. Uses the brush material.").small().color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("Click or drag across faces, Shift+drag a box or lasso. Uses the brush material.").small().color(theme::TEXT_DIM));
                     } else if self.tool == Tool::Path {
                         self.path_toolbar(ui);
                     } else {
@@ -2531,7 +2631,12 @@ impl PainterApp {
                     .width(ui.available_width())
                     .show_ui(ui, |ui| {
                         for (k, set) in self.mesh.sets.iter().enumerate() {
-                            if ui.selectable_label(k == self.sets.active, &set.name).clicked() {
+                            let resp = ui.selectable_label(k == self.sets.active, &set.name);
+                            // Hovering an entry shows its part of the mesh.
+                            if resp.hovered() {
+                                self.sets.hover = Some(k);
+                            }
+                            if resp.clicked() {
                                 pick = Some(k);
                             }
                         }
@@ -2540,7 +2645,7 @@ impl PainterApp {
                     .on_hover_text("Each material of the mesh has its own layers, size and mesh maps");
             });
             if let Some(k) = pick {
-                self.switch_set(k);
+                self.pick_set(k, ui.ctx());
             }
             ui.add_space(2.0);
         }
@@ -2574,7 +2679,7 @@ impl PainterApp {
                 let collapsed = self
                     .engine
                     .ancestors(idx)
-                    .any(|a| matches!(self.engine.layers[a].content, Content::Folder(Folder { open: false })));
+                    .any(|a| matches!(self.engine.layers[a].content, Content::Folder(Folder { open: false, .. })));
                 if !collapsed {
                     self.layer_row(ui, idx);
                 }
@@ -2597,6 +2702,7 @@ impl PainterApp {
         let indent = self.engine.depth(idx) as f32 * 16.0;
         let layer = &self.engine.layers[idx];
         let (id, visible, name) = (layer.id, layer.visible, layer.name.clone());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, idx == self.selected, &name));
         let folder_open = match layer.content {
             Content::Folder(f) => Some(f.open),
             _ => None,
@@ -2760,7 +2866,7 @@ impl PainterApp {
                 }
             }
         }
-        if let (Some(from), Some(p)) = (resp.dnd_release_payload::<LayerDrag>(), ui.ctx().pointer_interact_pos()) {
+        if let (Some(from), Some(p)) = (dnd_release::<LayerDrag>(&resp), ui.ctx().pointer_interact_pos()) {
             if from.0 != idx {
                 self.pending.push(Action::MoveTo { from: from.0, drop: drop_at(p.y) });
             }
@@ -2780,7 +2886,7 @@ impl PainterApp {
                 }
             }
         }
-        if let (Some(item), Some(p)) = (resp.dnd_release_payload::<ShelfItem>(), ui.ctx().pointer_interact_pos()) {
+        if let (Some(item), Some(p)) = (dnd_release::<ShelfItem>(&resp), ui.ctx().pointer_interact_pos()) {
             if let ShelfItem::Generator(g) = *item {
                 self.selected = idx;
                 self.pending.push(Action::AddGenerator(g));
@@ -3001,6 +3107,8 @@ impl PainterApp {
                 ui.add(egui::Slider::new(&mut v.ao_strength, 0.0..=1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)))
             })
             .on_hover_text("How much the baked ambient occlusion darkens crevices in the 3D view. Only the view: bakes and exports keep the full map.");
+            labeled(ui, "Emission", |ui| ui.add(egui::Slider::new(&mut v.emission, 0.0..=20.0).logarithmic(true).max_decimals(2)))
+                .on_hover_text("How bright emissive parts glow in the 3D view and the ray tracer. Only the view: exports keep the emission color as painted.");
 
             section(ui, "Key light");
             ui.checkbox(&mut v.key.on, theme::with_icon(icons::SUN, "Directional light with shadows"))
@@ -3092,6 +3200,14 @@ impl PainterApp {
                 .small()
                 .color(theme::TEXT_DIM),
             );
+            if let Some(filled) = r.filled_percent().filter(|f| *f > 0.0) {
+                ui.label(
+                    egui::RichText::new(format!("{filled:.2}% of texels missed by every ray took the nearest high-poly surface"))
+                        .small()
+                        .color(theme::TEXT_DIM),
+                )
+                .on_hover_text("Raise the cage there (Paint cage or Auto-fix) for an exact projection.");
+            }
             if let Some(missed) = r.missed_percent() {
                 let (col, text) = if missed > 0.05 {
                     (Color32::from_rgb(235, 120, 90), format!("⚠ {missed:.2}% of texels missed the bake source"))
@@ -3275,6 +3391,22 @@ impl PainterApp {
                     ui.label(egui::RichText::new("Rays start on the cage and travel to the low poly.").small().color(theme::TEXT_DIM));
                 }
                 slider(ui, "Rear", &mut s.rear, 0.001..=0.5);
+                if s.cage.is_none() {
+                    ui.checkbox(&mut s.average_normals, "Average normals").on_hover_text(
+                        "Rays search along normals averaged over every face at a vertex, so the cage stays closed over hard edges: no gaps or doubled detail along them. Off: each vertex's own normal.",
+                    );
+                }
+                ui.checkbox(&mut s.ignore_backfaces, "Ignore backfaces").on_hover_text(
+                    "Rays skip faces they reach from behind (the inside of a neighboring part, the far side of a thin one). Where that leaves nothing, they count them after all, so flipped faces still bake.",
+                );
+                ui.checkbox(&mut s.fill_misses, "Fill misses from the nearest surface").on_hover_text(
+                    "A texel whose rays find nothing takes the high poly's nearest point instead of staying flat, so the maps have no holes. The report counts them.",
+                );
+                if s.builds_cage() || (s.cage.is_none() && !s.average_normals) {
+                    let painted = s.cage_paint.is_some();
+                    let probed = self.cage_preview.probe.as_ref().is_some_and(|p| p.has_high);
+                    cage_paint::cage_brush_ui(ui, &mut self.cage_brush, painted, probed);
+                }
                 let c = &mut self.cage_preview;
                 ui.checkbox(&mut c.show, theme::with_icon(icons::CUBE_TRANSPARENT, "Show cage in the 3D view"))
                     .on_hover_text("The shell the bake rays start from, colored by what they find from each low-poly vertex.");
@@ -3526,9 +3658,22 @@ impl PainterApp {
                 dirty |= self.mask_properties(ui, idx);
                 self.brush_properties(ui, false);
             } else {
+                if self.engine.layers[idx].is_folder() {
+                    section(ui, "Material graph");
+                    labeled(ui, "Graph", |ui| {
+                        if ui.button("Edit as graph").on_hover_text("The fill layers inside as nodes in the Material Designer (Ctrl+G)").clicked() {
+                            self.pending.push(Action::EditGraph);
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Its fill layers show as Layer and Smart Mask nodes. Edits in the graph change the layers, and the other way round; wire your own nodes into a Layer node's mask.")
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                }
                 let is_fill = self.engine.layers[idx].is_fill();
                 if is_fill {
-                    let names: [Option<String>; 4] =
+                    let names: [Option<String>; crate::engine::CHANNELS] =
                         std::array::from_fn(|i| self.engine.layers[idx].images[i].as_ref().map(|im| im.name.clone()));
                     let graph_name = match &self.engine.layers[idx].content {
                         Content::Fill(f) => f.graph.map(|g| self.graphs.doc(g).map_or("(missing)".to_string(), |d| d.graph.name.clone())),
@@ -3556,8 +3701,9 @@ impl PainterApp {
                         if graph_name.is_none() {
                         section(ui, "Images");
                         let shelf_textures = &self.shelf.textures;
-                        for (ch, label) in ["Color", "Roughness", "Metallic", "Height"].into_iter().enumerate() {
-                            labeled(ui, label, |ui| {
+                        for (ch, label) in ["Color", "Roughness", "Metallic", "Height", "Opacity", "Emission", "Normal", "Specular"].into_iter().enumerate() {
+                            // A shelf texture dropped on the row feeds the channel.
+                            let row = ui.scope(|ui| labeled(ui, label, |ui| {
                                 match &names[ch] {
                                     Some(name) => {
                                         ui.add(egui::Label::new(name.as_str()).truncate()).on_hover_text(name.as_str());
@@ -3595,7 +3741,19 @@ impl PainterApp {
                                         });
                                     });
                                 });
-                            });
+                            }))
+                            .response
+                            .rect;
+                            let drop = ui.interact(row, ui.scope_id().with(("image_drop", ch)), Sense::hover());
+                            if let Some(ShelfItem::Texture(_)) = drop.dnd_hover_payload::<ShelfItem>().as_deref() {
+                                ui.painter().rect_stroke(row.expand(1.0), 0.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
+                            }
+                            if let Some(ShelfItem::Texture(texture)) = dnd_release::<ShelfItem>(&drop).as_deref() {
+                                self.pending.push(Action::TextureToChannel { texture: *texture, ch });
+                            }
+                        }
+                        if names[crate::engine::NORMAL].is_some() {
+                            dirty |= slider(ui, "Normal strength", &mut f.mat.normal, 0.0..=2.0);
                         }
                         if names.iter().any(Option::is_some) {
                             labeled(ui, "Projection", |ui| {
@@ -3626,7 +3784,7 @@ impl PainterApp {
                     }
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Fill layers cost no texture memory. Add a mask to paint where they show.").small().color(theme::TEXT_DIM));
-                } else {
+                } else if !self.engine.layers[idx].is_folder() {
                     self.brush_properties(ui, true);
                 }
             }
@@ -4022,11 +4180,17 @@ impl PainterApp {
     // ------------------------------------------------------------------ shelf
 
     fn shelf_panel(&mut self, ui: &mut egui::Ui) {
+        // A narrow shelf keeps its room for thumbnails: categories as icons
+        // (names on hover), a header without the hint, - / + for the size.
+        let compact = ui.available_width() < SHELF_COMPACT;
         egui::Panel::left("shelf_cats")
-            .exact_size(176.0)
-            .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(8, 8)))
+            .exact_size(if compact { 40.0 } else { 176.0 })
+            .resizable(false)
+            .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(if compact { 4 } else { 8 }, 8)))
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("SHELF").small().color(theme::TEXT_DIM));
+                if !compact {
+                    ui.label(egui::RichText::new("SHELF").small().color(theme::TEXT_DIM));
+                }
                 ui.spacing_mut().item_spacing.y = 2.0;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (cat, icon, name, count) in [
@@ -4039,15 +4203,21 @@ impl PainterApp {
                     (ShelfCat::Downloaded, icons::DOWNLOAD_SIMPLE, "Downloaded", self.library.local.len()),
                 ] {
                     let on = self.shelf.cat == cat;
-                    let text = egui::RichText::new(format!("{}  {name}", icon)).color(if on { Color32::WHITE } else { theme::TEXT });
-                    let resp = ui.add_sized([158.0, 21.0], theme::selectable(on, text));
-                    ui.painter().text(
-                        resp.rect.right_center() - vec2(8.0, 0.0),
-                        egui::Align2::RIGHT_CENTER,
-                        count.to_string(),
-                        egui::FontId::proportional(10.0),
-                        theme::TEXT_DIM,
-                    );
+                    let color = if on { Color32::WHITE } else { theme::TEXT };
+                    let resp = if compact {
+                        ui.add_sized([32.0, 26.0], theme::selectable(on, egui::RichText::new(icon).size(15.0).color(color)))
+                            .on_hover_text(format!("{name} ({count})"))
+                    } else {
+                        let resp = ui.add_sized([158.0, 21.0], theme::selectable(on, egui::RichText::new(format!("{}  {name}", icon)).color(color)));
+                        ui.painter().text(
+                            resp.rect.right_center() - vec2(8.0, 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            count.to_string(),
+                            egui::FontId::proportional(10.0),
+                            theme::TEXT_DIM,
+                        );
+                        resp
+                    };
                     if resp.clicked() {
                         self.shelf.cat = cat;
                     }
@@ -4057,13 +4227,14 @@ impl PainterApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6, 4)))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let browse = egui::Button::new(egui::RichText::new(theme::with_icon(icons::GLOBE, "Get more assets")).color(Color32::WHITE))
-                        .fill(theme::ACCENT.gamma_multiply(0.55));
-                    if ui.add(browse).on_hover_text("Thousands of free materials from Poly Haven and ambientCG, and graphs shared by the community").clicked() {
+                // Wraps rather than overlapping when even the compact header doesn't fit.
+                ui.horizontal_wrapped(|ui| {
+                    let label = if compact { icons::GLOBE.to_string() } else { theme::with_icon(icons::GLOBE, "Get more assets") };
+                    let browse = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(theme::ACCENT.gamma_multiply(0.55));
+                    if ui.add(browse).on_hover_text("Get more assets: thousands of free materials from Poly Haven and ambientCG, and graphs shared by the community").clicked() {
                         self.library.open = true;
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.shelf.search).hint_text("Search…").desired_width(200.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.shelf.search).hint_text("Search…").desired_width(if compact { 110.0 } else { 200.0 }));
                     let hint = match self.shelf.cat {
                         ShelfCat::SmartMaterials => "Double-click or drag onto a view to add a smart material (a folder of layers). Save your own: right-click a folder in Layers → Save as smart material.",
                         ShelfCat::Materials => "Double-click or drag onto a view to add as a fill layer. Right-click for more.",
@@ -4075,13 +4246,24 @@ impl PainterApp {
                     };
                     if matches!(self.shelf.cat, ShelfCat::SmartMaterials | ShelfCat::Materials | ShelfCat::Downloaded) {
                         let text = self.shelf.kind.map_or("All types", |k| k.name());
-                        egui::ComboBox::from_id_salt("shelf type").selected_text(text).width(130.0).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt("shelf type").selected_text(text).width(if compact { 96.0 } else { 130.0 }).show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.shelf.kind, None, "All types").on_hover_text("Everything, grouped by type");
                             for k in presets::MaterialType::ALL {
                                 ui.selectable_value(&mut self.shelf.kind, Some(k), k.name());
                             }
                         });
                     }
+                    if compact {
+                        // Thumbnail size in steps; the hint stays on the hover.
+                        let step = |size: f32, by: f32| (size + by).clamp(ICON_MIN, ICON_MAX);
+                        if ui.small_button("-").on_hover_text("Smaller thumbnails (Ctrl+scroll over the shelf)").clicked() {
+                            self.shelf.icon_size = step(self.shelf.icon_size, -16.0);
+                        }
+                        if ui.small_button("+").on_hover_text("Bigger thumbnails (Ctrl+scroll over the shelf)").clicked() {
+                            self.shelf.icon_size = step(self.shelf.icon_size, 16.0);
+                        }
+                        ui.label(egui::RichText::new(icons::INFO).color(theme::TEXT_DIM)).on_hover_text(hint);
+                    } else {
                     // The size slider at the right edge first; the hint fits in what's left,
                     // shortened with an ellipsis (whole on hover) instead of running under it.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4091,6 +4273,7 @@ impl PainterApp {
                             ui.add(egui::Label::new(egui::RichText::new(hint).small().color(theme::TEXT_DIM)).truncate()).on_hover_text(hint);
                         });
                     });
+                    }
                 });
                 ui.add_space(2.0);
                 // Ctrl+scroll arrives as zoom; it resizes the thumbnails.
@@ -4229,6 +4412,16 @@ impl PainterApp {
                                     if resp.double_clicked() {
                                         self.pending.push(Action::AddOnTop(ShelfItem::Smart(i)));
                                     }
+                                    resp.context_menu(|ui| {
+                                        if ui.button("Add as layer folder").on_hover_text("A folder of fill layers with smart masks; Ctrl+G shows them as a graph you can edit too").clicked() {
+                                            self.pending.push(Action::AddOnTop(ShelfItem::Smart(i)));
+                                            ui.close();
+                                        }
+                                        if ui.button("Add as one graph layer").on_hover_text("One layer driven by a graph; its settings as material parameters in the layer properties").clicked() {
+                                            self.pending.push(Action::AddOnTop(ShelfItem::SmartGraph(i)));
+                                            ui.close();
+                                        }
+                                    });
                                 }
                             }
                             ShelfCat::Materials => {
@@ -4251,8 +4444,15 @@ impl PainterApp {
                                         }
                                         if ui.button("Use as brush material").clicked() {
                                             let f = m.fill();
-                                            let keep_height = self.brush.mat.enabled[3];
-                                            self.brush.mat = MatValues { enabled: [true, true, true, keep_height], height: self.brush.mat.height, ..f.mat };
+                                            let mut enabled = self.brush.mat.enabled;
+                                            enabled[..3].fill(true);
+                                            self.brush.mat = MatValues {
+                                                enabled,
+                                                height: self.brush.mat.height,
+                                                opacity: self.brush.mat.opacity,
+                                                emission: self.brush.mat.emission,
+                                                ..f.mat
+                                            };
                                             self.tool = Tool::Paint;
                                             ui.close();
                                         }
@@ -4328,7 +4528,8 @@ impl PainterApp {
     /// A shelf thumbnail `size` points wide with its name below; hovering
     /// shows it at twice the size.
     fn swatch(ui: &mut egui::Ui, tex: egui::TextureId, name: &str, size: f32) -> egui::Response {
-        let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 22.0), Sense::click_and_drag());
+        let named = size >= NAMED_MIN;
+        let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + if named { 22.0 } else { 8.0 }), Sense::click_and_drag());
         let p = ui.painter();
         if resp.hovered() {
             p.rect_filled(rect, 0.0, theme::WIDGET_HOVER);
@@ -4336,9 +4537,11 @@ impl PainterApp {
         let img = Rect::from_min_size(rect.min + vec2(6.0, 4.0), vec2(size, size));
         p.image(tex, img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         // One line, cut with "…"; the hover shows the full name.
-        let galley = theme::elided(p, name, egui::FontId::proportional(10.5), theme::TEXT, size + 8.0);
-        let pos = pos2(rect.center().x - galley.size().x * 0.5, img.max.y + 3.0);
-        p.galley(pos, galley, theme::TEXT);
+        if named {
+            let galley = theme::elided(p, name, egui::FontId::proportional(10.5), theme::TEXT, size + 8.0);
+            let pos = pos2(rect.center().x - galley.size().x * 0.5, img.max.y + 3.0);
+            p.galley(pos, galley, theme::TEXT);
+        }
         if resp.dragged() {
             // The thumbnail follows the pointer while it's dragged to a view.
             if let Some(p) = resp.ctx.pointer_interact_pos() {
@@ -4425,7 +4628,7 @@ impl PainterApp {
             }
         };
         let fill = FillParams {
-            mat: MatValues { enabled: [false, false, false, true], height: 0.5, ..FillParams::default().mat },
+            mat: MatValues { enabled: [false, false, false, true, false, false, false, false], height: 0.5, ..FillParams::default().mat },
             projection: Projection::Triplanar,
             tiling: 2.0,
             ..FillParams::default()
@@ -4529,6 +4732,7 @@ impl PainterApp {
     /// poly on a worker thread when the inputs change, recolors when the
     /// distances change, and hides it with the bake window.
     fn update_cage_preview(&mut self, ctx: &egui::Context) {
+        self.apply_cage_action();
         let c = &mut self.cage_preview;
         if let Some((key, rx)) = &c.job {
             match rx.try_recv() {
@@ -4577,12 +4781,12 @@ impl PainterApp {
             }
             return;
         }
-        let distances = (self.bake_settings.front, self.bake_settings.rear);
-        if c.drawn != Some(distances) {
+        let reach = crate::cage::Reach::new(&self.bake_settings);
+        if c.drawn.as_ref() != Some(&reach) {
             let probe = c.probe.as_ref().expect("current");
-            let (tris, lines, stats) = probe.overlay(distances.0, distances.1);
+            let (tris, lines, stats) = probe.overlay(&reach);
             self.overlays.set(&self.rs.device, OverlaySlot::Cage, &tris, &lines);
-            c.drawn = Some(distances);
+            c.drawn = Some(reach);
             c.stats = probe.has_high.then_some(stats);
             ctx.request_repaint();
         }
@@ -4594,38 +4798,57 @@ impl PainterApp {
         self.poly.topo.get_or_insert_with(|| Arc::new(Topology::build(&self.mesh))).clone()
     }
 
-    /// The triangle under a view pixel.
-    fn pick_triangle(&mut self, kind: ViewKind, at: Vec2) -> Option<u32> {
+    /// The triangle under a view pixel, and the 3D point there.
+    fn pick_triangle(&mut self, kind: ViewKind, at: Vec2) -> Option<(u32, Vec3)> {
         match kind {
             ViewKind::V3d => {
                 let size = Vec2::new(self.views.view3d.size[0] as f32, self.views.view3d.size[1] as f32);
                 let (o, d) = self.cam.ray(at, size);
-                self.bvh.raycast(o, d).map(|h| h.tri)
+                self.bvh.raycast(o, d).map(|h| (h.tri, h.pos))
             }
             ViewKind::V2d => {
                 let size = self.views.view2d.size;
                 let center = Vec2::new(size[0] as f32, size[1] as f32) * 0.5;
                 let uv = (at - center - self.cam2d.pan) / self.cam2d.zoom.max(1.0) + Vec2::splat(0.5);
-                self.poly_topology().pick_uv(uv)
+                let topo = self.poly_topology();
+                // The 2D view shows the edited texture set: pick among its faces.
+                let t = topo.pick_uv(uv)?;
+                Some((t, topo.point_at_uv(t, uv)))
             }
         }
     }
 
+    /// The texture set whose part of the mesh is under a 3D view pixel. The
+    /// 2D view shows only the edited set, so it has none to pick.
+    fn set_under(&mut self, kind: ViewKind, at: Vec2) -> Option<usize> {
+        if kind != ViewKind::V3d || self.mesh.sets.len() < 2 {
+            return None;
+        }
+        self.pick_triangle(kind, at).map(|(t, _)| self.mesh.set_of(t))
+    }
+
+    fn poly_opts(&self, at: Option<Vec3>) -> SelectOpts {
+        SelectOpts { at, angle: self.poly.angle }
+    }
+
     /// Fills the faces the fill mode selects around each seed triangle,
-    /// skipping any already filled during this drag.
-    fn poly_fill(&mut self, seeds: &[u32]) {
+    /// skipping any already filled during this drag. `at`: where a single
+    /// pick landed (face loops run through the edge nearest it).
+    fn poly_fill(&mut self, seeds: &[u32], at: Option<Vec3>) {
         let topo = self.poly_topology();
+        let opts = self.poly_opts(at);
         let mut tris = Vec::new();
         for &s in seeds {
             // A filled seed's whole selection is already filled.
             if !self.poly.filled.contains(&s) {
-                tris.extend(topo.select(self.poly.mode, s).into_iter().filter(|t| self.poly.filled.insert(*t)));
+                tris.extend(topo.select_with(self.poly.mode, s, &opts).into_iter().filter(|t| self.poly.filled.insert(*t)));
             }
         }
-        // Only the edited texture set takes paint.
+        // Only the edited texture set takes paint, and only where it's shown.
         if let Some(set) = self.mesh.sets.get(self.sets.active) {
             tris.retain(|t| set.tris.contains(t));
         }
+        tris.retain(|&t| !self.tri_hidden(t));
         if tris.is_empty() {
             return;
         }
@@ -4645,12 +4868,19 @@ impl PainterApp {
         self.engine.stroke_polys(&geometry, &paint);
     }
 
-    /// Triangles whose centers fall inside a box of view pixels. In 3D only
-    /// the ones the camera sees, as with a click.
-    fn box_triangles(&mut self, kind: ViewKind, a: Vec2, b: Vec2) -> Vec<u32> {
+    /// Triangles whose centers fall inside a box or lasso of view pixels
+    /// (`outline`: the lasso, else the box `a`..`b`). In 3D only the ones the
+    /// camera sees, as with a click, unless selecting through.
+    fn region_triangles(&mut self, kind: ViewKind, a: Vec2, b: Vec2, outline: &[Vec2]) -> Vec<u32> {
         use rayon::prelude::*;
         let topo = self.poly_topology();
-        let (lo, hi) = (a.min(b), a.max(b));
+        let (lo, hi) = if outline.len() >= 3 {
+            (outline.iter().fold(Vec2::splat(f32::MAX), |m, p| m.min(*p)), outline.iter().fold(Vec2::splat(f32::MIN), |m, p| m.max(*p)))
+        } else {
+            (a.min(b), a.max(b))
+        };
+        let inside = |p: Vec2| !(p.cmplt(lo).any() || p.cmpgt(hi).any()) && (outline.len() < 3 || crate::polyfill::in_outline(p, outline));
+        let through = self.poly.through;
         let n = topo.triangle_count() as u32;
         match kind {
             ViewKind::V3d => {
@@ -4667,8 +4897,11 @@ impl PainterApp {
                             return false;
                         }
                         let px = Vec2::new((q.x / q.w * 0.5 + 0.5) * size.x, (0.5 - q.y / q.w * 0.5) * size.y);
-                        if px.cmplt(lo).any() || px.cmpgt(hi).any() {
+                        if !inside(px) {
                             return false;
+                        }
+                        if through {
+                            return true;
                         }
                         let to = c - eye;
                         let dist = to.length();
@@ -4679,15 +4912,10 @@ impl PainterApp {
             ViewKind::V2d => {
                 let size = self.views.view2d.size;
                 let center = Vec2::new(size[0] as f32, size[1] as f32) * 0.5;
-                let to_uv = |p: Vec2| (p - center - self.cam2d.pan) / self.cam2d.zoom.max(1.0) + Vec2::splat(0.5);
-                let (ulo, uhi) = (to_uv(lo), to_uv(hi));
-                (0..n)
-                    .into_par_iter()
-                    .filter(|&t| {
-                        let c = topo.uv_centroid(t);
-                        c.cmpge(ulo).all() && c.cmple(uhi).all()
-                    })
-                    .collect()
+                let (pan, zoom) = (self.cam2d.pan, self.cam2d.zoom.max(1.0));
+                // Back from UV to view pixels, where the box or lasso is.
+                let to_px = |uv: Vec2| (uv - Vec2::splat(0.5)) * zoom + center + pan;
+                (0..n).into_par_iter().filter(|&t| inside(to_px(topo.uv_centroid(t)))).collect()
             }
         }
     }
@@ -4696,19 +4924,30 @@ impl PainterApp {
     fn update_poly_highlight(&mut self) {
         let hover = self.poly.frame_hover.take().filter(|_| self.tool == Tool::PolyFill);
         let erase = if self.stroke.is_some() { self.poly.stroke_erase } else { self.poly.erase };
-        let want = hover.map(|t| (t, self.poly.mode, erase));
-        if want == self.poly.shown {
+        let mode = self.poly.mode;
+        let want = hover.map(|(tri, at)| PolyShown {
+            tri,
+            mode,
+            erase,
+            edge: (mode == FillMode::Loop).then(|| self.poly_topology().loop_edge(tri, at)),
+            angle: if mode == FillMode::Flat { self.poly.angle.round() as u32 } else { 0 },
+        });
+        if want == self.poly.shown && hover.is_some() == self.poly.shown.is_some() {
             return;
         }
         self.poly.shown = want;
-        match want {
-            Some((t, mode, erase)) => {
+        match (want, hover) {
+            (Some(w), Some((_, at))) => {
                 let topo = self.poly_topology();
                 let color = if erase { [255, 90, 80] } else { [80, 160, 255] };
-                let (fill, outline) = topo.overlay(&topo.select(mode, t), color);
+                let mut tris = topo.select_with(w.mode, w.tri, &self.poly_opts(Some(at)));
+                if let Some(set) = self.mesh.sets.get(self.sets.active) {
+                    tris.retain(|t| set.tris.contains(t));
+                }
+                let (fill, outline) = topo.overlay(&tris, color);
                 self.overlays.set(&self.rs.device, OverlaySlot::Selection, &fill, &outline);
             }
-            None => self.overlays.clear(OverlaySlot::Selection),
+            _ => self.overlays.clear(OverlaySlot::Selection),
         }
     }
 
@@ -4725,7 +4964,7 @@ impl PainterApp {
     fn begin_stroke_on_target(&mut self, kind: ViewKind, at: Vec2, erase: bool) -> bool {
         let idx = self.selected;
         if let StrokeTarget::BakeFix(_) = self.target {
-            if self.engine.begin_stroke(0, self.target, [false; 4], erase) {
+            if self.engine.begin_stroke(0, self.target, [false; crate::engine::CHANNELS], erase) {
                 self.stroke = Some(StrokeInput { view: kind, last: at, lazy: at, pressure: self.pressure });
                 return true;
             } else if !self.engine.has_bake {
@@ -4988,6 +5227,13 @@ impl PainterApp {
                 return;
             }
         }
+        // Painting the bake cage takes drags over the model while it's on.
+        if kind == ViewKind::V3d && !mods.alt && self.cage_brush_active() {
+            let at = hover.filter(|p| rect.contains(*p) && resp.hovered());
+            if self.cage_brush_input(ui, at.map(local), at, down) {
+                return;
+            }
+        }
 
         // The path tool places and drags points instead of painting.
         if self.tool == Tool::Path {
@@ -4999,27 +5245,41 @@ impl PainterApp {
 
         // Polygon fill picks faces instead of laying down stamps.
         if self.tool == Tool::PolyFill {
-            if let Some(mut b) = self.poly.box_drag.filter(|b| b.view == kind) {
+            // Only the view the box started in handles it (both views run
+            // their input every frame).
+            if self.poly.box_drag.as_ref().is_some_and(|b| b.view != kind) {
+                return;
+            }
+            if let Some(mut b) = self.poly.box_drag.take() {
                 if down {
                     if let Some(p) = hover {
-                        b.end = rect.clamp(p);
-                        self.poly.box_drag = Some(b);
+                        let p = rect.clamp(p);
+                        b.end = p;
+                        // A lasso keeps points a few pixels apart.
+                        if self.poly.lasso && b.lasso.last().is_none_or(|q| q.distance(p) >= 3.0) {
+                            b.lasso.push(p);
+                        }
                     }
+                    self.poly.box_drag = Some(b);
                     return;
                 }
-                // Released: fill what the box covers. A Shift+click without
-                // dragging fills the face under it, like a plain click.
-                self.poly.box_drag = None;
+                // Released: fill what the box or lasso covers. A Shift+click
+                // without dragging fills the face under it, like a plain click.
                 let (a, z) = (local(b.start), local(b.end));
-                let seeds = if a.distance(z) < 3.0 * ppp {
-                    self.pick_triangle(kind, a).into_iter().collect()
+                let outline: Vec<Vec2> = b.lasso.iter().map(|p| local(*p)).collect();
+                let span = outline.iter().fold(a.distance(z), |m, p| m.max(a.distance(*p)));
+                let (seeds, at) = if span < 3.0 * ppp {
+                    match self.pick_triangle(kind, a) {
+                        Some((t, at)) => (vec![t], Some(at)),
+                        None => (Vec::new(), None),
+                    }
                 } else {
-                    self.box_triangles(kind, a, z)
+                    (self.region_triangles(kind, a, z, if self.poly.lasso { &outline } else { &[] }), None)
                 };
                 if !seeds.is_empty() && self.begin_stroke_on_target(kind, a, b.erase) {
                     self.poly.filled.clear();
                     self.poly.stroke_erase = b.erase;
-                    self.poly_fill(&seeds);
+                    self.poly_fill(&seeds, at);
                     self.end_stroke();
                 }
                 return;
@@ -5031,19 +5291,20 @@ impl PainterApp {
             }
             if pressed && mods.shift && at.is_some() && resp.hovered() && self.stroke.is_none() {
                 let p = hover.unwrap_or_default();
-                self.poly.box_drag = Some(BoxDrag { view: kind, start: p, end: p, erase: self.poly.erase != mods.ctrl });
+                let lasso = if self.poly.lasso { vec![p] } else { Vec::new() };
+                self.poly.box_drag = Some(BoxDrag { view: kind, start: p, end: p, lasso, erase: self.poly.erase != mods.ctrl });
             } else if pressed && at.is_some() && resp.hovered() && self.stroke.is_none() {
-                if let Some(t) = tri {
+                if let Some((t, pos)) = tri {
                     let erase = self.poly.erase != mods.ctrl;
                     if self.begin_stroke_on_target(kind, at.unwrap_or_default(), erase) {
                         self.poly.filled.clear();
                         self.poly.stroke_erase = erase;
-                        self.poly_fill(&[t]);
+                        self.poly_fill(&[t], Some(pos));
                     }
                 }
             } else if down && self.stroke.as_ref().is_some_and(|s| s.view == kind) {
-                if let Some(t) = tri {
-                    self.poly_fill(&[t]);
+                if let Some((t, pos)) = tri {
+                    self.poly_fill(&[t], Some(pos));
                 }
             }
             return;
@@ -5082,7 +5343,20 @@ impl PainterApp {
         }
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         self.view_input(ui, kind, rect, &resp);
-        if let Some(item) = resp.dnd_release_payload::<ShelfItem>() {
+        // A shelf item goes to the texture set under the pointer, which lights up while it's dragged over.
+        let drop_set = resp
+            .dnd_hover_payload::<ShelfItem>()
+            // Masks and brush tips go to the selected layer and the brush instead.
+            .filter(|item| !matches!(**item, ShelfItem::Generator(_) | ShelfItem::Brush(_)))
+            .and_then(|_| ui.ctx().pointer_interact_pos())
+            .and_then(|p| self.set_under(kind, Vec2::new((p.x - rect.min.x) * self.ppp, (p.y - rect.min.y) * self.ppp)));
+        if let Some(k) = drop_set {
+            self.sets.hover = Some(k);
+        }
+        if let Some(item) = dnd_release::<ShelfItem>(&resp) {
+            if let Some(k) = drop_set {
+                self.switch_set(k);
+            }
             self.pending.push(Action::AddOnTop(*item));
         }
         self.update_poly_highlight();
@@ -5096,6 +5370,7 @@ impl PainterApp {
         let mut rt_view = None;
         match kind {
             ViewKind::V3d => {
+                self.views.set_looks = self.set_looks(ui.ctx());
                 let engines = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len());
                 self.views.render_3d(&self.rs, size, &engines, &self.env, &self.gpu_mesh, &self.cam, &self.view, Some(&self.overlays));
                 self.drew_3d = true;
@@ -5127,11 +5402,18 @@ impl PainterApp {
         painter.image(id, rect, uv, Color32::WHITE);
         self.draw_path(&painter, kind, rect);
         self.draw_gizmo(&painter, kind, rect);
-        if let Some(b) = self.poly.box_drag.filter(|b| b.view == kind) {
+        self.draw_cage_brush(&painter, kind);
+        if let Some(b) = self.poly.box_drag.as_ref().filter(|b| b.view == kind) {
             let color = if b.erase { Color32::from_rgb(255, 90, 80) } else { Color32::from_rgb(80, 160, 255) };
-            let r = Rect::from_two_pos(b.start, b.end);
-            painter.rect_filled(r, 0.0, color.gamma_multiply(0.15));
-            painter.rect_stroke(r, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+            if b.lasso.len() >= 2 {
+                let mut pts = b.lasso.clone();
+                pts.push(b.lasso[0]);
+                painter.add(egui::Shape::line(pts, Stroke::new(1.5, color)));
+            } else if b.lasso.is_empty() {
+                let r = Rect::from_two_pos(b.start, b.end);
+                painter.rect_filled(r, 0.0, color.gamma_multiply(0.15));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+            }
         }
         let label = match kind {
             ViewKind::V3d if rt_view.is_some() => {
@@ -5142,10 +5424,12 @@ impl PainterApp {
         };
         painter.text(rect.min + vec2(10.0, 8.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.5), Color32::from_white_alpha(150));
         if let Some(item) = resp.dnd_hover_payload::<ShelfItem>() {
-            let what = match *item {
-                ShelfItem::Generator(_) => "Drop to mask the selected layer",
-                ShelfItem::Brush(_) => "Drop to paint with this brush tip",
-                _ => "Drop to add",
+            let set = drop_set.filter(|_| self.mesh.sets.len() > 1).map(|k| self.mesh.sets[k].name.clone());
+            let what = match (*item, set) {
+                (ShelfItem::Generator(_), _) => "Drop to mask the selected layer".to_owned(),
+                (ShelfItem::Brush(_), _) => "Drop to paint with this brush tip".to_owned(),
+                (_, Some(name)) => format!("Drop to add to {name}"),
+                _ => "Drop to add".to_owned(),
             };
             painter.rect_stroke(rect.shrink(2.0), 0.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
             painter.text(rect.center_bottom() - vec2(0.0, 24.0), egui::Align2::CENTER_CENTER, what, egui::FontId::proportional(13.0), Color32::WHITE);

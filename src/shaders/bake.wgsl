@@ -26,7 +26,7 @@ struct BakeU {
     d: vec4<f32>,   // edge threshold, edge max distance, curvature scale, low-poly-only flag
     e: vec4<f32>,   // tile x, tile y, JFA / filter step, seed
     f: vec4<f32>,   // convex edge BVH root, concave edge BVH root (-1 = none), has cage, low-poly-only edge seed curvature
-    g: vec4<f32>,   // height range (largest distance above / below the low poly a ray can find), baked-map bits, random cell size (world), unused
+    g: vec4<f32>,   // height range (largest distance above / below the low poly a ray can find), baked-map bits, random cell size (world), projection flags (1 built cage: rear scales with it, 2 ignore backfaces, 4 fill misses from the nearest surface)
     // Custom map slot k (see `bake::CustomMap`), three vec4 each:
     //   [3k]     kind (0 none), distance, cos(spread), rays
     //   [3k + 1] unit direction the fluid or wind comes from, strength
@@ -60,7 +60,7 @@ struct BakeU {
 @group(0) @binding(23) var map_a_w: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(24) var map_b_w: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(25) var map_c_w: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(26) var<storage, read_write> counters: array<atomic<u32>, 2>;
+@group(0) @binding(26) var<storage, read_write> counters: array<atomic<u32>, 3>;
 // Geometric (face) normal of the source triangle under each texel, and its part index.
 @group(0) @binding(27) var surf_geo_w: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(28) var surf_geo: texture_2d<f32>;
@@ -70,6 +70,9 @@ struct BakeU {
 @group(0) @binding(32) var edge_t: texture_2d<f32>;
 // Cage position per texel (when f.z is set): rays start there.
 @group(0) @binding(33) var cage_pos: texture_2d<f32>;
+// A cage the bake builds itself: cage_pos holds the projection direction
+// (interpolated, unnormalized) and cage_tan.x how far out rays start.
+@group(0) @binding(38) var cage_tan: texture_2d<f32>;
 // Per texel: the source mesh's vertex curvature interpolated at the
 // projected point, and the mean edge length of the source triangle there.
 @group(0) @binding(34) var surf_curv_w: texture_storage_2d<rg32float, write>;
@@ -94,6 +97,11 @@ const FOLD_COS: f32 = 0.7071;
 // Rays ignore every triangle of this part (contact maps look for the other
 // parts). NONE = off.
 var<private> skip_part: u32 = 0xffffffffu;
+
+// Projection rays skip faces they reach from behind (their face normal
+// points along the ray): the inside of another part, the far side of a
+// thin one.
+var<private> cull_back: bool = false;
 
 const NONE: u32 = 0xffffffffu;
 const STACK: u32 = 64u;
@@ -185,6 +193,9 @@ fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any_hit: bool) -> Hit {
                     continue;
                 }
                 let t = dot(e2, q) * idet;
+                if (cull_back && dot(cross(e1, e2), d) > 0.0) {
+                    continue;
+                }
                 if (t > 0.0 && t < fold_reach && bitcast<u32>(tri_pos[ti * 3u].w) == fold_part) {
                     // The face normal on the side the ray arrives from.
                     let gn = normalize(cross(e1, e2));
@@ -223,6 +234,108 @@ fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any_hit: bool) -> Hit {
         }
     }
     return h;
+}
+
+// Barycentric weights (of v0, v1, v2) of the point of triangle v0 v1 v2
+// nearest `p` (Ericson, Real-Time Collision Detection, 5.1.5).
+fn nearest_on_tri(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) {
+        return vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let bp = p - b;
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        let v = d1 / (d1 - d3);
+        return vec3<f32>(1.0 - v, v, 0.0);
+    }
+    let cp = p - c;
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) {
+        return vec3<f32>(0.0, 0.0, 1.0);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        let w = d2 / (d2 - d6);
+        return vec3<f32>(1.0 - w, 0.0, w);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return vec3<f32>(0.0, 1.0 - w, w);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    return vec3<f32>(1.0 - v - w, v, w);
+}
+
+// The surface point nearest `p` within `radius` (of the texel's name group):
+// t = its distance, tri = NONE when there's none that close.
+fn nearest_surface(p: vec3<f32>, radius: f32) -> Hit {
+    var h: Hit;
+    h.t = radius;
+    h.tri = NONE;
+    var stack: array<u32, 64>;
+    var sp = 1u;
+    stack[0] = 0u;
+    loop {
+        if (sp == 0u) {
+            break;
+        }
+        sp -= 1u;
+        let ni = stack[sp];
+        let a = nodes[ni * 2u];
+        let b = nodes[ni * 2u + 1u];
+        // Distance from p to the node's box.
+        if (length(max(max(a.xyz - p, p - b.xyz), vec3<f32>(0.0))) >= h.t) {
+            continue;
+        }
+        let first = bitcast<u32>(a.w);
+        let count = bitcast<u32>(b.w);
+        if (count > 0u) {
+            for (var i = 0u; i < count; i++) {
+                let ti = first + i;
+                if (match_group != 0u) {
+                    let tg = bitcast<u32>(tri_pos[ti * 3u + 2u].w);
+                    if (tg != 0u && tg != match_group) {
+                        continue;
+                    }
+                }
+                let v0 = tri_pos[ti * 3u].xyz;
+                let v1 = tri_pos[ti * 3u + 1u].xyz;
+                let v2 = tri_pos[ti * 3u + 2u].xyz;
+                let w = nearest_on_tri(p, v0, v1, v2);
+                let d = distance(p, v0 * w.x + v1 * w.y + v2 * w.z);
+                if (d < h.t) {
+                    h.t = d;
+                    h.tri = ti;
+                    h.b1 = w.y;
+                    h.b2 = w.z;
+                }
+            }
+        } else if (sp + 2u <= STACK) {
+            stack[sp] = first;
+            stack[sp + 1u] = first + 1u;
+            sp += 2u;
+        }
+    }
+    return h;
+}
+
+fn hit_point(h: Hit) -> vec3<f32> {
+    let w0 = 1.0 - h.b1 - h.b2;
+    return tri_pos[h.tri * 3u].xyz * w0 + tri_pos[h.tri * 3u + 1u].xyz * h.b1 + tri_pos[h.tri * 3u + 2u].xyz * h.b2;
 }
 
 // Interpolated shading normal at a hit along ray direction `dir`. Zero or
@@ -496,6 +609,8 @@ fn cs_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
     let own_tri = select(NONE, u32(abs(tg.w) + 0.5) - 2u, low_only && abs(tg.w) > 1.5);
     let use_cage = u.f.z > 0.5 && !low_only;
     let cage_center = textureLoad(cage_pos, c, 0).xyz;
+    let flags = u32(u.g.w + 0.5);
+    let built_cage = (flags & 1u) != 0u;
 
     // A low-poly-only bake projects the low poly onto itself: its normal map
     // is flat by definition and one sample is enough. The texel's triangle
@@ -544,7 +659,18 @@ fn cs_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
         var origin = o + fr.n * front;
         var dir = -fr.n;
         var start = front;
-        if (use_cage) {
+        if (use_cage && built_cage) {
+            // Along the interpolated projection direction, from the painted
+            // distance out; rear follows the same multiplier.
+            let out_dir = cage_center;
+            let reach = textureLoad(cage_tan, c, 0).x;
+            if (dot(out_dir, out_dir) > 1e-12 && reach > 1e-6) {
+                dir = -normalize(out_dir);
+                origin = o - dir * reach;
+                start = reach;
+                rear = rear * reach / max(u.a.z, 1e-6);
+            }
+        } else if (use_cage) {
             let oc = cage_center + dpx * j.x + dpy * j.y;
             let span = o - oc;
             let len = length(span);
@@ -559,7 +685,13 @@ fn cs_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
             h = surface_hit(own_tri, o);
             h.t = start;
         } else {
+            cull_back = !low_only && (flags & 2u) != 0u;
             h = intersect(origin, dir, start + rear, false);
+            cull_back = false;
+            // Nothing seen from the front: flipped faces still count.
+            if (h.tri == NONE && !low_only && (flags & 2u) != 0u) {
+                h = intersect(origin, dir, start + rear, false);
+            }
         }
         if (h.tri == NONE && low_only) {
             front = u.a.z;
@@ -584,6 +716,29 @@ fn cs_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
                 center_bary = vec2<f32>(h.b1, h.b2);
                 center_pos = origin + dir * h.t;
                 center_n = hn;
+            }
+        }
+    }
+
+    // Every ray missed: take the high poly's point nearest the texel, so the
+    // maps hold its surface instead of a hole.
+    if (hits == 0.0 && !low_only && (flags & 4u) != 0u) {
+        let near = nearest_surface(lp.xyz, max(u.g.x, max(u.a.z, u.a.w)) * 4.0);
+        if (near.tri != NONE) {
+            var fr = LowFrame(n, normalize(tg.xyz - n * dot(n, tg.xyz)), vec3<f32>(0.0), center.n, tg.xyz);
+            fr.b = cross(fr.n, fr.t) * sign;
+            let hp = hit_point(near);
+            let hn = hit_normal(near, -n);
+            tsum = encode_tangent(hn, fr, sign);
+            nsum = hn;
+            hsum = dot(hp - lp.xyz, n);
+            hits = 1.0;
+            center_tri = near.tri;
+            center_bary = vec2<f32>(near.b1, near.b2);
+            center_pos = hp;
+            center_n = hn;
+            if (inside) {
+                atomicAdd(&counters[2], 1u);
             }
         }
     }

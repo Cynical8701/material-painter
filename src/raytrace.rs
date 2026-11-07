@@ -53,15 +53,34 @@ struct Scene {
 /// Largest size the texture sets are copied at for path tracing several.
 const MAX_SET_COPY: u32 = 2048;
 
-/// The formats of the five textures the path tracer reads per set: final
-/// color (sRGB-encoded), roughness, metallic, height, and the baked normal map.
-const SET_FORMATS: [wgpu::TextureFormat; 5] = [
+/// The formats of the textures the path tracer reads per set: final color
+/// (sRGB-encoded), roughness, metallic, height, the baked normal map,
+/// emission (sRGB-encoded), the painted normal and specular level.
+const SET_FORMATS: [wgpu::TextureFormat; 8] = [
     wgpu::TextureFormat::Rgba8Unorm,
     wgpu::TextureFormat::R8Unorm,
     wgpu::TextureFormat::R8Unorm,
     wgpu::TextureFormat::R16Float,
     crate::bake::MAP_FORMATS[3],
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::Rgba8Unorm,
+    wgpu::TextureFormat::R8Unorm,
 ];
+
+/// A set's textures in [`SET_FORMATS`] order.
+fn set_sources(e: &Engine) -> [&crate::gpu::Tex; 8] {
+    use crate::engine::{FINAL_EMISSION, FINAL_NORMAL, FINAL_SPECULAR};
+    [
+        e.final_tex(0),
+        e.final_tex(1),
+        e.final_tex(2),
+        e.final_tex(3),
+        e.map_tex(3),
+        e.final_tex(FINAL_EMISSION),
+        e.final_tex(FINAL_NORMAL),
+        e.final_tex(FINAL_SPECULAR),
+    ]
+}
 
 /// Several texture sets' textures, one array layer per set, at one size.
 struct SetCopies {
@@ -181,6 +200,9 @@ impl RayTracer {
                     count: None,
                 },
                 buffer(16, true),
+                texture(17),
+                texture(18),
+                texture(19),
             ],
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -277,7 +299,7 @@ impl RayTracer {
             }
             copies.copied[k] = Some(stamp);
             any = true;
-            let sources = [e.final_tex(0), e.final_tex(1), e.final_tex(2), e.final_tex(3), e.map_tex(3)];
+            let sources = set_sources(e);
             for ((src, dst), &format) in sources.iter().zip(&copies.textures).zip(&SET_FORMATS) {
                 let view = dst.create_view(&wgpu::TextureViewDescriptor {
                     dimension: Some(wgpu::TextureViewDimension::D2),
@@ -395,7 +417,7 @@ impl RayTracer {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: eye.extend(1.0).to_array(),
             frame: [size[0] as f32, size[1] as f32, self.samples as f32, settings.bounces as f32],
-            light: [view.env_rotation, 0.0, ground_y, if settings.ground { 1.0 } else { 0.0 }],
+            light: [view.env_rotation, view.emission, ground_y, if settings.ground { 1.0 } else { 0.0 }],
             params: [if use_baked { 1.0 } else { 0.0 }, view.height_strength, 1.0 / res, res],
             env: [view.env_intensity, (RADIANCE_MIPS - 1) as f32, view.bg_blur, view.background as u32 as f32],
             bg: [view.bg_color[0], view.bg_color[1], view.bg_color[2], view.bg_intensity],
@@ -421,13 +443,11 @@ impl RayTracer {
         };
         let textures: Vec<&wgpu::Texture> = match &self.copies {
             Some(c) => c.textures.iter().collect(),
-            None => [engine.final_tex(0), engine.final_tex(1), engine.final_tex(2), engine.final_tex(3), engine.map_tex(3)]
-                .into_iter()
-                .map(|t| &t.texture)
-                .collect(),
+            None => set_sources(engine).into_iter().map(|t| &t.texture).collect(),
         };
-        // Color holds sRGB-encoded values: read through an sRGB view.
+        // Color and emission hold sRGB-encoded values: read through sRGB views.
         let srgb = array_view(textures[0], wgpu::TextureFormat::Rgba8UnormSrgb);
+        let emission = array_view(textures[5], wgpu::TextureFormat::Rgba8UnormSrgb);
         let set_views: Vec<wgpu::TextureView> = textures.iter().map(|t| array_view(t, t.format())).collect();
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
@@ -447,6 +467,9 @@ impl RayTracer {
             wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&env.radiance) },
             wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::Sampler(&self.env_sampler) },
             wgpu::BindGroupEntry { binding: 16, resource: env.cdf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(&emission) },
+            wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(&set_views[6]) },
+            wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(&set_views[7]) },
         ];
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("path trace"),

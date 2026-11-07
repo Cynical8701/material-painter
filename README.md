@@ -26,16 +26,27 @@ maps, build materials in a node graph and write your own node shaders.
 - **Material Paint**: a layer stack with paint, fill and folder layers, blend
   modes and opacity; brushes with tips, grain, pen pressure, stabilizer,
   symmetry and screen, surface or UV projection; polygon fill by triangle,
-  quad, loose part, object or UV island.
+  quad, face loop, flat area (up to an angle), loose part, object, UV island
+  or texture set, by click, drag, box or lasso.
+- **Channels**: base color, roughness, metallic, height, opacity, emission,
+  normal and specular level, each painted and filled like any other.
+  Opacity (or an image's alpha) is see-through in the 3D view and the path
+  tracer and exports as the base color's alpha; emission glows with bloom;
+  normal-map images on fills add detail, projected in UV or tri-planar, and
+  merge with the baked normal on export.
 - **Texture sets**: a mesh with several materials gets one texture set per
   material, each with its own layers, size, baked maps and exported files.
+  Hide a set's part of the mesh, or highlight it to see which part it is.
 - **Smart materials and masks**: dozens of ready-made materials, smart mask
   generators (edge wear, dirt, dust, rain streaks, drips, cavity grime...),
   mask layers with blend modes, and mask filters (levels, blur, warp, noise
   breakup...).
 - **Mesh map baking**: ambient occlusion, curvature, cavity, thickness,
   normal and height from a high poly, position, world normal, ID and more,
-  with cages and match-by-name. Custom bake maps add what happens around the
+  with match-by-name and a cage that never leaves holes: averaged normals
+  close it over hard edges, rays skip faces they reach from behind, misses
+  take the nearest surface, and you can paint the cage out or in where the
+  live preview shows misses or bleeding, or fit it with Auto-fix. Custom bake maps add what happens around the
   model: fluid flow from any direction, wind exposure and erosion, sand and
   snow drifts, contact between parts and distance from a point.
 - **Material Designer**: a node graph of tileable textures that drives fill
@@ -56,8 +67,8 @@ maps, build materials in a node graph and write your own node shaders.
   graphs and nodes that users share from inside the app. Downloads are plain
   image files with a `meta.json`, so nothing is locked into Material Painter.
 - **Open Substance 3D Painter projects** (`.spp`): the model and every
-  texture set, with the final look of base color, roughness, metallic and
-  height, and as much of each layer stack as maps onto Material Painter's
+  texture set, with the final look of base color, roughness, metallic,
+  height, opacity, emission and painted normal details, and as much of each layer stack as maps onto Material Painter's
   layers. Procedural materials, brush
   strokes and Painter-only channels don't come across; the import report
   says exactly what did. Details and limits:

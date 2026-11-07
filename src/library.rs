@@ -617,8 +617,8 @@ pub struct LocalMaterial {
     pub name: String,
     pub source: String,
     pub url: String,
-    /// Image file per engine fill channel (color, rough, metal, height).
-    pub maps: [Option<PathBuf>; 4],
+    /// Image file per engine channel (color, rough, metal, height, normal).
+    pub maps: [Option<PathBuf>; crate::engine::CHANNELS],
 }
 
 /// Every downloaded material, by name.
@@ -636,7 +636,14 @@ pub fn local_materials() -> Vec<LocalMaterial> {
                 name: meta["name"].as_str().unwrap_or("Material").to_string(),
                 source: meta["source"].as_str().unwrap_or("").to_string(),
                 url: meta["url"].as_str().unwrap_or("").to_string(),
-                maps: [map("color"), map("rough"), map("metal"), map("height")],
+                maps: std::array::from_fn(|ch| match ch {
+                    0 => map("color"),
+                    1 => map("rough"),
+                    2 => map("metal"),
+                    3 => map("height"),
+                    crate::engine::NORMAL => map("normal"),
+                    _ => None,
+                }),
                 dir,
             })
         })

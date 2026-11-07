@@ -40,8 +40,8 @@ struct ThumbGpu {
     shrink_mask: wgpu::RenderPipeline,
     show: wgpu::RenderPipeline,
     /// Thumbnail-sized composite targets: a cleared stack below, and the result.
-    below: [Tex; 4],
-    out: [Tex; 4],
+    below: [Tex; ACCUM],
+    out: [Tex; ACCUM],
     /// A painted mask, shrunk; a mask's value.
     mask_paint: Tex,
     mask_value: Tex,
@@ -259,7 +259,7 @@ impl Engine {
         }
         let dummy = &self.dummy.view;
         let view = |t| or_dummy(t, dummy);
-        let images: [Option<&Tex>; 4] = [0, 1, 2, 3].map(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref()));
+        let images: [Option<&Tex>; super::CHANNELS] = std::array::from_fn(|i| layer.images[i].as_ref().map(|im| im.tex.as_ref()));
         let painted = layer.mask.as_ref().and_then(|m| m.paint.as_ref());
         if painted.is_some() {
             self.thumb_pass(encoder, &g.shrink_mask, painted.unwrap(), &g.mask_paint, [0.0, SHRINK_TAPS, RENDER as f32, 0.0]);
@@ -294,6 +294,16 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 16, resource: view(Some(self.map_tex(4))) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler) },
+                wgpu::BindGroupEntry { binding: 19, resource: view(images[super::OPACITY]) },
+                wgpu::BindGroupEntry { binding: 20, resource: view(Some(&g.below[super::FINAL_EMISSION])) },
+                wgpu::BindGroupEntry { binding: 21, resource: view(images[super::EMISSION]) },
+                wgpu::BindGroupEntry { binding: 22, resource: view(Some(&g.below[super::FINAL_NORMAL])) },
+                wgpu::BindGroupEntry { binding: 23, resource: view(images[super::NORMAL]) },
+                wgpu::BindGroupEntry { binding: 24, resource: view(Some(&g.below[super::FINAL_SPECULAR])) },
+                wgpu::BindGroupEntry { binding: 25, resource: view(images[super::SPECULAR]) },
+                // Full size, unlike the thumbnail's position and normal: it
+                // only turns normal images, which thumbnails don't show.
+                wgpu::BindGroupEntry { binding: 26, resource: view(Some(&self.tan)) },
             ],
         });
 
@@ -310,6 +320,9 @@ impl Engine {
                         gpu::color_attachment(&g.below[1].view, c(0.5)),
                         gpu::color_attachment(&g.below[2].view, c(0.0)),
                         gpu::color_attachment(&g.below[3].view, c(0.0)),
+                        gpu::color_attachment(&g.below[4].view, c(0.0)),
+                        gpu::color_attachment(&g.below[5].view, wgpu::LoadOp::Clear(wgpu::Color { r: 0.5, g: 0.5, b: 1.0, a: 1.0 })),
+                        gpu::color_attachment(&g.below[6].view, c(0.5)),
                     ],
                 );
             }

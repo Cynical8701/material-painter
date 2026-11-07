@@ -10,7 +10,7 @@ what didn't.
 - **Every texture set**, as a texture set of its own (the parts of the model that use its
   material), with its size (up to 4096²). Switch between them in the Texture Set panel or at the
   top of the Layers panel.
-- **The final look** of each set's base color, roughness, metallic and height: Painter's own
+- **The final look** of each set's base color, roughness, metallic, height, opacity, emissive and normal: Painter's own
   result as of its last save, as one paint layer, *Painter result (flattened)*. This is the
   project exactly as it looked in Painter.
 - **Each set's layer stack structure**, rebuilt in a hidden folder, *Painter layers (rebuilt)*:
@@ -33,8 +33,8 @@ To edit the structure instead of the flattened result, show *Painter layers (reb
   in as named placeholders.
 - **Image fills**: not rebuilt (the image is in the flattened result).
 - **Painted mask strokes**: not rebuilt.
-- **Channels Material Painter doesn't have**: Painter's normal channel (painted normal details),
-  emissive, opacity, ambient occlusion and others.
+- **Channels Material Painter doesn't have**: ambient occlusion and others. Painter's specular
+  level isn't read yet.
 - **Baked mesh maps**: Material Painter bakes its own from the model when the project opens. If
   Painter baked from a high poly, load the same high poly in the bake window.
 - **Texture sets larger than 4096²** come in at 4096².

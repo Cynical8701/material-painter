@@ -257,6 +257,21 @@ pub struct BakeSettings {
     /// A cage mesh (the low poly with pushed-out vertices, same topology):
     /// rays start on the cage and travel toward the low poly.
     pub cage: Option<PathBuf>,
+    /// Without a cage file: rays search along averaged normals (every face at
+    /// a vertex's position, so split copies share one direction). The cage
+    /// they start from stays closed over hard edges, which leave no gaps or
+    /// doubled detail. Off: along each vertex's own normal.
+    pub average_normals: bool,
+    /// Rays skip faces they reach from behind (from inside another part or
+    /// the high poly's far side). A ray that then finds nothing tries again
+    /// without, so high polys with flipped faces still bake.
+    pub ignore_backfaces: bool,
+    /// A texel whose ray finds no surface takes the nearest point of the high
+    /// poly instead of staying flat: no holes, even where the cage misses.
+    pub fill_misses: bool,
+    /// Painted cage distance: a multiplier of front and rear per low-poly
+    /// vertex, raised where rays miss and lowered where another part bleeds in.
+    pub cage_paint: Option<std::sync::Arc<CagePaint>>,
     /// Which maps to bake: a bit per `engine::MAPS` index. Maps left out are
     /// written neutral and their passes skipped where they can be.
     pub maps: u32,
@@ -297,6 +312,10 @@ impl Default for BakeSettings {
             hard_edge_angle: 35.0,
             match_by_name: true,
             cage: None,
+            average_normals: true,
+            ignore_backfaces: true,
+            fill_misses: true,
+            cage_paint: None,
             maps: ALL_MAPS,
             custom: Vec::new(),
         };
@@ -305,7 +324,67 @@ impl Default for BakeSettings {
     }
 }
 
+/// Largest distance (in the normalized mesh's units) a painted cage reaches
+/// out or in from the low poly.
+pub const MAX_CAGE_REACH: f32 = 2.0;
+/// Range of a painted cage distance multiplier.
+pub const CAGE_SCALE: std::ops::RangeInclusive<f32> = 0.05..=8.0;
+
+/// A painted cage: a front and rear distance multiplier per low-poly vertex.
+/// Compared and hashed (bake keys) by content, printed as a short digest.
+#[derive(Clone)]
+pub struct CagePaint {
+    scale: Vec<f32>,
+    digest: u64,
+}
+
+impl CagePaint {
+    pub fn new(mut scale: Vec<f32>) -> CagePaint {
+        use std::hash::{Hash, Hasher};
+        for s in &mut scale {
+            *s = s.clamp(*CAGE_SCALE.start(), *CAGE_SCALE.end());
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for s in &scale {
+            s.to_bits().hash(&mut h);
+        }
+        CagePaint { digest: h.finish(), scale }
+    }
+
+    /// Vertex `v`'s multiplier (1 past the end: a mesh it wasn't painted for).
+    pub fn at(&self, v: usize) -> f32 {
+        self.scale.get(v).copied().unwrap_or(1.0)
+    }
+
+    pub fn scales(&self) -> &[f32] {
+        &self.scale
+    }
+
+    /// Painted for a mesh with this many vertices.
+    pub fn fits(&self, vertices: usize) -> bool {
+        self.scale.len() == vertices
+    }
+}
+
+impl PartialEq for CagePaint {
+    fn eq(&self, o: &Self) -> bool {
+        self.digest == o.digest && self.scale == o.scale
+    }
+}
+
+impl std::fmt::Debug for CagePaint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CagePaint({} vertices, {:016x})", self.scale.len(), self.digest)
+    }
+}
+
 impl BakeSettings {
+    /// Whether the bake makes its own cage from the low poly (no cage file):
+    /// pushed out along averaged normals, by the painted distances.
+    pub fn builds_cage(&self) -> bool {
+        self.high_poly.is_some() && self.cage.is_none() && (self.average_normals || self.cage_paint.is_some())
+    }
+
     /// The maps this bake makes (the chosen ones plus the always-baked).
     pub fn baked_maps(&self) -> u32 {
         (self.maps & ALL_MAPS) | ALWAYS_MAPS
@@ -373,9 +452,13 @@ impl BakeSettings {
     /// prepared scene and only redo the GPU passes.
     pub fn prepare_key(&self) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{}|{}|{}|{}|{}",
+            "{:?}|{:?}|{}|{:?}|{}|{:?}|{}|{}|{}|{}|{}",
             self.high_poly,
             self.cage,
+            self.average_normals,
+            self.cage_paint,
+            // A built cage reaches `front` out from the low poly.
+            if self.builds_cage() { self.front } else { 0.0 },
             self.id_source,
             self.match_by_name,
             self.edge_auto,
@@ -1004,15 +1087,39 @@ pub fn prepare(low: &Mesh, settings: &BakeSettings, set: usize) -> Result<Prepar
                 .collect();
             Some(corners)
         }
+        _ if settings.builds_cage() => {
+            // The bake's own cage, by direction and distance rather than as
+            // a shell: rays search along the interpolated projection
+            // direction (averaged: shared by split copies of a vertex, so
+            // the cage stays closed over hard edges), starting front times
+            // the painted multiplier out. Kept apart, a painted spot only
+            // moves where its rays start, never which way they point. The
+            // corners carry the direction in `pos` and the distance in the
+            // tangent's x (see `cs_surface`).
+            let dirs = crate::cage::projection_dirs(low, settings.average_normals);
+            let paint = settings.cage_paint.as_deref().filter(|p| p.fits(low.vertices.len()));
+            let corners: Vec<crate::mesh::Vertex> = low
+                .indices
+                .iter()
+                .map(|&l| {
+                    let v = low.vertices[l as usize];
+                    let reach = (settings.front * paint.map_or(1.0, |p| p.at(l as usize))).min(MAX_CAGE_REACH);
+                    crate::mesh::Vertex { pos: dirs[l as usize].to_array(), tangent: [reach, 0.0, 0.0, v.tangent[3]], ..v }
+                })
+                .collect();
+            Some(corners)
+        }
         _ => None,
     };
-    let cage_reach = cage.as_ref().map_or(0.0, |corners| {
-        corners
+    let cage_reach = match &cage {
+        Some(corners) if settings.builds_cage() => corners.iter().map(|c| c.tangent[0]).fold(0.0, f32::max),
+        Some(corners) => corners
             .iter()
             .zip(&low.indices)
             .map(|(c, &l)| Vec3::from_array(c.pos).distance(Vec3::from_array(low.vertices[l as usize].pos)))
-            .fold(0.0, f32::max)
-    });
+            .fold(0.0, f32::max),
+        None => 0.0,
+    };
 
     let (tri_part, part_count) = components(&positions, &indices);
     let mut part_lo = vec![f32::MAX; part_count as usize];
@@ -1208,9 +1315,20 @@ pub struct BakeReport {
     finished: AtomicBool,
     valid_texels: AtomicU32,
     missed_texels: AtomicU32,
+    /// Texels whose rays found nothing, filled from the nearest high-poly point.
+    filled_texels: AtomicU32,
 }
 
 impl BakeReport {
+    /// Share of the islands' texels filled from the nearest surface (their rays missed).
+    pub fn filled_percent(&self) -> Option<f32> {
+        if !self.finished() {
+            return None;
+        }
+        let v = self.valid_texels.load(Ordering::Relaxed).max(1) as f32;
+        Some(self.filled_texels.load(Ordering::Relaxed) as f32 / v * 100.0)
+    }
+
     pub fn finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
@@ -1246,6 +1364,7 @@ impl BakeReport {
             "gpu_seconds": self.seconds().unwrap_or(0.0),
             "valid_texels": self.valid_texels.load(Ordering::Relaxed),
             "missed_texels": self.missed_texels.load(Ordering::Relaxed),
+            "filled_texels": self.filled_texels.load(Ordering::Relaxed),
         })
     }
 
@@ -1282,6 +1401,7 @@ impl BakeReport {
             finished: AtomicBool::new(true),
             valid_texels: AtomicU32::new(u("valid_texels")? as u32),
             missed_texels: AtomicU32::new(u("missed_texels")? as u32),
+            filled_texels: AtomicU32::new(u("filled_texels").unwrap_or(0) as u32),
         })
     }
 }
@@ -1465,6 +1585,7 @@ impl GpuBaker {
                 (27, StorageTex(F::Rgba32Float)),
                 (34, StorageTex(F::Rg32Float)),
                 (33, Tex),
+                (38, Tex),
             ],
         );
         let occlusion = compute(
@@ -1760,7 +1881,12 @@ impl GpuBaker {
             f: [scene.edge_roots[0], scene.edge_roots[1], if cage.is_some() { 1.0 } else { 0.0 }, scene.edge_seed_curvature],
             // Random ray sets are picked per world cell of about two texels
             // (see `world_seed` in bake.wgsl).
-            g: [height_range(s.front, s.rear, cage.is_some().then_some(scene.cage_reach)), s.baked_maps() as f32, 2.0 * scene.uv_scale / res as f32, 0.0],
+            g: [
+                height_range(s.front, s.rear * if s.builds_cage() { scene.cage_reach / s.front.max(1e-6) } else { 1.0 }, cage.is_some().then_some(scene.cage_reach)),
+                s.baked_maps() as f32,
+                2.0 * scene.uv_scale / res as f32,
+                (u32::from(s.builds_cage()) | u32::from(s.ignore_backfaces) << 1 | u32::from(s.fill_misses) << 2) as f32,
+            ],
             cust: [[0.0; 4]; CUSTOM_PER_TEXTURE * 3],
         };
         let ubuf = Self::uniform_buffer(device, &uniform);
@@ -1773,7 +1899,7 @@ impl GpuBaker {
         let segs = Self::storage(device, "edge segments", &scene.segs);
         let counters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bake counters"),
-            contents: bytemuck::cast_slice(&[0u32, 0u32]),
+            contents: bytemuck::cast_slice(&[0u32, 0u32, 0u32]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
@@ -1810,6 +1936,7 @@ impl GpuBaker {
                 (26, counters.as_entire_binding()),
                 (27, v(&surf_geo)),
                 (33, v(cage.as_ref().map_or(&low[0], |c| &c[0]))),
+                (38, v(cage.as_ref().map_or(&low[2], |c| &c[2]))),
                 (34, v(&surf_curv)),
             ],
         );
@@ -1817,11 +1944,11 @@ impl GpuBaker {
 
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bake counters readback"),
-            size: 8,
+            size: 12,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        encoder.copy_buffer_to_buffer(&counters, 0, &readback, 0, 8);
+        encoder.copy_buffer_to_buffer(&counters, 0, &readback, 0, 12);
         queue.submit([encoder.finish()]);
 
         let report = Arc::new(BakeReport {
@@ -1844,6 +1971,7 @@ impl GpuBaker {
             finished: AtomicBool::new(false),
             valid_texels: AtomicU32::new(0),
             missed_texels: AtomicU32::new(0),
+            filled_texels: AtomicU32::new(0),
         });
         {
             let report = report.clone();
@@ -1854,6 +1982,7 @@ impl GpuBaker {
                         let c: &[u32] = bytemuck::cast_slice(&data);
                         report.valid_texels.store(c[0], Ordering::Relaxed);
                         report.missed_texels.store(c[1], Ordering::Relaxed);
+                        report.filled_texels.store(c[2], Ordering::Relaxed);
                     }
                     rb.unmap();
                 }
@@ -2161,6 +2290,7 @@ pub(crate) mod tests {
     use crate::engine::{MAPS, MapKind};
     use crate::gpu::{GpuMesh, f16_to_f32, read_texture};
     use crate::mesh::Primitive;
+    use glam::Vec2;
     use std::path::Path;
 
     /// Distance from p to the nearest convex feature, as the edge bake measures it.
@@ -2568,5 +2698,249 @@ pub(crate) mod tests {
             let baked = bake(&device, &queue, mesh, &BakeSettings::default(), 1024);
             write_pngs(&baked, &mesh.name.to_lowercase().replace(' ', "_"));
         }
+    }
+
+    /// What one bake's projection found per texel: inside an island, the low
+    /// poly's point, and the high-poly normal it took.
+    struct Projected {
+        report: Arc<BakeReport>,
+        inside: Vec<bool>,
+        low: Vec<Vec3>,
+        high_n: Vec<Vec3>,
+        height: Vec<f32>,
+    }
+
+    fn project(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, settings: &BakeSettings, res: u32) -> Projected {
+        let gpu_mesh = GpuMesh::new(device, mesh);
+        let scene = prepare(mesh, settings, 0).expect("bake source");
+        let baker = GpuBaker::new(device);
+        let ctx = egui::Context::default();
+        let mut run = baker.start(device, queue, &gpu_mesh, &scene, settings, res);
+        let maps = loop {
+            if let Some(maps) = baker.pump(&mut run, device, queue, &ctx) {
+                break maps;
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+        };
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+        let f32s = |t: &Tex| -> Vec<[f32; 4]> {
+            read_texture(device, queue, t).chunks_exact(16).map(|b| [0, 1, 2, 3].map(|k| f32::from_le_bytes([b[k * 4], b[k * 4 + 1], b[k * 4 + 2], b[k * 4 + 3]]))).collect()
+        };
+        let low = f32s(&run.low[0]);
+        let nrm: Vec<Vec3> = read_texture(device, queue, &run.surf_nrm)
+            .chunks_exact(8)
+            .map(|b| Vec3::new(f16_to_f32(u16::from_le_bytes([b[0], b[1]])), f16_to_f32(u16::from_le_bytes([b[2], b[3]])), f16_to_f32(u16::from_le_bytes([b[4], b[5]]))))
+            .collect();
+        let hm = &MAPS[MAPS.iter().position(|m| m.name == "Height").unwrap()];
+        let height_tex = &maps.maps[hm.tex];
+        let height: Vec<f32> = match height_tex.format {
+            F::Rgba16Float => read_texture(device, queue, height_tex)
+                .chunks_exact(8)
+                .map(|b| f16_to_f32(u16::from_le_bytes([b[hm.comp * 2], b[hm.comp * 2 + 1]])))
+                .collect(),
+            _ => read_texture(device, queue, height_tex).chunks_exact(4).map(|b| b[hm.comp] as f32 / 255.0).collect(),
+        };
+        let r = &run.report;
+        println!(
+            "  {:.3}% missed, {:.3}% filled from the nearest surface",
+            r.missed_percent().unwrap_or(0.0),
+            r.filled_percent().unwrap_or(0.0)
+        );
+        Projected {
+            report: run.report.clone(),
+            inside: low.iter().map(|p| p[3] > 0.75).collect(),
+            low: low.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect(),
+            high_n: nrm,
+            height,
+        }
+    }
+
+    /// A box with sharp edges: six faces of `n`×`n` quads, each with its own
+    /// normal (split at the edges), in a 3×2 UV atlas.
+    fn hard_box(n: u32) -> Mesh {
+        let faces = [
+            (Vec3::Z, Vec3::X, -Vec3::Y),
+            (Vec3::X, -Vec3::Z, -Vec3::Y),
+            (-Vec3::Z, -Vec3::X, -Vec3::Y),
+            (-Vec3::X, Vec3::Z, -Vec3::Y),
+            (Vec3::Y, Vec3::X, Vec3::Z),
+            (-Vec3::Y, Vec3::X, -Vec3::Z),
+        ];
+        let (mut pos, mut nrm, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (f, (nf, ua, va)) in faces.iter().enumerate() {
+            let base = pos.len() as u32;
+            let (col, row) = ((f % 3) as f32, (f / 3) as f32);
+            for j in 0..=n {
+                for i in 0..=n {
+                    let (a, b) = (i as f32 / n as f32 * 2.0 - 1.0, j as f32 / n as f32 * 2.0 - 1.0);
+                    pos.push(*nf + *ua * a + *va * b);
+                    nrm.push(*nf);
+                    uv.push(Vec2::new((col + 0.05 + (a + 1.0) * 0.45) / 3.0, (row + 0.05 + (b + 1.0) * 0.45) / 2.0));
+                }
+            }
+            for j in 0..n {
+                for i in 0..n {
+                    let v = |i: u32, j: u32| base + j * (n + 1) + i;
+                    for t in [[v(i, j), v(i + 1, j), v(i + 1, j + 1)], [v(i, j), v(i + 1, j + 1), v(i, j + 1)]] {
+                        let p = t.map(|k| pos[k as usize]);
+                        let outward = (p[1] - p[0]).cross(p[2] - p[0]).dot(*nf) > 0.0;
+                        idx.extend(if outward { t } else { [t[0], t[2], t[1]] });
+                    }
+                }
+            }
+        }
+        Mesh::from_parts("Hard Box".into(), pos, Some(nrm), uv, idx)
+    }
+
+    fn write_high(path: &Path, positions: &[Vec3], tris: &[[u32; 3]]) {
+        use std::fmt::Write;
+        let mut s = String::new();
+        for p in positions {
+            writeln!(s, "v {} {} {}", p.x, p.y, p.z).unwrap();
+        }
+        for t in tris {
+            writeln!(s, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1).unwrap();
+        }
+        std::fs::write(path, s).unwrap();
+    }
+
+    /// A sharp-edged low poly baked from a beveled high poly: with averaged
+    /// normals the texels meeting at a hard edge take the same high-poly
+    /// point (the cage is closed), so the normal map shades continuously
+    /// across the edge. Along each face's own normal they take points a
+    /// quarter turn apart: a seam.
+    #[test]
+    #[ignore]
+    fn bake_averaged_normals_close_hard_edges() {
+        let (device, queue) = gpu();
+        let low = hard_box(16);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("beveled_box_high.obj");
+        write_obj(&Primitive::RoundedCube.build(), &obj);
+        let res = 384;
+        let base = BakeSettings { high_poly: Some(obj), front: 0.05, rear: 0.3, ..Default::default() };
+        // Across each hard edge: texels of different faces at the same point.
+        let agreement = |p: &Projected| {
+            let face = |i: usize| ((i as u32 % res) * 3 / res, (i as u32 / res) * 2 / res);
+            let mut grid: std::collections::HashMap<[i32; 3], Vec<usize>> = Default::default();
+            let q = |v: Vec3| (v * 150.0).round().as_ivec3().to_array();
+            let edge = |v: Vec3| v.abs().to_array().iter().filter(|c| **c > 0.985).count() >= 2;
+            for i in (0..p.low.len()).filter(|&i| p.inside[i] && edge(p.low[i])) {
+                grid.entry(q(p.low[i])).or_default().push(i);
+            }
+            let mut dots = Vec::new();
+            for cell in grid.values() {
+                for (a, &i) in cell.iter().enumerate() {
+                    for &j in &cell[a + 1..] {
+                        if face(i) != face(j) && p.low[i].distance(p.low[j]) < 0.01 {
+                            dots.push(p.high_n[i].normalize_or_zero().dot(p.high_n[j].normalize_or_zero()));
+                        }
+                    }
+                }
+            }
+            assert!(dots.len() > 50, "texel pairs across the edges ({})", dots.len());
+            dots.iter().sum::<f32>() / dots.len() as f32
+        };
+        let split = project(&device, &queue, &low, &BakeSettings { average_normals: false, ..base.clone() }, res);
+        let averaged = project(&device, &queue, &low, &base, res);
+        let (s, a) = (agreement(&split), agreement(&averaged));
+        println!("  high-poly normals across hard edges agree: {s:.3} along face normals, {a:.3} averaged");
+        assert!(a > 0.97, "averaged: the texels at an edge take one point ({a})");
+        assert!(a > s + 0.15, "averaging closes the seam ({s} → {a})");
+        assert_eq!(averaged.report.missed_percent(), Some(0.0));
+    }
+
+    /// A ray reaching a face from behind (the underside of a lid over the
+    /// surface) passes it and finds the surface.
+    #[test]
+    #[ignore]
+    fn bake_ignores_backfaces() {
+        let (device, queue) = gpu();
+        // The low poly: a flat square at y = 0.
+        let n = 16;
+        let (mut pos, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..=n {
+            for i in 0..=n {
+                let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                pos.push(Vec3::new(u * 2.0 - 1.0, 0.0, v * 2.0 - 1.0));
+                uv.push(Vec2::new(u, v));
+            }
+        }
+        for j in 0..n {
+            for i in 0..n {
+                let v = |i: u32, j: u32| j * (n + 1) + i;
+                idx.extend([v(i, j), v(i, j + 1), v(i + 1, j + 1), v(i, j), v(i + 1, j + 1), v(i + 1, j)]);
+            }
+        }
+        let low = Mesh::from_parts("Floor".into(), pos, Some(vec![Vec3::Y; (n as usize + 1).pow(2)]), uv, idx);
+        // The high poly: the same square, and a lid 0.03 above it facing down.
+        let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        let mut hp: Vec<Vec3> = corners.iter().map(|&(x, z)| Vec3::new(x, 0.0, z) / low.scale + low.center).collect();
+        hp.extend(corners.iter().map(|&(x, z)| Vec3::new(x, 0.03, z) / low.scale + low.center));
+        // Floor faces up (+Y), the lid down.
+        let tris = [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7]];
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("floor_with_lid.obj");
+        write_high(&obj, &hp, &tris);
+        let base = BakeSettings { high_poly: Some(obj), front: 0.06, rear: 0.06, ..Default::default() };
+        let mean_height = |p: &Projected| {
+            let h: Vec<f32> = (0..p.inside.len()).filter(|&i| p.inside[i]).map(|i| p.height[i]).collect();
+            h.iter().sum::<f32>() / h.len().max(1) as f32
+        };
+        let culled = project(&device, &queue, &low, &base, 128);
+        let seen = project(&device, &queue, &low, &BakeSettings { ignore_backfaces: false, ..base.clone() }, 128);
+        let (c, s) = (mean_height(&culled), mean_height(&seen));
+        println!("  mean height: {c:.3} ignoring backfaces, {s:.3} without");
+        assert!((c - 0.5).abs() < 0.02, "the floor itself (mid gray), not the lid ({c})");
+        assert!(s > 0.6, "without, the lid's underside is taken ({s})");
+    }
+
+    /// A high poly that bulges past the front distance on one side: without
+    /// help those texels miss; filling takes the nearest surface (no holes);
+    /// a fitted cage reaches it properly (nothing even needs filling).
+    #[test]
+    #[ignore]
+    fn bake_never_misses() {
+        let (device, queue) = gpu();
+        let low = Primitive::Sphere.build();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("bulging_sphere_high.obj");
+        let hp: Vec<Vec3> = low
+            .vertices
+            .iter()
+            .map(|v| {
+                let p = Vec3::from_array(v.pos);
+                p * if p.x > 0.5 { 1.3 } else { 1.03 } / low.scale + low.center
+            })
+            .collect();
+        let tris: Vec<[u32; 3]> = low.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        write_high(&obj, &hp, &tris);
+        let base = BakeSettings { high_poly: Some(obj.clone()), front: 0.08, rear: 0.05, ..Default::default() };
+        let res = 256;
+        let holes = project(&device, &queue, &low, &BakeSettings { fill_misses: false, ..base.clone() }, res);
+        assert!(holes.report.missed_percent().unwrap() > 5.0, "the bulge misses without help");
+        let filled = project(&device, &queue, &low, &base, res);
+        assert_eq!(filled.report.missed_percent(), Some(0.0), "no holes");
+        assert!(filled.report.filled_percent().unwrap() > 5.0, "the bulge filled from the nearest surface");
+        // Auto-fit the cage from the probe, then bake without filling.
+        let key = crate::cage::ProbeKey::new(&low, &base);
+        let probe = crate::cage::CageProbe::build(&low, key).expect("probes");
+        let (scale, fix) = probe.auto_fix(&crate::cage::Reach::new(&base)).expect("fits");
+        println!("  auto-fix: {fix:?}");
+        let fitted = BakeSettings { cage_paint: Some(Arc::new(CagePaint::new(scale))), fill_misses: false, ..base.clone() };
+        let exact = project(&device, &queue, &low, &fitted, res);
+        let missed = exact.report.missed_percent().unwrap();
+        assert!(missed < 0.5, "a fitted cage reaches the bulge ({missed}%)");
+        // Where filled and fitted both found the bulge, they agree on its normal.
+        let agree: Vec<f32> = (0..exact.inside.len())
+            .filter(|&i| exact.inside[i] && exact.low[i].x > 0.7)
+            .map(|i| exact.high_n[i].normalize_or_zero().dot(filled.high_n[i].normalize_or_zero()))
+            .collect();
+        let mean = agree.iter().sum::<f32>() / agree.len().max(1) as f32;
+        println!("  bulge normals, filled vs fitted cage: {mean:.3}");
+        assert!(mean > 0.9, "the nearest surface is the bulge itself ({mean})");
     }
 }
