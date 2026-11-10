@@ -801,6 +801,7 @@ impl PainterApp {
             self.graphs.editor.doc = self.graphs.docs.last().map(|d| d.id);
         }
         egui::Panel::top("designer bar")
+            .show_separator_line(false)
             .frame(theme::card(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
             .show(ui, |ui| self.graph_toolbar(ui));
         self.graphs.editor.hovered = false;

@@ -650,6 +650,22 @@ fn ui_screenshots() {
         harness.run_steps(6);
         harness.render().expect("renders").save(dir.join(format!("{name}.png"))).unwrap();
     }
+    // Hover states and the open File menu, to check that highlights have
+    // room around what they hold.
+    harness.state_mut().set_workspace(Workspace::Paint);
+    harness.run_steps(4);
+    for (i, label) in ["Wireframe", "Materials", "Mesh Maps", "Blend mode"].iter().enumerate() {
+        if let Some(node) = harness.get_all_by_label_contains(label).next() {
+            node.hover();
+        }
+        harness.run_steps(2);
+        harness.render().expect("renders").save(dir.join(format!("hover_{i}.png"))).unwrap();
+    }
+    harness.get_by_label("File").click();
+    harness.run_steps(3);
+    harness.render().expect("renders").save(dir.join("menu_file.png")).unwrap();
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
     // The shelf's plain materials, grouped by type.
     harness.state_mut().set_workspace(Workspace::Paint);
     harness.state_mut().test_shelf_materials();

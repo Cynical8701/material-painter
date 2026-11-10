@@ -190,12 +190,14 @@ fn style_mut(style: &mut egui::Style) {
     w.active.fg_stroke = Stroke::new(1.0, TEXT_BRIGHT);
 
     let s = &mut style.spacing;
-    s.item_spacing = vec2(7.0, 6.0);
-    s.button_padding = vec2(10.0, 4.0);
-    s.interact_size.y = 24.0;
+    // One spacing scale (4, 6, 8, 12) so highlights have room around what
+    // they hold.
+    s.item_spacing = vec2(8.0, 6.0);
+    s.button_padding = vec2(10.0, 5.0);
+    s.interact_size.y = 26.0;
     s.slider_width = 150.0;
     s.slider_rail_height = 4.0;
-    s.menu_margin = Margin::same(8);
+    s.menu_margin = Margin::same(6);
     s.window_margin = Margin::same(14);
     s.combo_width = 120.0;
     for (text_style, size) in [
@@ -283,7 +285,7 @@ pub fn metal(ctx: &egui::Context, rect: egui::Rect, radius: u8) -> egui::Shape {
 
 /// The hover tint of borderless controls.
 fn hover_tint() -> Color32 {
-    Color32::from_white_alpha(14)
+    Color32::from_white_alpha(20)
 }
 
 #[derive(Clone)]
@@ -368,6 +370,12 @@ impl<'a> Selectable<'a> {
 
     pub fn shortcut_text(mut self, shortcut_text: impl egui::IntoAtoms<'a>) -> Self {
         self.button = self.button.shortcut_text(shortcut_text);
+        self
+    }
+
+    /// Text at the right edge; the label stays at the left.
+    pub fn right_text(mut self, right_text: impl egui::IntoAtoms<'a>) -> Self {
+        self.button = self.button.right_text(right_text);
         self
     }
 }

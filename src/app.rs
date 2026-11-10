@@ -1140,10 +1140,12 @@ impl PainterApp {
         self.shelf.kind = None;
     }
 
-    /// Closes the welcome window (offscreen UI tests).
+    /// Closes the welcome window and the autosave prompt an earlier test run
+    /// may have left (offscreen UI tests).
     #[cfg(test)]
     pub(crate) fn test_close_welcome(&mut self) {
         self.show_welcome = false;
+        self.recovery = None;
     }
 
     /// Opens the asset library and shows the Downloaded shelf (offscreen UI
@@ -2150,6 +2152,8 @@ impl PainterApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
+            // The bar's menu buttons keep room around their hover highlight.
+            ui.spacing_mut().button_padding = vec2(8.0, 4.0);
             ui.menu_button("File", |ui| {
                 if ui.add(egui::Button::new(theme::with_icon(icons::FOLDER_OPEN, "Open project…")).shortcut_text("Ctrl+O")).clicked() {
                     self.pending.push(Action::OpenProject(None));
@@ -4179,6 +4183,7 @@ impl PainterApp {
         egui::Panel::left("shelf_cats")
             .exact_size(if compact { 40.0 } else { 176.0 })
             .resizable(false)
+            .show_separator_line(false)
             .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(if compact { 4 } else { 8 }, 8)))
             .show(ui, |ui| {
                 if !compact {
@@ -4196,20 +4201,17 @@ impl PainterApp {
                     (ShelfCat::Downloaded, icons::DOWNLOAD_SIMPLE, "Downloaded", self.library.local.len()),
                 ] {
                     let on = self.shelf.cat == cat;
-                    let color = if on { Color32::WHITE } else { theme::TEXT };
+                    let color = if on { theme::TEXT_BRIGHT } else { theme::TEXT };
                     let resp = if compact {
                         ui.add_sized([32.0, 26.0], theme::selectable(on, egui::RichText::new(icon).size(15.0).color(color)))
                             .on_hover_text(format!("{name} ({count})"))
                     } else {
-                        let resp = ui.add_sized([158.0, 21.0], theme::selectable(on, egui::RichText::new(format!("{}  {name}", icon)).color(color)));
-                        ui.painter().text(
-                            resp.rect.right_center() - vec2(8.0, 0.0),
-                            egui::Align2::RIGHT_CENTER,
-                            count.to_string(),
-                            egui::FontId::proportional(10.0),
-                            theme::TEXT_DIM,
-                        );
-                        resp
+                        let count = egui::RichText::new(count.to_string()).size(11.0).color(theme::TEXT_DIM);
+                        ui.add(
+                            theme::selectable(on, egui::RichText::new(format!("{}  {name}", icon)).color(color))
+                                .right_text(count)
+                                .min_size(vec2(ui.available_width(), 26.0)),
+                        )
                     };
                     if resp.clicked() {
                         self.shelf.cat = cat;
@@ -5616,18 +5618,22 @@ impl eframe::App for PainterApp {
         self.process_actions(&ctx);
         self.process_mcp(&ctx);
 
-        egui::Panel::top("menu").frame(theme::bar().inner_margin(egui::Margin::symmetric(10, 5))).show(ui, |ui| self.menu_bar(ui));
+        // The backdrop shows in the gaps around the bars and cards.
+        ui.painter().rect_filled(ui.max_rect(), 0.0, theme::BG);
+        egui::Panel::top("menu").show_separator_line(false).frame(theme::bar().inner_margin(egui::Margin::symmetric(10, 5))).show(ui, |ui| self.menu_bar(ui));
         let paint = self.workspace == Workspace::Paint;
         if paint {
             egui::Panel::top("toolbar")
                 .exact_size(46.0)
+                .show_separator_line(false)
                 .frame(theme::card(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 4)))
                 .show(ui, |ui| self.context_toolbar(ui));
         }
-        egui::Panel::bottom("status").exact_size(24.0).frame(theme::bar()).show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("status").exact_size(24.0).show_separator_line(false).frame(theme::bar()).show(ui, |ui| self.status_bar(ui));
         if paint {
         egui::Panel::left("tools")
             .exact_size(56.0)
+            .show_separator_line(false)
             .frame(theme::card(theme::PANEL).inner_margin(egui::Margin::symmetric(7, 10)))
             .show(ui, |ui| self.tool_strip(ui));
         }
