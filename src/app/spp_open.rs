@@ -14,7 +14,6 @@ use crate::spp::{LayerInfo, LayerKind, SourceInfo, channel_bits};
 use crate::spp_import::Imported;
 use crate::undo::StrokeTarget;
 use eframe::egui;
-use egui::Color32;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -325,7 +324,7 @@ impl PainterApp {
             .default_width(520.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(&r.name).strong().color(Color32::WHITE));
+                ui.label(egui::RichText::new(&r.name).strong().color(theme::TEXT_BRIGHT));
                 ui.label(
                     egui::RichText::new(format!(
                         "The layer \"{FLATTENED}\" shows the project as it looked in Painter. To edit its structure instead, show the folder \"{REBUILT}\" and hide the flattened layer."
@@ -334,8 +333,8 @@ impl PainterApp {
                 );
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-                    let green = Color32::from_rgb(120, 210, 140);
-                    let amber = Color32::from_rgb(240, 190, 90);
+                    let green = theme::GOOD;
+                    let amber = theme::WARN;
                     ui.label(egui::RichText::new("Came across").strong().color(green));
                     for line in &r.came {
                         ui.label(format!("✓ {line}"));

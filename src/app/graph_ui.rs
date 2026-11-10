@@ -262,7 +262,7 @@ pub(super) fn param_widget(ui: &mut egui::Ui, p: &graph::def::Param, v: &mut Val
     // Seeds get a button that rolls a new one.
     if let (ParamKind::Int { min, max }, Value::Int(i)) = (&p.kind, &mut *v) {
         if p.name.contains("seed") {
-            let mut ch = ui.add(egui::Slider::new(i, *min..=*max)).changed();
+            let mut ch = ui.add(theme::Slider(egui::Slider::new(i, *min..=*max))).changed();
             if ui.small_button("🎲").on_hover_text("New random seed").clicked() {
                 let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
                 *i = *min + (t % ((*max - *min).max(1) as u32 + 1)) as i32;
@@ -272,8 +272,8 @@ pub(super) fn param_widget(ui: &mut egui::Ui, p: &graph::def::Param, v: &mut Val
         }
     }
     match (&p.kind, v) {
-                    (ParamKind::Float { min, max }, Value::Float(f)) => ui.add(egui::Slider::new(f, *min..=*max).max_decimals(3)).changed(),
-                    (ParamKind::Int { min, max }, Value::Int(i)) => ui.add(egui::Slider::new(i, *min..=*max)).changed(),
+                    (ParamKind::Float { min, max }, Value::Float(f)) => ui.add(theme::Slider(egui::Slider::new(f, *min..=*max).max_decimals(3))).changed(),
+                    (ParamKind::Int { min, max }, Value::Int(i)) => ui.add(theme::Slider(egui::Slider::new(i, *min..=*max))).changed(),
                     (ParamKind::Bool, Value::Bool(b)) => ui.checkbox(b, "").changed(),
                     (ParamKind::Color, Value::Color(c)) => super::color_edit(ui, c),
                     (ParamKind::Enum(opts), Value::Enum(i)) => {
@@ -995,7 +995,7 @@ impl PainterApp {
             }
             if !self.graphs.lib.errors.is_empty() {
                 let text: Vec<String> = self.graphs.lib.errors.iter().map(|(p, e)| format!("{}: {e}", p.display())).collect();
-                ui.label(egui::RichText::new(format!("⚠ {} node file(s) with errors", text.len())).color(Color32::from_rgb(240, 120, 90)))
+                ui.label(egui::RichText::new(format!("⚠ {} node file(s) with errors", text.len())).color(theme::ERROR))
                     .on_hover_text(text.join("\n"));
             }
         });
@@ -1198,10 +1198,10 @@ impl PainterApp {
             let title_cut = t.elided.then_some(title);
             painter.galley(head.left_center() + vec2(7.0 * zoom, -t.size().y * 0.5), t, Color32::WHITE);
             if d.graph.is_bound(id) {
-                painter.text(head.right_center() - vec2(7.0 * zoom, 0.0), egui::Align2::RIGHT_CENTER, "◆", font(10.0), Color32::from_rgb(255, 220, 120));
+                painter.text(head.right_center() - vec2(7.0 * zoom, 0.0), egui::Align2::RIGHT_CENTER, "◆", font(10.0), theme::ACCENT);
             }
             let border = if error.is_some() {
-                Stroke::new(2.0, Color32::from_rgb(240, 90, 70))
+                Stroke::new(2.0, theme::ERROR)
             } else if primary {
                 Stroke::new(2.5, theme::ACCENT)
             } else if selected {
@@ -1234,7 +1234,7 @@ impl PainterApp {
                 _ => {
                     painter.rect_filled(img, 0.0, Color32::from_gray(28));
                     if error.is_some() {
-                        painter.text(img.center(), egui::Align2::CENTER_CENTER, "error", font(12.0), Color32::from_rgb(240, 110, 90));
+                        painter.text(img.center(), egui::Align2::CENTER_CENTER, "error", font(12.0), theme::ERROR);
                     }
                 }
             }
@@ -1457,10 +1457,10 @@ impl PainterApp {
         let Some(ni) = d.graph.nodes.iter().position(|n| n.id == sel) else { return };
         let node = &d.graph.nodes[ni];
         let Some(def) = lib.find(&node.def) else {
-            ui.label(egui::RichText::new(format!("Unknown node '{}'. Its file is missing or has errors.", node.def)).color(Color32::from_rgb(240, 120, 90)));
+            ui.label(egui::RichText::new(format!("Unknown node '{}'. Its file is missing or has errors.", node.def)).color(theme::ERROR));
             return;
         };
-        ui.label(egui::RichText::new(&def.name).heading().color(Color32::WHITE));
+        ui.label(egui::RichText::new(&def.name).heading().color(theme::TEXT_BRIGHT));
         ui.label(egui::RichText::new(format!("{} · {}", def.category, if def.id.starts_with("user/") { "custom node" } else { "built-in" })).small().color(theme::TEXT_DIM));
         if let Some(t) = d.graph.tag_of(sel) {
             let what = match t.role {
@@ -1475,7 +1475,7 @@ impl PainterApp {
             ui.label(egui::RichText::new(&def.description).color(theme::TEXT));
         }
         if let Some(e) = &error {
-            ui.label(egui::RichText::new(e).color(Color32::from_rgb(240, 120, 90)).monospace().small());
+            ui.label(egui::RichText::new(e).color(theme::ERROR).monospace().small());
         }
         let mut changed = false;
         // The pane scrolls as a whole (node settings, preview, material parameters).
@@ -1508,7 +1508,7 @@ impl PainterApp {
                     .collect();
                 let c = labeled(ui, &label, |ui| {
                     let star = egui::RichText::new(if bound.is_some() { "◆" } else { "◇" })
-                        .color(if bound.is_some() { Color32::from_rgb(255, 220, 120) } else { theme::TEXT_DIM });
+                        .color(if bound.is_some() { theme::ACCENT } else { theme::TEXT_DIM });
                     let tip = match bound {
                         Some(i) => format!("Set by the material parameter \"{}\"", d.graph.params[i].name),
                         None => "Show this setting in the layer properties (Material Paint)".to_string(),

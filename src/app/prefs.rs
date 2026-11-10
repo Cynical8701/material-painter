@@ -380,9 +380,9 @@ impl PainterApp {
             }
             Page::Interface => {
                 section(ui, "Scale");
-                labeled(ui, "UI scale", |ui| ui.add(egui::Slider::new(&mut p.ui_scale, 0.6..=2.5).max_decimals(2).suffix("x")));
+                labeled(ui, "UI scale", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.ui_scale, 0.6..=2.5).max_decimals(2).suffix("x"))));
                 hint(ui, "Applies when you release the slider. Ctrl + / Ctrl - also zoom the interface.");
-                labeled(ui, "Shelf icons", |ui| ui.add(egui::Slider::new(&mut p.shelf_icon_size, super::ICON_MIN..=super::ICON_MAX).max_decimals(0).suffix(" px")));
+                labeled(ui, "Shelf icons", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.shelf_icon_size, super::ICON_MIN..=super::ICON_MAX).max_decimals(0).suffix(" px"))));
             }
             Page::Viewport => {
                 section(ui, "Lighting");
@@ -396,9 +396,9 @@ impl PainterApp {
                 });
                 ui.checkbox(&mut p.key_light, "Key light with shadows on new projects");
                 section(ui, "Camera");
-                labeled(ui, "Field of view", |ui| ui.add(egui::Slider::new(&mut p.fov_deg, 10.0..=120.0).max_decimals(0).suffix("°")));
-                labeled(ui, "Orbit speed", |ui| ui.add(egui::Slider::new(&mut p.orbit_speed, 0.1..=5.0).max_decimals(2).suffix("x")));
-                labeled(ui, "Zoom speed", |ui| ui.add(egui::Slider::new(&mut p.zoom_speed, 0.1..=5.0).max_decimals(2).suffix("x")));
+                labeled(ui, "Field of view", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.fov_deg, 10.0..=120.0).max_decimals(0).suffix("°"))));
+                labeled(ui, "Orbit speed", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.orbit_speed, 0.1..=5.0).max_decimals(2).suffix("x"))));
+                labeled(ui, "Zoom speed", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.zoom_speed, 0.1..=5.0).max_decimals(2).suffix("x"))));
                 ui.checkbox(&mut p.invert_zoom, "Invert scroll zoom");
                 section(ui, "Ray traced preview");
                 labeled(ui, "Max samples", |ui| ui.add(egui::DragValue::new(&mut p.rt_max_samples).range(16..=16384)));
@@ -406,12 +406,12 @@ impl PainterApp {
             }
             Page::Painting => {
                 section(ui, "New brush defaults");
-                labeled(ui, "Size", |ui| ui.add(egui::Slider::new(&mut p.brush_size, 1.0..=400.0).max_decimals(0).suffix(" pt")));
-                labeled(ui, "Hardness", |ui| ui.add(egui::Slider::new(&mut p.brush_hardness, 0.0..=1.0).max_decimals(2)));
-                labeled(ui, "Spacing", |ui| ui.add(egui::Slider::new(&mut p.brush_spacing, 0.01..=1.0).max_decimals(2)));
+                labeled(ui, "Size", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.brush_size, 1.0..=400.0).max_decimals(0).suffix(" pt"))));
+                labeled(ui, "Hardness", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.brush_hardness, 0.0..=1.0).max_decimals(2))));
+                labeled(ui, "Spacing", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.brush_spacing, 0.01..=1.0).max_decimals(2))));
                 hint(ui, "Used when the app starts.");
                 section(ui, "Polygon fill");
-                labeled(ui, "Seam padding", |ui| ui.add(egui::Slider::new(&mut p.poly_padding, 0.0..=16.0).max_decimals(1).suffix(" texels")));
+                labeled(ui, "Seam padding", |ui| ui.add(theme::Slider(egui::Slider::new(&mut p.poly_padding, 0.0..=16.0).max_decimals(1).suffix(" texels"))));
                 hint(ui, "How far fills reach past UV island borders, so mips and filtering don't show seams.");
             }
             Page::Baking => {

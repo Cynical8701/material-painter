@@ -98,7 +98,7 @@ impl PainterApp {
                         for path in self.recent.iter().take(7) {
                             let name = path.file_stem().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
                             let folder = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-                            let resp = ui.add(row_button(ui, egui::RichText::new(&name).color(Color32::WHITE))).on_hover_text(path.display().to_string());
+                            let resp = ui.add(row_button(ui, egui::RichText::new(&name).color(theme::TEXT_BRIGHT))).on_hover_text(path.display().to_string());
                             ui.add(egui::Label::new(egui::RichText::new(folder).small().color(theme::TEXT_DIM)).truncate());
                             if resp.clicked() {
                                 self.pending.push(Action::OpenProject(Some(path.clone())));
@@ -138,7 +138,7 @@ impl PainterApp {
 }
 
 fn heading(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).size(15.0).family(theme::heading_family()).color(Color32::WHITE));
+    ui.label(egui::RichText::new(title).size(15.0).family(theme::heading_family()).color(theme::TEXT_BRIGHT));
     ui.add_space(4.0);
 }
 

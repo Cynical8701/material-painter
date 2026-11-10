@@ -7,7 +7,7 @@ use super::{PainterApp, labeled, section};
 use crate::export::{self, Chan, Depth, Format, Layout, OutputMap, Padding, Source, Template};
 use crate::theme;
 use eframe::egui;
-use egui::{Color32, vec2};
+use egui::vec2;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -363,7 +363,7 @@ impl PainterApp {
                         let doc = self.engine.res;
                         let out = self.prefs.export_size.unwrap_or(doc);
                         if out > doc {
-                            ui.label(egui::RichText::new(format!("Upscaled from the {doc} px document.")).small().color(Color32::from_rgb(230, 180, 90)));
+                            ui.label(egui::RichText::new(format!("Upscaled from the {doc} px document.")).small().color(theme::WARN));
                         }
 
                         section(ui, "Files");
@@ -394,13 +394,13 @@ impl PainterApp {
                         });
                         match &self.export.result {
                             Some(Ok(msg)) => {
-                                ui.label(egui::RichText::new(msg).color(Color32::from_rgb(120, 200, 120)));
+                                ui.label(egui::RichText::new(msg).color(theme::GOOD));
                                 if ui.button("Open folder").clicked() {
                                     open_in_file_browser(std::path::Path::new(&self.prefs.export_folder));
                                 }
                             }
                             Some(Err(e)) => {
-                                ui.label(egui::RichText::new(e).color(Color32::from_rgb(230, 110, 100)));
+                                ui.label(egui::RichText::new(e).color(theme::ERROR));
                             }
                             None => {}
                         }

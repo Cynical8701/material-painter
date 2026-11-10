@@ -34,6 +34,16 @@ pub const OUTLINE: Color32 = Color32::from_rgb(0x2a, 0x2c, 0x33);
 /// Outlines of hovered controls.
 pub const OUTLINE_STRONG: Color32 = Color32::from_rgb(0x3e, 0x40, 0x49);
 
+/// Text on an accent fill.
+pub const ON_ACCENT: Color32 = Color32::from_rgb(0x14, 0x15, 0x18);
+/// Status colors: success, warnings and errors, and the fills of notes in
+/// the warning and error colors.
+pub const GOOD: Color32 = Color32::from_rgb(0x2f, 0xc6, 0xb4);
+pub const WARN: Color32 = Color32::from_rgb(0xf2, 0xc1, 0x4e);
+pub const ERROR: Color32 = Color32::from_rgb(0xff, 0x6f, 0x6f);
+pub const WARN_BG: Color32 = Color32::from_rgb(0x3a, 0x32, 0x1e);
+pub const ERROR_BG: Color32 = Color32::from_rgb(0x3d, 0x22, 0x24);
+
 /// Corner radius of controls; cards and windows use [`CARD_RADIUS`], small
 /// things (icon buttons, menu items) [`SMALL_RADIUS`].
 pub const RADIUS: u8 = 5;
@@ -392,6 +402,41 @@ impl egui::Widget for Selectable<'_> {
         }
         resp
     }
+}
+
+/// egui's slider in the Studio look: the rail filled in the accent up to a
+/// bright round handle ringed in the accent. egui paints its handle in the
+/// rail's color, so this restyles the shapes the slider just added.
+pub struct Slider<'a>(pub egui::Slider<'a>);
+
+impl egui::Widget for Slider<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let layer = ui.layer_id();
+        let next = |ui: &egui::Ui| ui.ctx().graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
+        let start = next(ui);
+        let resp = ui.add(self.0);
+        let (end, fill, hot) = (next(ui), ui.visuals().selection.bg_fill, resp.hovered() || resp.dragged());
+        ui.ctx().graphics_mut(|g| {
+            let list = g.entry(layer);
+            for i in start..end {
+                list.mutate_shape(egui::layers::ShapeIdx(i), |s| match &mut s.shape {
+                    egui::Shape::Circle(c) => {
+                        c.radius = if hot { 7.5 } else { 6.5 };
+                        c.fill = TEXT_BRIGHT;
+                        c.stroke = Stroke::new(2.0, ACCENT);
+                    }
+                    egui::Shape::Rect(r) if r.fill == fill => r.fill = ACCENT,
+                    _ => {}
+                });
+            }
+        });
+        resp
+    }
+}
+
+/// The main action of a panel: filled in the accent, dark text.
+pub fn primary<'a>(text: impl Into<String>) -> egui::Button<'a> {
+    egui::Button::new(egui::RichText::new(text).strong().color(ON_ACCENT)).fill(ACCENT).stroke(Stroke::NONE)
 }
 
 /// Icon followed by text, for buttons and tabs.

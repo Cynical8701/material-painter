@@ -111,7 +111,7 @@ impl PainterApp {
             }
         });
         if let Some(e) = &self.preview.error {
-            ui.label(egui::RichText::new(format!("The shader doesn't compile: {e}")).small().color(egui::Color32::from_rgb(240, 110, 100)));
+            ui.label(egui::RichText::new(format!("The shader doesn't compile: {e}")).small().color(theme::ERROR));
         } else {
             ui.label(
                 egui::RichText::new("Only changes how the 3D view looks while you work; exports are unaffected. Ray tracing uses the default look.")

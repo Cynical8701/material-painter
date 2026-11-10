@@ -320,7 +320,7 @@ impl PainterApp {
             p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, bar.height())), 0.0, theme::ACCENT);
         } else {
             let (text, color) = if installed {
-                ("✓ On your shelf".to_string(), Color32::from_rgb(110, 200, 120))
+                ("✓ On your shelf".to_string(), theme::GOOD)
             } else if hovered {
                 (theme::with_icon(icons::DOWNLOAD_SIMPLE, "Download"), theme::ACCENT)
             } else {

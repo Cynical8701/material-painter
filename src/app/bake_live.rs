@@ -283,7 +283,7 @@ impl PainterApp {
                 } else if self.bake_job.is_some() {
                     ("Paused while baking.".to_string(), theme::TEXT_DIM)
                 } else if let Some((_, e)) = &self.bake_preview.failed {
-                    (format!("Can't preview: {e}"), Color32::from_rgb(255, 110, 90))
+                    (format!("Can't preview: {e}"), theme::ERROR)
                 } else if self.bake_preview.preparing.is_some() {
                     ("Preparing the mesh…".to_string(), theme::TEXT)
                 } else if self.bake_preview.run.as_ref().is_some_and(|(_, res, _)| *res > PREVIEW_RES) {

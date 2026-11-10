@@ -449,7 +449,7 @@ impl PainterApp {
             for (path, err) in &lib.errors {
                 any = true;
                 let id = format!("user/{}", path.file_stem().unwrap_or_default().to_string_lossy());
-                let text = egui::RichText::new(format!("⚠ {}", id.trim_start_matches("user/"))).color(Color32::from_rgb(240, 130, 90));
+                let text = egui::RichText::new(format!("⚠ {}", id.trim_start_matches("user/"))).color(theme::ERROR);
                 if ui.selectable_label(open.as_deref() == Some(id.as_str()), text).on_hover_text(err).clicked() {
                     pick = Some(id);
                 }
@@ -489,7 +489,7 @@ impl PainterApp {
             let id = sm.id.clone().unwrap_or_default();
             ui.horizontal(|ui| {
                 let title = format!("{}{}", id.trim_start_matches("user/"), if sm.modified() { " *" } else { "" });
-                ui.label(egui::RichText::new(title).heading().color(Color32::WHITE));
+                ui.label(egui::RichText::new(title).heading().color(theme::TEXT_BRIGHT));
                 if !editable {
                     ui.label(egui::RichText::new("built-in, read-only").color(theme::TEXT_DIM));
                 }
@@ -506,7 +506,7 @@ impl PainterApp {
                     .clicked();
                 if editable {
                     if sm.confirm_delete {
-                        ui.label(egui::RichText::new("Delete the file?").color(Color32::from_rgb(240, 130, 90)));
+                        ui.label(egui::RichText::new("Delete the file?").color(theme::ERROR));
                         delete = ui.button("Yes, delete").clicked();
                         if ui.button("No").clicked() {
                             sm.confirm_delete = false;
@@ -518,14 +518,14 @@ impl PainterApp {
             });
             match &sm.error {
                 Some(e) => {
-                    egui::Frame::new().fill(Color32::from_rgb(60, 28, 24)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+                    egui::Frame::new().fill(theme::ERROR_BG).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("shader errors").max_height(110.0).show(ui, |ui| {
-                            ui.label(egui::RichText::new(e).monospace().small().color(Color32::from_rgb(250, 160, 140)));
+                            ui.label(egui::RichText::new(e).monospace().small().color(theme::ERROR));
                         });
                     });
                 }
                 None => {
-                    ui.label(egui::RichText::new("✔ Compiles. The preview updates as you type.").small().color(Color32::from_rgb(120, 200, 120)));
+                    ui.label(egui::RichText::new("✔ Compiles. The preview updates as you type.").small().color(theme::GOOD));
                 }
             }
             ui.add_space(4.0);

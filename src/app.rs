@@ -866,7 +866,7 @@ fn custom_map_picker(ui: &mut egui::Ui, g: &mut crate::engine::Generator, salt: 
         });
     });
     if current.is_some_and(|(_, id)| custom.iter().all(|c| c.id != id)) {
-        ui.label(egui::RichText::new("This map was removed in the bake window; pick another.").small().color(Color32::from_rgb(240, 180, 80)));
+        ui.label(egui::RichText::new("This map was removed in the bake window; pick another.").small().color(theme::WARN));
     }
     dirty
 }
@@ -887,7 +887,7 @@ fn input_row(ui: &mut egui::Ui, name: String, tip: &str, weight: &mut f32) -> (b
         });
         // The slider takes what's left, next to its value box.
         ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(40.0);
-        changed = ui.add(egui::Slider::new(weight, -2.0..=2.0).max_decimals(2)).changed();
+        changed = ui.add(theme::Slider(egui::Slider::new(weight, -2.0..=2.0).max_decimals(2))).changed();
     });
     (remove, changed)
 }
@@ -961,7 +961,7 @@ fn generator_inputs_ui(ui: &mut egui::Ui, g: &mut crate::engine::Generator, cust
 }
 
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) -> bool {
-    labeled(ui, label, |ui| ui.add(egui::Slider::new(v, range).max_decimals(2)).changed())
+    labeled(ui, label, |ui| ui.add(theme::Slider(egui::Slider::new(v, range).max_decimals(2))).changed())
 }
 
 fn color_edit(ui: &mut egui::Ui, c: &mut [f32; 3]) -> bool {
@@ -980,7 +980,7 @@ fn channel_toggles(ui: &mut egui::Ui, enabled: &mut [bool; crate::engine::CHANNE
         use crate::engine::{NORMAL, SPECULAR};
         for (c, name) in [(0, "color"), (3, "height"), (1, "rough"), (2, "metal"), (SPECULAR, "specular"), (NORMAL, "normal"), (4, "opacity"), (5, "emission")] {
             let on = enabled[c];
-            let text = egui::RichText::new(name).color(if on { Color32::WHITE } else { theme::TEXT_DIM });
+            let text = egui::RichText::new(name).color(if on { theme::TEXT_BRIGHT } else { theme::TEXT_DIM });
             let b = egui::Button::new(text).fill(if on { theme::ACCENT_DIM } else { theme::WIDGET }).min_size(vec2(56.0, 20.0));
             let b = ui.add(b);
             let b = match c {
@@ -2273,7 +2273,7 @@ impl PainterApp {
                 ui.checkbox(&mut self.view.show_seams_3d, "UV seams (3D)");
                 ui.horizontal(|ui| {
                     ui.label("UV wire opacity");
-                    ui.add(egui::Slider::new(&mut self.view.uv_wire_opacity, 0.05..=1.0).max_decimals(2));
+                    ui.add(theme::Slider(egui::Slider::new(&mut self.view.uv_wire_opacity, 0.05..=1.0).max_decimals(2)));
                 });
                 ui.add(egui::Checkbox::new(&mut self.rt.enabled, "Ray traced preview (F10)"));
                 if ui.add(egui::Button::new("Frame mesh").shortcut_text("F")).clicked() {
@@ -2374,8 +2374,8 @@ impl PainterApp {
                 }
                 rt_btn.context_menu(|ui| {
                     ui.set_min_width(220.0);
-                    labeled(ui, "Max samples", |ui| ui.add(egui::Slider::new(&mut self.rt.max_samples, 16..=4096).logarithmic(true)));
-                    labeled(ui, "Bounces", |ui| ui.add(egui::Slider::new(&mut self.rt.bounces, 1..=12)));
+                    labeled(ui, "Max samples", |ui| ui.add(theme::Slider(egui::Slider::new(&mut self.rt.max_samples, 16..=4096).logarithmic(true))));
+                    labeled(ui, "Bounces", |ui| ui.add(theme::Slider(egui::Slider::new(&mut self.rt.bounces, 1..=12))));
                     ui.checkbox(&mut self.rt.ground, "Ground plane with shadows");
                 });
                 if ui
@@ -2462,7 +2462,7 @@ impl PainterApp {
                         Tool::PolyFill => icons::POLYGON,
                         Tool::Path => icons::PATH,
                     };
-                    ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(Color32::WHITE));
+                    ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(theme::TEXT_BRIGHT));
                     ui.separator();
                     if self.tool == Tool::PolyFill {
                         ui.spacing_mut().item_spacing.x = 2.0;
@@ -2482,9 +2482,9 @@ impl PainterApp {
                             }
                         }
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new(self.poly.mode.name()).color(Color32::WHITE));
+                        ui.label(egui::RichText::new(self.poly.mode.name()).color(theme::TEXT_BRIGHT));
                         if self.poly.mode == FillMode::Flat {
-                            ui.add(egui::Slider::new(&mut self.poly.angle, 1.0..=90.0).max_decimals(0).suffix("°"))
+                            ui.add(theme::Slider(egui::Slider::new(&mut self.poly.angle, 1.0..=90.0).max_decimals(0).suffix("°")))
                                 .on_hover_text("The sharpest edge a flat area spreads across");
                         }
                         ui.separator();
@@ -2510,7 +2510,7 @@ impl PainterApp {
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("Opacity").color(theme::TEXT_DIM));
                         let mut p = self.brush.opacity * 100.0;
-                        if ui.add(egui::Slider::new(&mut p, 1.0..=100.0).max_decimals(0).suffix("%")).changed() {
+                        if ui.add(theme::Slider(egui::Slider::new(&mut p, 1.0..=100.0).max_decimals(0).suffix("%"))).changed() {
                             self.brush.opacity = p / 100.0;
                         }
                         ui.label(egui::RichText::new("Click or drag across faces, Shift+drag a box or lasso. Uses the brush material.").small().color(theme::TEXT_DIM));
@@ -2523,13 +2523,13 @@ impl PainterApp {
                             let mut p = *v * 100.0;
                             let lo = *r.start() * 100.0;
                             let hi = *r.end() * 100.0;
-                            let resp = ui.add(egui::Slider::new(&mut p, lo..=hi).max_decimals(0).suffix("%"));
+                            let resp = ui.add(theme::Slider(egui::Slider::new(&mut p, lo..=hi).max_decimals(0).suffix("%")));
                             if resp.changed() {
                                 *v = p / 100.0;
                             }
                             resp
                         } else {
-                            ui.add(egui::Slider::new(v, r).max_decimals(0))
+                            ui.add(theme::Slider(egui::Slider::new(v, r).max_decimals(0)))
                         };
                         ui.add_space(6.0);
                         resp
@@ -2727,7 +2727,7 @@ impl PainterApp {
         let eye_rect = Rect::from_center_size(pos2(rect.min.x + 16.0, rect.center().y), vec2(22.0, 22.0));
         let eye = ui.interact(eye_rect, base_id.with("eye"), Sense::click());
         let (eye_icon, eye_col) = if visible { (icons::EYE, theme::TEXT) } else { (icons::EYE_SLASH, theme::TEXT_DIM.gamma_multiply(0.6)) };
-        let eye_col = if eye.hovered() { Color32::WHITE } else { eye_col };
+        let eye_col = if eye.hovered() { theme::TEXT_BRIGHT } else { eye_col };
         painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, eye_icon, egui::FontId::proportional(15.0), eye_col);
 
         // Content thumbnail, indented by folder depth.
@@ -2795,7 +2795,7 @@ impl PainterApp {
         }
 
         // Name and blend info.
-        let text_col = if visible { Color32::WHITE } else { theme::TEXT_DIM };
+        let text_col = if visible { theme::TEXT_BRIGHT } else { theme::TEXT_DIM };
         let title = theme::elided(&painter, &name, egui::FontId::proportional(12.5), text_col, rect.max.x - x - 8.0);
         let name_cut = title.elided;
         painter.galley(pos2(x, rect.min.y + 13.0 - title.size().y * 0.5), title, text_col);
@@ -3041,10 +3041,10 @@ impl PainterApp {
                 Color32::WHITE,
             );
             let resp = resp.on_hover_text("Choose an HDRI");
-            ui.label(egui::RichText::new(current).strong().color(Color32::WHITE));
+            ui.label(egui::RichText::new(current).strong().color(theme::TEXT_BRIGHT));
             egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 ui.set_width(360.0);
-                ui.label(egui::RichText::new("Environment").strong().color(Color32::WHITE));
+                ui.label(egui::RichText::new("Environment").strong().color(theme::TEXT_BRIGHT));
                 egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -3078,7 +3078,7 @@ impl PainterApp {
                                 egui::Align2::LEFT_TOP,
                                 name,
                                 egui::FontId::proportional(11.5),
-                                if selected { Color32::WHITE } else { theme::TEXT_DIM },
+                                if selected { theme::TEXT_BRIGHT } else { theme::TEXT_DIM },
                             );
                             if resp.clicked() {
                                 pick = Some(src);
@@ -3101,10 +3101,10 @@ impl PainterApp {
             }
             slider(ui, "Intensity", &mut v.env_intensity, 0.0..=4.0);
             labeled(ui, "Ambient occlusion", |ui| {
-                ui.add(egui::Slider::new(&mut v.ao_strength, 0.0..=1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)))
+                ui.add(theme::Slider(egui::Slider::new(&mut v.ao_strength, 0.0..=1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0))))
             })
             .on_hover_text("How much the baked ambient occlusion darkens crevices in the 3D view. Only the view: bakes and exports keep the full map.");
-            labeled(ui, "Emission", |ui| ui.add(egui::Slider::new(&mut v.emission, 0.0..=20.0).logarithmic(true).max_decimals(2)))
+            labeled(ui, "Emission", |ui| ui.add(theme::Slider(egui::Slider::new(&mut v.emission, 0.0..=20.0).logarithmic(true).max_decimals(2))))
                 .on_hover_text("How bright emissive parts glow in the 3D view and the ray tracer. Only the view: exports keep the emission color as painted.");
 
             section(ui, "Key light");
@@ -3138,7 +3138,7 @@ impl PainterApp {
 
             section(ui, "Post processing");
             labeled(ui, "Exposure", |ui| {
-                ui.add(egui::Slider::new(&mut v.exposure, 0.05..=8.0).logarithmic(true).max_decimals(2));
+                ui.add(theme::Slider(egui::Slider::new(&mut v.exposure, 0.05..=8.0).logarithmic(true).max_decimals(2)));
             });
             let p = &mut v.post;
             labeled(ui, "Tone mapping", |ui| {
@@ -3207,9 +3207,9 @@ impl PainterApp {
             }
             if let Some(missed) = r.missed_percent() {
                 let (col, text) = if missed > 0.05 {
-                    (Color32::from_rgb(235, 120, 90), format!("⚠ {missed:.2}% of texels missed the bake source"))
+                    (theme::ERROR, format!("⚠ {missed:.2}% of texels missed the bake source"))
                 } else {
-                    (Color32::from_rgb(120, 200, 120), "✔ No missed rays".to_string())
+                    (theme::GOOD, "✔ No missed rays".to_string())
                 };
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(text).color(col));
@@ -3414,7 +3414,7 @@ impl PainterApp {
                             ui.label(egui::RichText::new("Probing the high poly…").small().color(theme::TEXT_DIM));
                         });
                     } else if let Some((_, e)) = &c.failed {
-                        ui.label(egui::RichText::new(e).small().color(Color32::from_rgb(255, 110, 90)));
+                        ui.label(egui::RichText::new(e).small().color(theme::ERROR));
                     } else if let Some(st) = c.stats {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
@@ -3476,11 +3476,11 @@ impl PainterApp {
                 });
             });
             labeled(ui, "Anti-aliasing", |ui| {
-                ui.add(egui::Slider::new(&mut s.aa, 1..=8).custom_formatter(|v, _| format!("{0}x{0}", v as u32)))
+                ui.add(theme::Slider(egui::Slider::new(&mut s.aa, 1..=8).custom_formatter(|v, _| format!("{0}x{0}", v as u32))))
             });
-            labeled(ui, "AO rays", |ui| ui.add(egui::Slider::new(&mut s.ao_rays, 4..=512)));
-            labeled(ui, "Thickness rays", |ui| ui.add(egui::Slider::new(&mut s.thickness_rays, 0..=256)));
-            labeled(ui, "Sky rays", |ui| ui.add(egui::Slider::new(&mut s.sky_rays, 0..=256)));
+            labeled(ui, "AO rays", |ui| ui.add(theme::Slider(egui::Slider::new(&mut s.ao_rays, 4..=512))));
+            labeled(ui, "Thickness rays", |ui| ui.add(theme::Slider(egui::Slider::new(&mut s.thickness_rays, 0..=256))));
+            labeled(ui, "Sky rays", |ui| ui.add(theme::Slider(egui::Slider::new(&mut s.sky_rays, 0..=256))));
             ui.label(
                 egui::RichText::new(format!(
                     "{} rays per texel · {:.0}M rays at {}²",
@@ -3507,7 +3507,7 @@ impl PainterApp {
                         let auto = s.edge_distance_for(&self.mesh);
                         ui.label(egui::RichText::new(format!("{auto:.3}")).color(theme::TEXT_DIM));
                     } else {
-                        ui.add(egui::Slider::new(&mut s.edge_max_distance, 0.005..=1.0).max_decimals(3));
+                        ui.add(theme::Slider(egui::Slider::new(&mut s.edge_max_distance, 0.005..=1.0).max_decimals(3)));
                     }
                 });
                 slider(ui, "Hard edge angle (°)", &mut s.hard_edge_angle, 5.0..=120.0);
@@ -3521,7 +3521,7 @@ impl PainterApp {
                 let busy = self.bake_job.is_some();
                 let sets = self.mesh.sets.len();
                 let label = if sets > 1 { format!("Bake {}", self.mesh.sets[self.sets.active].name) } else { "Bake".into() };
-                let bake = egui::Button::new(egui::RichText::new(theme::with_icon(icons::FIRE, &label)).strong()).fill(theme::ACCENT_DIM).min_size(vec2(120.0, 30.0));
+                let bake = theme::primary(theme::with_icon(icons::FIRE, &label)).min_size(vec2(120.0, 30.0));
                 if ui.add_enabled(!busy, bake).on_hover_text("Bake the texture set being painted").clicked() {
                     self.pending.push(Action::Bake);
                 }
@@ -3548,7 +3548,7 @@ impl PainterApp {
     fn fix_properties(&mut self, ui: &mut egui::Ui, map: usize) {
         let info = &MAPS[map];
         section(ui, "Bake fix");
-        ui.label(egui::RichText::new(format!("Painting corrections on {}.", info.name)).color(Color32::WHITE));
+        ui.label(egui::RichText::new(format!("Painting corrections on {}.", info.name)).color(theme::TEXT_BRIGHT));
         ui.label(
             egui::RichText::new("Paint (1) sets the value below, Eraser (2) restores the original bake. Fixes survive re-baking.")
                 .small()
@@ -3559,7 +3559,7 @@ impl PainterApp {
         } else {
             ui.horizontal(|ui| {
                 ui.label("Value");
-                ui.add(egui::Slider::new(&mut self.brush.fix_value, 0.0..=1.0));
+                ui.add(theme::Slider(egui::Slider::new(&mut self.brush.fix_value, 0.0..=1.0)));
             });
             ui.horizontal(|ui| {
                 for (label, v) in [("Black", 0.0), ("50%", 0.5), ("White", 1.0)] {
@@ -3614,7 +3614,7 @@ impl PainterApp {
 
     fn properties(&mut self, ui: &mut egui::Ui) {
         if let StrokeTarget::BakeFix(m) = self.target {
-            ui.label(egui::RichText::new(format!("Properties – Fix · {}", MAPS[m].name)).strong().color(Color32::WHITE));
+            ui.label(egui::RichText::new(format!("Properties – Fix · {}", MAPS[m].name)).strong().color(theme::TEXT_BRIGHT));
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.fix_properties(ui, m));
             return;
         }
@@ -3624,7 +3624,7 @@ impl PainterApp {
             Some(l) if l.is_fill() => format!("Properties – Fill · {}", l.name),
             Some(l) => format!("Properties – Paint · {}", l.name),
         };
-        ui.label(egui::RichText::new(title).strong().color(Color32::WHITE));
+        ui.label(egui::RichText::new(title).strong().color(theme::TEXT_BRIGHT));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let idx = self.selected;
             if idx >= self.engine.layers.len() {
@@ -3645,7 +3645,7 @@ impl PainterApp {
                     });
                 });
                 let mut op = layer.opacity * 100.0;
-                if labeled(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut op, 0.0..=100.0).max_decimals(0).suffix("%")).changed()) {
+                if labeled(ui, "Opacity", |ui| ui.add(theme::Slider(egui::Slider::new(&mut op, 0.0..=100.0).max_decimals(0).suffix("%"))).changed()) {
                     layer.opacity = op / 100.0;
                     dirty = true;
                 }
@@ -3679,7 +3679,7 @@ impl PainterApp {
                     if let Some(name) = &graph_name {
                         section(ui, "Material graph");
                         labeled(ui, "Graph", |ui| {
-                            ui.label(egui::RichText::new(name).color(Color32::WHITE));
+                            ui.label(egui::RichText::new(name).color(theme::TEXT_BRIGHT));
                             if ui.button("Edit graph").on_hover_text("Ctrl+G").clicked() {
                                 self.pending.push(Action::EditGraph);
                             }
@@ -3761,7 +3761,7 @@ impl PainterApp {
                                 });
                             });
                             dirty |= labeled(ui, "Tiling", |ui| {
-                                ui.add(egui::Slider::new(&mut f.tiling, 0.05..=64.0).logarithmic(true).max_decimals(2)).changed()
+                                ui.add(theme::Slider(egui::Slider::new(&mut f.tiling, 0.05..=64.0).logarithmic(true).max_decimals(2))).changed()
                             });
                             dirty |= slider(ui, "Rotation", &mut f.rotation, -180.0..=180.0);
                             dirty |= slider(ui, "Offset U", &mut f.offset[0], -1.0..=1.0);
@@ -3798,7 +3798,7 @@ impl PainterApp {
         }
         let at = resp.rect.right_top() + vec2(-8.0, 6.0);
         let r = Rect::from_center_size(at + vec2(-5.0, 6.0), vec2(16.0, 16.0));
-        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(230, 160, 40));
+        ui.painter().rect_filled(r, 0.0, theme::WARN);
         ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "!", egui::FontId::proportional(12.0), Color32::BLACK);
         resp.clone().on_hover_text(format!("Needs maps that weren't baked: {}. Bake them for this to look right.", crate::engine::map_names(missing)));
     }
@@ -3838,10 +3838,10 @@ impl PainterApp {
         }
         let mut names: Vec<String> = (missing != 0).then(|| crate::engine::map_names(missing)).into_iter().collect();
         names.extend(custom);
-        egui::Frame::new().fill(Color32::from_rgb(60, 45, 20)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+        egui::Frame::new().fill(theme::WARN_BG).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!("This mask reads maps that weren't baked: {}.", names.join(", ")))
-                    .color(Color32::from_rgb(240, 190, 90)),
+                    .color(theme::WARN),
             );
             if ui.button("Open the baker").clicked() {
                 self.show_bake = true;
@@ -3861,7 +3861,7 @@ impl PainterApp {
         if let Some(gid) = mask.graph {
             let name = self.graphs.doc(gid).map_or("(missing)".to_string(), |d| d.graph.name.clone());
             labeled(ui, "Graph", |ui| {
-                ui.label(egui::RichText::new(name).color(Color32::WHITE));
+                ui.label(egui::RichText::new(name).color(theme::TEXT_BRIGHT));
                 if ui.button("Edit graph").on_hover_text("Ctrl+G").clicked() {
                     self.pending.push(Action::EditGraph);
                 }
@@ -3914,7 +3914,7 @@ impl PainterApp {
                         MaskSource::Generator(g) => g.kind.name(),
                         MaskSource::Fill(_) => "Fill",
                     };
-                    ui.label(egui::RichText::new(name).strong().color(if ml.enabled { Color32::WHITE } else { theme::TEXT_DIM }));
+                    ui.label(egui::RichText::new(name).strong().color(if ml.enabled { theme::TEXT_BRIGHT } else { theme::TEXT_DIM }));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button(icons::TRASH).on_hover_text("Remove").clicked() {
                             remove = Some(i);
@@ -3992,7 +3992,7 @@ impl PainterApp {
             egui::Frame::new().fill(theme::PANEL_DARK).stroke(Stroke::new(1.0, theme::OUTLINE)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     dirty |= ui.checkbox(&mut f.enabled, "").on_hover_text("Switch the filter on or off").changed();
-                    ui.label(egui::RichText::new(f.kind.name()).strong().color(if f.enabled { Color32::WHITE } else { theme::TEXT_DIM }))
+                    ui.label(egui::RichText::new(f.kind.name()).strong().color(if f.enabled { theme::TEXT_BRIGHT } else { theme::TEXT_DIM }))
                         .on_hover_text(f.kind.tip());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button(icons::TRASH).on_hover_text("Remove").clicked() {
@@ -4118,13 +4118,13 @@ impl PainterApp {
             });
         }
         labeled(ui, "Angle limit", |ui| {
-            ui.add(egui::Slider::new(&mut self.brush.angle_limit, 10.0..=90.0).max_decimals(0).suffix("°"))
+            ui.add(theme::Slider(egui::Slider::new(&mut self.brush.angle_limit, 10.0..=90.0).max_decimals(0).suffix("°")))
                 .on_hover_text("Paint fades out on surfaces turned further than this from the brush, so it doesn't smear on slopes")
         });
 
         section(ui, "Stroke");
         labeled(ui, "Stabilizer", |ui| {
-            ui.add(egui::Slider::new(&mut self.brush.stabilize, 0.0..=200.0).max_decimals(0))
+            ui.add(theme::Slider(egui::Slider::new(&mut self.brush.stabilize, 0.0..=200.0).max_decimals(0)))
                 .on_hover_text("Lazy mouse: the brush trails the cursor on a string for smooth lines")
         });
         labeled(ui, "Pen pressure", |ui| {
@@ -4146,7 +4146,7 @@ impl PainterApp {
         if self.brush.grain.is_some() {
             slider(ui, "Strength", &mut self.brush.grain_strength, 0.0..=1.0);
             labeled(ui, "Scale", |ui| {
-                ui.add(egui::Slider::new(&mut self.brush.grain_scale, 0.25..=64.0).logarithmic(true).max_decimals(2))
+                ui.add(theme::Slider(egui::Slider::new(&mut self.brush.grain_scale, 0.25..=64.0).logarithmic(true).max_decimals(2)))
                     .on_hover_text("Repeats across the mesh (or the UV square with the UV projection)")
             });
             labeled(ui, "Invert", |ui| ui.checkbox(&mut self.brush.grain_invert, ""));
@@ -4169,7 +4169,7 @@ impl PainterApp {
                 if ui.button("White").clicked() {
                     self.brush.mask_value = 1.0;
                 }
-                ui.add(egui::Slider::new(&mut self.brush.mask_value, 0.0..=1.0));
+                ui.add(theme::Slider(egui::Slider::new(&mut self.brush.mask_value, 0.0..=1.0)));
             });
         }
     }
@@ -4225,7 +4225,7 @@ impl PainterApp {
                 // Wraps rather than overlapping when even the compact header doesn't fit.
                 ui.horizontal_wrapped(|ui| {
                     let label = if compact { icons::GLOBE.to_string() } else { theme::with_icon(icons::GLOBE, "Get more assets") };
-                    let browse = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(theme::ACCENT.gamma_multiply(0.55));
+                    let browse = theme::primary(label);
                     if ui.add(browse).on_hover_text("Get more assets: thousands of free materials from Poly Haven and ambientCG, and graphs shared by the community").clicked() {
                         self.library.open = true;
                     }
@@ -4262,7 +4262,7 @@ impl PainterApp {
                     // The size slider at the right edge first; the hint fits in what's left,
                     // shortened with an ellipsis (whole on hover) instead of running under it.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Slider::new(&mut self.shelf.icon_size, ICON_MIN..=ICON_MAX).show_value(false))
+                        ui.add(theme::Slider(egui::Slider::new(&mut self.shelf.icon_size, ICON_MIN..=ICON_MAX).show_value(false)))
                             .on_hover_text("Thumbnail size (Ctrl+scroll over the shelf)");
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add(egui::Label::new(egui::RichText::new(hint).small().color(theme::TEXT_DIM)).truncate()).on_hover_text(hint);
@@ -5474,7 +5474,7 @@ impl PainterApp {
         let mut open = self.show_about;
         egui::Window::new("About").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.set_width(360.0);
-            ui.label(egui::RichText::new("Material Painter").heading().color(Color32::WHITE));
+            ui.label(egui::RichText::new("Material Painter").heading().color(theme::TEXT_BRIGHT));
             ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT_DIM));
             if let Some(gpu) = crate::crash::context() {
                 // Selectable, so it can be copied into bug reports.

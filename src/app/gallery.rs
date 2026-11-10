@@ -181,7 +181,7 @@ pub(super) fn card(ui: &mut egui::Ui, tex: Option<egui::TextureId>, title: &str,
 /// A section heading for start pages.
 pub(super) fn heading(ui: &mut egui::Ui, title: &str, sub: &str) {
     ui.add_space(14.0);
-    ui.label(egui::RichText::new(title).size(19.0).family(theme::heading_family()).color(Color32::WHITE));
+    ui.label(egui::RichText::new(title).size(19.0).family(theme::heading_family()).color(theme::TEXT_BRIGHT));
     if !sub.is_empty() {
         ui.label(egui::RichText::new(sub).color(theme::TEXT_DIM));
     }

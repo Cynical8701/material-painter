@@ -60,9 +60,9 @@ pub(super) fn cage_brush_ui(ui: &mut egui::Ui, b: &mut CageBrush, painted: bool,
     if b.on {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Size").color(theme::TEXT_DIM));
-            ui.add(egui::Slider::new(&mut b.radius, 5.0..=300.0).max_decimals(0).suffix(" px"));
+            ui.add(theme::Slider(egui::Slider::new(&mut b.radius, 5.0..=300.0).max_decimals(0).suffix(" px")));
             ui.label(egui::RichText::new("Strength").color(theme::TEXT_DIM));
-            ui.add(egui::Slider::new(&mut b.strength, 0.1..=4.0).max_decimals(1));
+            ui.add(theme::Slider(egui::Slider::new(&mut b.strength, 0.1..=4.0).max_decimals(1)));
         });
         ui.label(
             egui::RichText::new("Drag: out · Ctrl+drag: in · Shift+drag: undoes the cage paint under the brush (back to the front distance). The cage colors update as you paint.")

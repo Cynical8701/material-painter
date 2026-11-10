@@ -336,7 +336,7 @@ impl PainterApp {
         toggle(ui, &mut self.path.closed, "Closed", "Join the last point back to the first");
         toggle(ui, &mut self.path.align, "Align to path", "Turn each stamp along the path; stitches need it");
         ui.separator();
-        let apply = egui::Button::new(egui::RichText::new(theme::with_icon(icons::CHECK, "Apply")).color(Color32::WHITE)).fill(theme::ACCENT.gamma_multiply(0.6));
+        let apply = theme::primary(theme::with_icon(icons::CHECK, "Apply"));
         if ui.add_enabled(n >= 2, apply).on_hover_text("Paint the brush along the path (Enter)").clicked() {
             self.apply_path();
         }
@@ -346,11 +346,11 @@ impl PainterApp {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Spacing").color(theme::TEXT_DIM));
         let mut p = self.brush.spacing * 100.0;
-        if ui.add(egui::Slider::new(&mut p, 2.0..=300.0).max_decimals(0).suffix("%")).on_hover_text("Distance between stamps, in brush sizes").changed() {
+        if ui.add(theme::Slider(egui::Slider::new(&mut p, 2.0..=300.0).max_decimals(0).suffix("%"))).on_hover_text("Distance between stamps, in brush sizes").changed() {
             self.brush.spacing = p / 100.0;
         }
         ui.label(egui::RichText::new("Size").color(theme::TEXT_DIM));
-        ui.add(egui::Slider::new(&mut self.brush.size, 2.0..=800.0).max_decimals(0));
+        ui.add(theme::Slider(egui::Slider::new(&mut self.brush.size, 2.0..=800.0).max_decimals(0)));
         ui.label(
             egui::RichText::new(if n == 0 {
                 "Click to place points on the mesh or the UV map. Try a stitch brush tip."
