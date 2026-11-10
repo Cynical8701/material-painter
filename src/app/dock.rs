@@ -201,6 +201,8 @@ impl Docks {
 struct DockBehavior<'a> {
     app: &'a mut PainterApp,
     edited: bool,
+    /// The tab groups, drawn as rounded cards.
+    cards: std::collections::HashSet<TileId>,
 }
 
 impl Behavior<Pane> for DockBehavior<'_> {
@@ -231,8 +233,6 @@ impl Behavior<Pane> for DockBehavior<'_> {
         } else {
             draw(ui, app);
         }
-        // A clear edge around every panel.
-        ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, theme::OUTLINE), egui::StrokeKind::Inside);
         UiResponse::None
     }
 
@@ -257,15 +257,22 @@ impl Behavior<Pane> for DockBehavior<'_> {
     }
 
     fn tab_bar_color(&self, _visuals: &egui::Visuals) -> Color32 {
-        theme::PANEL_DARK
+        theme::PANEL
     }
 
+    // Tabs are flat: the selected one is filled, none are outlined.
     fn tab_bg_color(&self, _visuals: &egui::Visuals, _tiles: &Tiles<Pane>, _tile: TileId, state: &TabState) -> Color32 {
-        if state.active { theme::SELECT_BG } else { Color32::TRANSPARENT }
+        if state.active { theme::SURFACE } else { Color32::TRANSPARENT }
     }
 
-    fn tab_outline_stroke(&self, _visuals: &egui::Visuals, _tiles: &Tiles<Pane>, _tile: TileId, state: &TabState) -> Stroke {
-        if state.active { Stroke::new(1.0, theme::ACCENT) } else { Stroke::NONE }
+    fn tab_outline_stroke(&self, _visuals: &egui::Visuals, _tiles: &Tiles<Pane>, _tile: TileId, _state: &TabState) -> Stroke {
+        Stroke::NONE
+    }
+
+    fn paint_on_top_of_tile(&self, painter: &egui::Painter, _style: &egui::Style, tile: TileId, rect: egui::Rect) {
+        if self.cards.contains(&tile) {
+            theme::card_edge(painter, rect, theme::BG);
+        }
     }
 
     fn tab_bar_hline_stroke(&self, _visuals: &egui::Visuals) -> Stroke {
@@ -273,14 +280,14 @@ impl Behavior<Pane> for DockBehavior<'_> {
     }
 
     fn tab_text_color(&self, _visuals: &egui::Visuals, _tiles: &Tiles<Pane>, _tile: TileId, state: &TabState) -> Color32 {
-        if state.active { Color32::WHITE } else { theme::TEXT_DIM }
+        if state.active { theme::TEXT_BRIGHT } else { theme::TEXT_DIM }
     }
 
     fn resize_stroke(&self, _style: &egui::Style, state: egui_tiles::ResizeState) -> Stroke {
         match state {
             egui_tiles::ResizeState::Idle => Stroke::NONE,
-            egui_tiles::ResizeState::Hovering => Stroke::new(2.0, theme::ACCENT.gamma_multiply(0.6)),
-            egui_tiles::ResizeState::Dragging => Stroke::new(2.0, theme::ACCENT),
+            egui_tiles::ResizeState::Hovering => Stroke::new(2.0, theme::OUTLINE_STRONG),
+            egui_tiles::ResizeState::Dragging => Stroke::new(2.0, theme::SELECT_RIM),
         }
     }
 
@@ -307,7 +314,8 @@ impl PainterApp {
                 }
             }
         }
-        let mut behavior = DockBehavior { app: self, edited: false };
+        let cards = tree.tiles.iter().filter(|(_, t)| matches!(t, Tile::Container(Container::Tabs(_)))).map(|(id, _)| *id).collect();
+        let mut behavior = DockBehavior { app: self, edited: false, cards };
         tree.ui(&mut behavior, ui);
         let edited = behavior.edited;
         self.docks.trees[i] = tree;

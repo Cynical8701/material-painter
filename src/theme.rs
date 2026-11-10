@@ -223,6 +223,45 @@ pub fn card(fill: Color32) -> egui::Frame {
         .inner_margin(Margin::same(8))
 }
 
+/// Rounds the corners of a square panel drawn into `rect` (painting
+/// `outside`, the color around it, over each corner) and outlines it, so
+/// docked panels read as cards on the backdrop.
+pub fn card_edge(painter: &egui::Painter, rect: egui::Rect, outside: Color32) {
+    let r = CARD_RADIUS as f32;
+    let mut mesh = egui::Mesh::default();
+    const STEPS: usize = 6;
+    for (corner, center, start) in [
+        (rect.left_top(), rect.left_top() + vec2(r, r), std::f32::consts::PI),
+        (rect.right_top(), rect.right_top() + vec2(-r, r), 1.5 * std::f32::consts::PI),
+        (rect.right_bottom(), rect.right_bottom() + vec2(-r, -r), 0.0),
+        (rect.left_bottom(), rect.left_bottom() + vec2(r, -r), 0.5 * std::f32::consts::PI),
+    ] {
+        // A fan from the square corner over the quarter arc.
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(corner, outside);
+        for i in 0..=STEPS {
+            let a = start + 0.5 * std::f32::consts::PI * i as f32 / STEPS as f32;
+            mesh.colored_vertex(center + r * vec2(a.cos(), a.sin()), outside);
+            if i > 0 {
+                mesh.add_triangle(base, base + i as u32, base + i as u32 + 1);
+            }
+        }
+    }
+    painter.add(mesh);
+    painter.rect_stroke(rect, CornerRadius::same(CARD_RADIUS), Stroke::new(1.0, OUTLINE), egui::StrokeKind::Inside);
+}
+
+/// A section title: bright medium text after a short accent bar, over a
+/// hairline.
+pub fn section_heading(ui: &mut egui::Ui, title: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let p = ui.painter();
+    let bar = egui::Rect::from_center_size(egui::pos2(rect.left() + 1.5, rect.center().y), vec2(3.0, 13.0));
+    p.rect_filled(bar, 1.5, ACCENT);
+    p.text(rect.left_center() + vec2(10.0, 0.0), egui::Align2::LEFT_CENTER, title, egui::FontId::new(14.0, heading_family()), TEXT_BRIGHT);
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, OUTLINE));
+}
+
 /// A thin bar on the backdrop (menu, status).
 pub fn bar() -> egui::Frame {
     egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 3))

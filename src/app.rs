@@ -551,12 +551,10 @@ const NAMED_MIN: f32 = 56.0;
 const SHELF_COMPACT: f32 = 720.0;
 const ICON_MAX: f32 = 128.0;
 
-/// A card-style section title: semibold white text over a hairline.
+/// A card-style section title (see [`theme::section_heading`]).
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(10.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
-    ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, title, egui::FontId::new(14.0, theme::heading_family()), Color32::WHITE);
-    ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::OUTLINE));
+    theme::section_heading(ui, title);
     ui.add_space(6.0);
 }
 
@@ -2711,16 +2709,11 @@ impl PainterApp {
         let base_id = ui.scope_id().with(("layer", id));
 
         let painter = ui.painter_at(rect);
-        let bg = if selected {
-            theme::SELECT_BG
-        } else if resp.hovered() {
-            theme::WIDGET
-        } else {
-            theme::PANEL_DARK
-        };
-        painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), theme::RADIUS, bg);
+        let row = rect.shrink2(vec2(0.0, 1.0));
         if selected {
-            painter.rect_stroke(rect.shrink2(vec2(0.0, 1.0)), theme::RADIUS, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+            painter.add(theme::metal(ui.ctx(), row, theme::RADIUS));
+        } else {
+            painter.rect_filled(row, theme::RADIUS, if resp.hovered() { theme::WIDGET } else { theme::PANEL_DARK });
         }
         if selected {
             painter.rect_filled(Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, h - 12.0)), 1.5, theme::ACCENT);
