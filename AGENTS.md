@@ -47,7 +47,7 @@ offscreen with egui_kittest into `target/bake_test/ui/`.
 | `src/export.rs` | Texture export templates (engine presets) and file writing |
 | `src/undo.rs` | Undo/redo of every document edit |
 | `src/mcp.rs`, `src/app/mcp_tools.rs` | Optional MCP server so AI agents can drive the app (off by default) |
-| `src/theme.rs`, `src/icons.rs` | UI theme (sharp corners, grey palette, blue accent) and Phosphor icon glyphs |
+| `src/theme.rs`, `src/icons.rs` | UI theme ("Studio": warm greys, rounded corners, yellow accent, bundled Space Grotesk and JetBrains Mono) and Phosphor icon glyphs |
 
 ## Conventions (follow these)
 

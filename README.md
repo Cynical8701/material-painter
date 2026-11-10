@@ -132,7 +132,9 @@ Material Painter is free software under the
 Third-party code is listed with its licenses in
 [THIRD_PARTY_NOTICES.html](THIRD_PARTY_NOTICES.html). The bundled HDRIs and
 PBR textures are from [Poly Haven](https://polyhaven.com) (CC0), and the
-icons are [Phosphor](https://phosphoricons.com) (MIT).
+icons are [Phosphor](https://phosphoricons.com) (MIT). The interface fonts are
+[Space Grotesk](https://github.com/floriankarsten/space-grotesk) and
+[JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) (SIL Open Font License).
 
 Reading Substance 3D Painter projects is adapted from
 [SubCraft](https://github.com/Aalzard/subcraft) by Aalzard and the SubCraft
