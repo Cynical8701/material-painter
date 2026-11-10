@@ -16,12 +16,14 @@ pub const WIDGET: Color32 = Color32::from_rgb(0x23, 0x24, 0x2a);
 pub const WIDGET_HOVER: Color32 = Color32::from_rgb(0x32, 0x34, 0x3c);
 /// The accent: focus, highlights and active handles.
 pub const ACCENT: Color32 = Color32::from_rgb(0xff, 0xce, 0x1b);
-/// A dim accent fill (text selection, "on" buttons).
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x4a, 0x3f, 0x16);
+/// A dim accent fill (text selection, slider fill, "on" buttons).
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x7a, 0x63, 0x14);
 /// The fill of selected items.
 pub const SELECT_BG: Color32 = Color32::from_rgb(0x2b, 0x2c, 0x32);
 /// The edge of selected items: a light rim, like brushed metal.
 pub const SELECT_RIM: Color32 = Color32::from_rgb(0x4d, 0x4e, 0x57);
+/// The fill of idle buttons.
+pub const SURFACE: Color32 = Color32::from_rgb(0x2a, 0x2c, 0x33);
 pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe4, 0xe1);
 /// Text of hovered and selected things.
 pub const TEXT_BRIGHT: Color32 = Color32::from_rgb(0xf4, 0xf3, 0xf0);
@@ -143,7 +145,9 @@ fn style_mut(style: &mut egui::Style) {
     v.code_bg_color = PANEL_DARK;
     v.override_text_color = Some(TEXT);
     v.selection.bg_fill = ACCENT_DIM;
-    v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0xff, 0xda, 0x55));
+    // The selection stroke also outlines the focused text field.
+    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.text_edit_bg_color = Some(WIDGET);
     v.hyperlink_color = ACCENT;
     v.window_corner_radius = CornerRadius::same(CARD_RADIUS);
     v.menu_corner_radius = CornerRadius::same(CARD_RADIUS);
@@ -162,9 +166,17 @@ fn style_mut(style: &mut egui::Style) {
     w.noninteractive.bg_stroke = Stroke::new(1.0, OUTLINE);
     w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
     w.noninteractive.corner_radius = r;
-    for (state, fill) in [(&mut w.inactive, WIDGET), (&mut w.hovered, WIDGET_HOVER), (&mut w.active, SELECT_BG), (&mut w.open, SELECT_BG)] {
+    // Buttons fill with `weak_bg_fill`; checkboxes, slider rails and handles
+    // with `bg_fill`. The idle outline matches the idle button fill, so
+    // buttons look borderless while text fields and checkboxes keep a hairline.
+    for (state, fill, button) in [
+        (&mut w.inactive, SURFACE, SURFACE),
+        (&mut w.hovered, WIDGET_HOVER, WIDGET_HOVER),
+        (&mut w.active, SELECT_BG, SELECT_BG),
+        (&mut w.open, SELECT_BG, SELECT_BG),
+    ] {
         state.bg_fill = fill;
-        state.weak_bg_fill = fill;
+        state.weak_bg_fill = button;
         state.bg_stroke = Stroke::new(1.0, OUTLINE);
         state.fg_stroke = Stroke::new(1.0, TEXT);
         state.corner_radius = r;
@@ -172,8 +184,9 @@ fn style_mut(style: &mut egui::Style) {
     }
     w.hovered.bg_stroke = Stroke::new(1.0, OUTLINE_STRONG);
     w.open.bg_stroke = Stroke::new(1.0, SELECT_RIM);
+    w.inactive.bg_stroke = Stroke::new(1.0, SURFACE);
     w.hovered.fg_stroke = Stroke::new(1.0, TEXT_BRIGHT);
-    w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    w.active.bg_stroke = Stroke::new(1.0, SELECT_RIM);
     w.active.fg_stroke = Stroke::new(1.0, TEXT_BRIGHT);
 
     let s = &mut style.spacing;
@@ -215,44 +228,122 @@ pub fn bar() -> egui::Frame {
     egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 3))
 }
 
-/// A square icon button, filled with a light rim while `selected`.
+/// Draws the metallic look of selected controls into `rect`: a rim lit at
+/// the top left that settles into the border tone at the bottom right, over
+/// a face lit from above, with a faint shadow.
+pub fn metal(ctx: &egui::Context, rect: egui::Rect, radius: u8) -> egui::Shape {
+    let t = metal_textures(ctx);
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    let shadow = egui::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Color32::from_black_alpha(40) };
+    egui::Shape::Vec(vec![
+        shadow.as_shape(rect, radius).into(),
+        egui::epaint::RectShape::filled(rect, radius, Color32::WHITE).with_texture(t.rim.id(), uv).into(),
+        egui::epaint::RectShape::filled(rect.shrink(1.0), radius.saturating_sub(1), Color32::WHITE).with_texture(t.face.id(), uv).into(),
+    ])
+}
+
+/// The hover tint of borderless controls.
+fn hover_tint() -> Color32 {
+    Color32::from_white_alpha(14)
+}
+
+#[derive(Clone)]
+struct MetalTextures {
+    rim: egui::TextureHandle,
+    face: egui::TextureHandle,
+}
+
+/// The rim and face gradients, made once per context.
+fn metal_textures(ctx: &egui::Context) -> MetalTextures {
+    let id = egui::Id::unique("theme metal textures");
+    if let Some(t) = ctx.data(|d| d.get_temp::<MetalTextures>(id)) {
+        return t;
+    }
+    let rgb = |c: u32| Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
+    let t = MetalTextures {
+        rim: gradient(ctx, "metal rim", vec2(1.0, 1.0), &[(0.0, rgb(0x4d4e57)), (0.35, rgb(0x3d3e46)), (0.7, rgb(0x33343b)), (1.0, rgb(0x2d2e34))]),
+        face: gradient(ctx, "metal face", vec2(0.35, 1.0), &[(0.0, rgb(0x31323a)), (0.55, rgb(0x2b2c32)), (1.0, rgb(0x28292f))]),
+    };
+    ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+    t
+}
+
+/// A small texture of a linear gradient along `dir` (in the unit square),
+/// stretched over a rect when drawn.
+fn gradient(ctx: &egui::Context, name: &str, dir: egui::Vec2, stops: &[(f32, Color32)]) -> egui::TextureHandle {
+    const N: usize = 32;
+    let (lo, hi) = (dir.x.min(0.0) + dir.y.min(0.0), dir.x.max(0.0) + dir.y.max(0.0));
+    let at = |t: f32| {
+        let i = stops.iter().position(|s| s.0 >= t).unwrap_or(stops.len() - 1).max(1);
+        let ((t0, a), (t1, b)) = (stops[i - 1], stops[i]);
+        let f = ((t - t0) / (t1 - t0).max(1e-6)).clamp(0.0, 1.0);
+        let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+        Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+    };
+    let pixels = (0..N * N)
+        .map(|i| {
+            let p = vec2((i % N) as f32, (i / N) as f32) / (N - 1) as f32;
+            at((p.dot(dir) - lo) / (hi - lo))
+        })
+        .collect();
+    ctx.load_texture(name, egui::ColorImage::new([N, N], pixels), egui::TextureOptions::LINEAR)
+}
+
+/// A square icon button: metallic while `selected`, tinted on hover.
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, selected: bool, size: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
     let p = ui.painter();
-    let (bg, fg) = if selected {
-        (SELECT_BG, TEXT_BRIGHT)
-    } else if resp.hovered() {
-        (Color32::from_white_alpha(18), TEXT_BRIGHT)
-    } else {
-        (Color32::TRANSPARENT, TEXT_DIM)
-    };
-    p.rect_filled(rect, CornerRadius::same(SMALL_RADIUS), bg);
+    let fg = if selected || resp.hovered() { TEXT_BRIGHT } else { TEXT_DIM };
     if selected {
-        p.rect_stroke(rect, CornerRadius::same(SMALL_RADIUS), Stroke::new(1.0, SELECT_RIM), egui::StrokeKind::Inside);
+        p.add(metal(ui.ctx(), rect, RADIUS));
+    } else if resp.hovered() {
+        p.rect_filled(rect, CornerRadius::same(SMALL_RADIUS), hover_tint());
     }
     p.text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(size * 0.56), fg);
     resp
 }
 
-/// A tab button: filled with a light rim while selected.
+/// A tab button: metallic while selected, dimmed text otherwise.
 pub fn pill(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fg = if selected { TEXT_BRIGHT } else { TEXT_DIM };
-    let button = egui::Button::new(egui::RichText::new(text).color(fg))
-        .fill(if selected { SELECT_BG } else { Color32::TRANSPARENT })
-        .stroke(if selected { Stroke::new(1.0, SELECT_RIM) } else { Stroke::new(1.0, OUTLINE) })
-        .corner_radius(CornerRadius::same(RADIUS))
-        .min_size(vec2(0.0, 26.0));
-    ui.add(button)
+    ui.add(selectable(selected, egui::RichText::new(text).color(fg)).min_size(vec2(0.0, 26.0)))
 }
 
-/// A toggle button: filled with a light rim while selected (instead of
-/// egui's accent selection).
-pub fn selectable<'a>(selected: bool, text: impl Into<egui::WidgetText>) -> egui::Button<'a> {
-    let b = egui::Button::new(text);
-    if selected {
-        b.fill(SELECT_BG).stroke(Stroke::new(1.0, SELECT_RIM))
-    } else {
-        b.fill(Color32::TRANSPARENT).stroke(Stroke::NONE)
+/// A toggle button: metallic while selected, borderless with a hover tint
+/// otherwise (instead of egui's accent selection).
+pub fn selectable<'a>(selected: bool, text: impl Into<egui::WidgetText>) -> Selectable<'a> {
+    Selectable { button: egui::Button::new(text).fill(Color32::TRANSPARENT).stroke(Stroke::NONE), selected }
+}
+
+/// See [`selectable`].
+pub struct Selectable<'a> {
+    button: egui::Button<'a>,
+    selected: bool,
+}
+
+impl<'a> Selectable<'a> {
+    pub fn min_size(mut self, min_size: egui::Vec2) -> Self {
+        self.button = self.button.min_size(min_size);
+        self
+    }
+
+    pub fn shortcut_text(mut self, shortcut_text: impl egui::IntoAtoms<'a>) -> Self {
+        self.button = self.button.shortcut_text(shortcut_text);
+        self
+    }
+}
+
+impl egui::Widget for Selectable<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        // The background goes under the button, which is drawn after it.
+        let slot = ui.painter().add(egui::Shape::Noop);
+        let resp = ui.add(self.button);
+        if self.selected {
+            ui.painter().set(slot, metal(ui.ctx(), resp.rect, RADIUS));
+        } else if resp.hovered() {
+            ui.painter().set(slot, egui::epaint::RectShape::filled(resp.rect, RADIUS, hover_tint()));
+        }
+        resp
     }
 }
 
