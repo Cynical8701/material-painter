@@ -2561,7 +2561,6 @@ impl PainterApp {
     }
 
     fn tool_strip(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
         ui.spacing_mut().item_spacing.y = 4.0;
         for (tool, icon, tip) in [
             (Tool::Paint, icons::PAINT_BRUSH, "Paint (1)"),
@@ -5626,15 +5625,18 @@ impl eframe::App for PainterApp {
             egui::Panel::top("toolbar")
                 .exact_size(46.0)
                 .show_separator_line(false)
-                .frame(theme::card(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 4)))
+                .frame(theme::card(theme::PANEL).outer_margin(theme::bar_margin()).inner_margin(egui::Margin::symmetric(12, 4)))
                 .show(ui, |ui| self.context_toolbar(ui));
         }
         egui::Panel::bottom("status").exact_size(24.0).show_separator_line(false).frame(theme::bar()).show(ui, |ui| self.status_bar(ui));
         if paint {
+        // 34 px buttons with the same 7 px margin on every side, and the gap
+        // to the views only on the left (the views' frame adds the right one).
         egui::Panel::left("tools")
-            .exact_size(56.0)
+            .exact_size(52.0)
+            .resizable(false)
             .show_separator_line(false)
-            .frame(theme::card(theme::PANEL).inner_margin(egui::Margin::symmetric(7, 10)))
+            .frame(theme::card(theme::PANEL).outer_margin(egui::Margin { left: theme::GAP, right: 0, top: theme::GAP, bottom: theme::GAP }).inner_margin(egui::Margin::same(7)))
             .show(ui, |ui| self.tool_strip(ui));
         }
 
@@ -5647,7 +5649,7 @@ impl eframe::App for PainterApp {
         self.update_cage_preview(&ctx);
         match self.workspace {
             Workspace::Paint => {
-                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(theme::GAP))).show(ui, |ui| {
                     self.dock_ui(ui, Workspace::Paint);
                 });
             }

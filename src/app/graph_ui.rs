@@ -802,10 +802,10 @@ impl PainterApp {
         }
         egui::Panel::top("designer bar")
             .show_separator_line(false)
-            .frame(theme::card(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
+            .frame(theme::card(theme::PANEL).outer_margin(theme::bar_margin()).inner_margin(egui::Margin::symmetric(12, 6)))
             .show(ui, |ui| self.graph_toolbar(ui));
         self.graphs.editor.hovered = false;
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(theme::GAP))).show(ui, |ui| {
             self.dock_ui(ui, super::Workspace::Designer);
         });
         self.snapshot_graph(ui.ctx());

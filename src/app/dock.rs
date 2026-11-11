@@ -249,7 +249,7 @@ impl Behavior<Pane> for DockBehavior<'_> {
     }
 
     fn gap_width(&self, _style: &egui::Style) -> f32 {
-        6.0
+        theme::GAP as f32
     }
 
     fn tab_bar_height(&self, _style: &egui::Style) -> f32 {

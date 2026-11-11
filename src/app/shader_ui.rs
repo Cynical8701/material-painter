@@ -342,7 +342,7 @@ impl PainterApp {
     // ------------------------------------------------------------------ workspace
 
     pub(super) fn shader_maker(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(4))).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(theme::GAP))).show(ui, |ui| {
             self.dock_ui(ui, Workspace::ShaderMaker);
         });
     }

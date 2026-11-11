@@ -50,6 +50,15 @@ pub const RADIUS: u8 = 5;
 pub const CARD_RADIUS: u8 = 6;
 pub const SMALL_RADIUS: u8 = 4;
 
+/// The gap between cards, and between cards and the window edge.
+pub const GAP: i8 = 4;
+
+/// The outer margin of a bar above the docked panels: the gap on its top
+/// and sides; the panels' frame adds the one below it.
+pub fn bar_margin() -> Margin {
+    Margin { left: GAP, right: GAP, top: GAP, bottom: 0 }
+}
+
 /// The soft drop shadow under cards.
 fn card_shadow() -> egui::Shadow {
     egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(70) }
@@ -231,7 +240,7 @@ pub fn card(fill: Color32) -> egui::Frame {
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .stroke(Stroke::new(1.0, OUTLINE))
         .shadow(card_shadow())
-        .outer_margin(Margin::same(4))
+        .outer_margin(Margin::same(GAP))
         .inner_margin(Margin::same(8))
 }
 
@@ -421,9 +430,9 @@ impl egui::Widget for Slider<'_> {
             for i in start..end {
                 list.mutate_shape(egui::layers::ShapeIdx(i), |s| match &mut s.shape {
                     egui::Shape::Circle(c) => {
-                        c.radius = if hot { 7.5 } else { 6.5 };
+                        c.radius = if hot { 5.5 } else { 4.5 };
                         c.fill = TEXT_BRIGHT;
-                        c.stroke = Stroke::new(2.0, ACCENT);
+                        c.stroke = Stroke::new(1.5, ACCENT);
                     }
                     egui::Shape::Rect(r) if r.fill == fill => r.fill = ACCENT,
                     _ => {}
