@@ -35,6 +35,7 @@ mod graph_ui;
 mod shader_ui;
 mod library_ui;
 mod path_tool;
+mod projection;
 mod bake_live;
 mod spp_open;
 mod preview_shader;
@@ -67,6 +68,8 @@ enum Tool {
     PolyFill,
     /// Lays the brush along an editable path (stitches, seams, panel lines).
     Path,
+    /// Paints an image placed over the view onto the mesh.
+    Projection,
 }
 
 /// Bake cage preview (see `crate::cage`): probe results and what's drawn.
@@ -473,6 +476,7 @@ pub struct PainterApp {
     library: library_ui::LibraryUi,
     user_smarts: Vec<smart_io::UserSmart>,
     path: path_tool::PathTool,
+    projection: projection::ProjectionState,
     bake_preview: bake_live::LivePreview,
     custom_ui: bake_live::CustomUi,
     spp: spp_open::SppOpen,
@@ -1140,6 +1144,12 @@ impl PainterApp {
         self.shelf.kind = None;
     }
 
+    /// Back to the paint brush (offscreen UI tests).
+    #[cfg(test)]
+    pub(crate) fn set_tool_paint(&mut self) {
+        self.tool = Tool::Paint;
+    }
+
     /// Closes the welcome window and the autosave prompt an earlier test run
     /// may have left (offscreen UI tests).
     #[cfg(test)]
@@ -1429,6 +1439,7 @@ impl PainterApp {
             library: Default::default(),
             user_smarts: smart_io::list(&cc.egui_ctx),
             path: Default::default(),
+            projection: Default::default(),
             bake_preview: Default::default(),
             custom_ui: Default::default(),
             spp: Default::default(),
@@ -2115,6 +2126,9 @@ impl PainterApp {
             if i.key_pressed(Key::Num4) || i.key_pressed(Key::L) {
                 self.tool = Tool::Path;
             }
+            if i.key_pressed(Key::Num5) {
+                self.tool = Tool::Projection;
+            }
             if i.key_pressed(Key::W) {
                 self.view.show_wire_3d = !self.view.show_wire_3d;
             }
@@ -2454,6 +2468,8 @@ impl PainterApp {
                         (Tool::PolyFill, _) => "Polygon fill",
                         (Tool::Path, StrokeTarget::Mask) => "Path (mask)",
                         (Tool::Path, _) => "Path",
+                        (Tool::Projection, StrokeTarget::Mask) => "Projection (mask)",
+                        (Tool::Projection, _) => "Projection",
                     };
                     let icon = match self.tool {
                         Tool::Paint => icons::PAINT_BRUSH,
@@ -2461,6 +2477,7 @@ impl PainterApp {
                         Tool::Picker => icons::EYEDROPPER,
                         Tool::PolyFill => icons::POLYGON,
                         Tool::Path => icons::PATH,
+                        Tool::Projection => icons::IMAGES,
                     };
                     ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(theme::TEXT_BRIGHT));
                     ui.separator();
@@ -2567,6 +2584,7 @@ impl PainterApp {
             (Tool::Eraser, icons::ERASER, "Eraser (2)"),
             (Tool::PolyFill, icons::POLYGON, "Polygon fill: triangles, quads, mesh parts or UV islands (3 / P)"),
             (Tool::Path, icons::PATH, "Path: place points, then paint along them; stitches, seams, panel lines (4 / L)"),
+            (Tool::Projection, icons::IMAGES, "Projection: paint an image placed over the view; photos, decals, logos (5)"),
             (Tool::Picker, icons::EYEDROPPER, "Pick material from the surface (I)"),
         ] {
             if theme::icon_button(ui, icon, self.tool == tool, 34.0).on_hover_text(tip).clicked() {
@@ -4093,6 +4111,9 @@ impl PainterApp {
     }
 
     fn brush_properties(&mut self, ui: &mut egui::Ui, content: bool) {
+        if self.tool == Tool::Projection {
+            self.projection_properties(ui);
+        }
         section(ui, if self.tool == Tool::Eraser { "Eraser" } else { "Brush" });
         slider(ui, "Size", &mut self.brush.size, 2.0..=800.0);
         slider(ui, "Hardness", &mut self.brush.hardness, 0.0..=0.99);
@@ -4553,12 +4574,24 @@ impl PainterApp {
 
     // ------------------------------------------------------------------ viewports
 
+    /// How stamps reach the mesh: the projection tool paints what's under
+    /// the image on screen, so it always projects from the camera.
+    fn stroke_projection(&self) -> BrushProjection {
+        if self.tool == Tool::Projection { BrushProjection::Screen } else { self.brush.projection }
+    }
+
+    /// Mirror axis of strokes; none for the projection tool, whose image
+    /// isn't mirrored.
+    fn stroke_symmetry(&self) -> u8 {
+        if self.tool == Tool::Projection { 0 } else { self.brush.symmetry }
+    }
+
     fn stamp_uniform(&self, kind: ViewKind) -> StampUniform {
         let ppp_radius = self.brush.size * 0.5 * self.ppp;
-        let brush = [ppp_radius.max(0.5), self.brush.hardness.min(0.99), self.brush.flow, self.brush.symmetry as f32];
+        let brush = [ppp_radius.max(0.5), self.brush.hardness.min(0.99), self.brush.flow, self.stroke_symmetry() as f32];
         let clip = [NEAR, FAR, if self.brush.tip.is_some() { 1.0 } else { 0.0 }, 0.0];
         let proj = [
-            match self.brush.projection {
+            match self.stroke_projection() {
                 BrushProjection::Screen => 0.0,
                 BrushProjection::Surface => 1.0,
                 BrushProjection::Uv => 2.0,
@@ -4956,6 +4989,9 @@ impl PainterApp {
     /// Starts a stroke on the current target (layer content, mask or bake
     /// fix), or says in the status bar why it can't.
     fn begin_stroke_on_target(&mut self, kind: ViewKind, at: Vec2, erase: bool) -> bool {
+        if !self.sync_projection(kind) {
+            return false;
+        }
         let idx = self.selected;
         if let StrokeTarget::BakeFix(_) = self.target {
             if self.engine.begin_stroke(0, self.target, [false; crate::engine::CHANNELS], erase) {
@@ -5032,7 +5068,7 @@ impl PainterApp {
             ViewKind::V3d => {
                 let [w, h] = self.views.view3d.size;
                 let radius = self.brush.size * 0.5 * self.ppp;
-                resolve_stamps(&self.mesh, &self.bvh, &self.cam, Vec2::new(w as f32, h as f32), self.brush.projection, self.brush.symmetry, radius, raw)
+                resolve_stamps(&self.mesh, &self.bvh, &self.cam, Vec2::new(w as f32, h as f32), self.stroke_projection(), self.stroke_symmetry(), radius, raw)
             }
             // The 2D view is the texture: stamps land where they are drawn.
             ViewKind::V2d => resolve_stamps(&self.mesh, &self.bvh, &self.cam, Vec2::ONE, BrushProjection::Screen, 0, 0.0, raw),
@@ -5053,7 +5089,7 @@ impl PainterApp {
                 let [w, h] = self.views.view3d.size;
                 let radius = self.brush.size * 0.5 * self.ppp;
                 let size = Vec2::new(w as f32, h as f32);
-                stroke_region(&self.mesh, &self.bvh, &self.cam, size, self.brush.projection, self.brush.symmetry, radius, &stamps)
+                stroke_region(&self.mesh, &self.bvh, &self.cam, size, self.stroke_projection(), self.stroke_symmetry(), radius, &stamps)
             }
             ViewKind::V2d => {
                 // The 2D view shows the texture: the stamps' own UV squares.
@@ -5112,7 +5148,7 @@ impl PainterApp {
 
     fn end_stroke(&mut self) {
         if let Some(s) = self.stroke.take() {
-            if matches!(self.tool, Tool::Paint | Tool::Eraser) {
+            if matches!(self.tool, Tool::Paint | Tool::Eraser | Tool::Projection) {
                 self.line_anchor = Some(LineAnchor { view: s.view, at: s.last, key: self.view_key(s.view) });
             }
             if let Some(entry) = self.engine.end_stroke() {
@@ -5304,6 +5340,11 @@ impl PainterApp {
             return;
         }
 
+        // Holding S places the projected image instead of painting.
+        if self.tool == Tool::Projection && self.projection_input(ui, kind, rect, resp) {
+            return;
+        }
+
         // Painting.
         if let Some(p) = hover {
             let in_view = rect.contains(p);
@@ -5394,6 +5435,7 @@ impl PainterApp {
             ViewKind::V2d => self.views.view2d.egui_id,
         };
         painter.image(id, rect, uv, Color32::WHITE);
+        self.draw_projection(&painter, rect);
         self.draw_path(&painter, kind, rect);
         self.draw_gizmo(&painter, kind, rect);
         self.draw_cage_brush(&painter, kind);
@@ -5432,8 +5474,13 @@ impl PainterApp {
         // Brush cursor.
         let alt = ui.input(|i| i.modifiers.alt);
         if let Some(p) = resp.hover_pos() {
+            let placing = self.tool == Tool::Projection && ui.input(|i| i.key_down(egui::Key::S)) && self.projection.image.is_some();
             if self.tool == Tool::PolyFill && !alt {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            } else if placing {
+                if ui.ctx().output(|o| o.cursor_icon) == egui::CursorIcon::Default {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
             } else if !alt {
                 let r = self.brush.size * 0.5;
                 painter.circle_stroke(p, r + 1.0, Stroke::new(1.0, Color32::from_black_alpha(140)));
@@ -5581,6 +5628,7 @@ impl eframe::App for PainterApp {
         let _ = self.rs.device.poll(wgpu::PollType::Poll);
         self.undo.update();
         self.poll_bake(&ctx);
+        self.poll_projection(&ctx);
         self.poll_spp_open(&ctx);
         self.update_preview(&ctx);
         self.poll_env();

@@ -933,6 +933,35 @@ struct ApplyUniform {
     /// Specular level, whether the stroke paints it, whether it paints the
     /// normal channel (flat), unused.
     s: [f32; 4],
+    /// The projection tool's image, see [`ImageProjection`].
+    vp: [[f32; 4]; 4],
+    /// View width, height (pixels), 2D view, image projected.
+    pv: [f32; 4],
+    /// 2D view zoom (px per uv), pan x, pan y, unused.
+    pv2: [f32; 4],
+    /// The image's center on screen (pixels), half width, half height.
+    pr: [f32; 4],
+    /// Cosine and sine of the image's rotation, unused.
+    pa: [f32; 4],
+}
+
+/// The projection tool: an image placed over the view a stroke is painted
+/// in. The stroke takes its base color (and coverage, from the image's
+/// alpha) from the image where each texel lands on screen.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageProjection {
+    /// The 3D view's camera (unused in the 2D view).
+    pub view_proj: [[f32; 4]; 4],
+    /// The view's size in pixels.
+    pub view: [f32; 2],
+    /// `Some(zoom, pan)` in the 2D view, as in [`StampUniform::view2d`].
+    pub view2d: Option<[f32; 3]>,
+    /// The image's center on screen, in pixels.
+    pub center: [f32; 2],
+    /// Half the image's width and height on screen, in pixels.
+    pub half: [f32; 2],
+    /// Rotation on screen, radians (clockwise, as the screen's y points down).
+    pub angle: f32,
 }
 
 /// What the brush deposits during a stroke.
@@ -1040,6 +1069,11 @@ pub struct Engine {
     brush_alpha: Tex,
     /// Brush grain texture (white when the brush has none).
     brush_grain: Tex,
+    /// The projection tool's image (sRGB-encoded rgba) and the id it was
+    /// uploaded under; the projection is set per stroke.
+    proj_image: Tex,
+    proj_image_id: u64,
+    projection: Option<ImageProjection>,
     /// Image files already on the GPU, shared by every layer that uses them
     /// (scanned smart materials); entries die with their last user.
     image_cache: HashMap<std::path::PathBuf, (std::sync::Weak<Tex>, Arc<Vec<u8>>)>,
@@ -1154,6 +1188,9 @@ impl Engine {
             apply_ubuf,
             brush_alpha: Tex::new(&device, "brush alpha", 1, 1, F::R8Unorm, LAYER_USAGE),
             brush_grain: Tex::new(&device, "brush grain", 1, 1, F::R8Unorm, LAYER_USAGE),
+            proj_image: Tex::new(&device, "projection image", 1, 1, F::Rgba8Unorm, LAYER_USAGE),
+            proj_image_id: 0,
+            projection: None,
             image_cache: HashMap::new(),
             layers: Vec::new(),
             folder_below: Vec::new(),
@@ -1346,6 +1383,8 @@ impl Engine {
                 gpu::tex_entry(11, false),
                 gpu::tex_entry(12, false),
                 gpu::tex_entry(13, false),
+                gpu::tex_entry(14, true),
+                gpu::sampler_entry(15),
             ],
         });
         let apply_layout = gpu::layout(device, &apply_bgl);
@@ -2919,6 +2958,28 @@ impl Engine {
         );
     }
 
+    /// The projection tool's image: `rgba` (sRGB-encoded, `width` × `height`)
+    /// under `id`; uploading the same id again does nothing.
+    pub fn set_projection_image(&mut self, id: u64, rgba: &[u8], width: u32, height: u32) {
+        if self.proj_image_id == id {
+            return;
+        }
+        self.proj_image_id = id;
+        self.proj_image = Tex::new(&self.device, "projection image", width, height, F::Rgba8Unorm, LAYER_USAGE);
+        self.queue.write_texture(
+            self.proj_image.copy_info(),
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            self.proj_image.extent(),
+        );
+    }
+
+    /// Strokes from now on take their color from the projected image, or
+    /// from the brush material (`None`).
+    pub fn set_projection(&mut self, projection: Option<ImageProjection>) {
+        self.projection = projection;
+    }
+
     /// Brush tip for the stamps (`size`² grayscale), or `None` for round.
     pub fn set_brush_alpha(&mut self, alpha: Option<(&[u8], u32)>) {
         let (pixels, size) = alpha.unwrap_or((&[255], 1));
@@ -2951,6 +3012,11 @@ impl Engine {
             g: if matches!(target, StrokeTarget::BakeFix(_)) { [0.0; 4] } else { paint.grain },
             e: [m.emission[0], m.emission[1], m.emission[2], ch[EMISSION]],
             s: [m.specular, ch[SPECULAR], ch[NORMAL], 0.0],
+            vp: self.projection.map_or([[0.0; 4]; 4], |p| p.view_proj),
+            pv: self.projection.map_or([0.0; 4], |p| [p.view[0], p.view[1], if p.view2d.is_some() { 1.0 } else { 0.0 }, 1.0]),
+            pv2: self.projection.and_then(|p| p.view2d).map_or([0.0; 4], |[z, x, y]| [z, x, y, 0.0]),
+            pr: self.projection.map_or([0.0, 0.0, 1.0, 1.0], |p| [p.center[0], p.center[1], p.half[0].max(1e-3), p.half[1].max(1e-3)]),
+            pa: self.projection.map_or([1.0, 0.0, 0.0, 0.0], |p| [p.angle.cos(), p.angle.sin(), 0.0, 0.0]),
         };
         self.queue.write_buffer(&self.apply_ubuf, 0, bytemuck::bytes_of(&au));
 
@@ -2986,6 +3052,8 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(snap_view(EMISSION)) },
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(snap_view(NORMAL)) },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(snap_view(SPECULAR)) },
+                wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&self.proj_image.view) },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
 

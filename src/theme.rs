@@ -137,17 +137,28 @@ pub fn apply(ctx: &egui::Context) {
     heading.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
     fonts.families.insert(heading_family(), heading);
     // Symbols (box lines, shapes, check marks, dice): Segoe UI Symbol, or
-    // DejaVu Sans, which covers them on Linux, or Apple Symbols on macOS.
+    // DejaVu Sans, which covers them on Linux. macOS needs two: Apple
+    // Symbols lacks check marks and crosses, which Arial Unicode has.
     let index = font_index();
-    let symbols = system_font(&index, &["seguisym.ttf", "DejaVuSans.ttf", "NotoSansSymbols2-Regular.ttf", "Apple Symbols.ttf"]).map(|b| fonts.font_data.insert("symbols".into(), egui::FontData::from_owned(b).into())).is_some();
+    let symbol_fonts: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["Apple Symbols.ttf"], &["Arial Unicode.ttf"]]
+    } else {
+        &[&["seguisym.ttf", "DejaVuSans.ttf", "NotoSansSymbols2-Regular.ttf"]]
+    };
+    let mut symbols = Vec::new();
+    for (i, names) in symbol_fonts.iter().enumerate() {
+        if let Some(b) = system_font(&index, names) {
+            let name = format!("symbols {i}");
+            fonts.font_data.insert(name.clone(), egui::FontData::from_owned(b).into());
+            symbols.push(name);
+        }
+    }
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace, heading_family()] {
         if let Some(list) = fonts.families.get_mut(&family) {
             if !list.iter().any(|f| f == "phosphor") {
                 list.push("phosphor".into());
             }
-            if symbols {
-                list.push("symbols".into());
-            }
+            list.extend(symbols.iter().cloned());
         }
     }
     ctx.set_fonts(fonts);

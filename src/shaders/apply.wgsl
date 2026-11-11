@@ -1,6 +1,8 @@
 // Writes the current stroke into a paint layer (or mask) using the snapshot
 // taken at stroke start as the base, so stroke opacity caps the build-up.
 // Paint channels store (value, alpha) pairs; color stores rgb + alpha.
+// With the projection tool the color comes from an image placed over the
+// view instead of the brush material.
 
 struct ApplyU {
     color: vec4<f32>,   // sRGB-encoded rgb, opacity
@@ -10,6 +12,11 @@ struct ApplyU {
     g: vec4<f32>,       // grain strength (0 off), tiling, in uv (else tri-planar world), invert
     e: vec4<f32>,       // sRGB-encoded emission, emission channel enabled
     s: vec4<f32>,       // specular level, specular channel enabled, normal channel enabled (paints flat), unused
+    vp: mat4x4<f32>,    // projection tool: the 3D view's camera
+    pv: vec4<f32>,      // view width, height (px), 2D view, image projected
+    pv2: vec4<f32>,     // 2D view zoom (px per uv), pan x, pan y, unused
+    pr: vec4<f32>,      // image center on screen (px), half width, half height
+    pa: vec4<f32>,      // cos and sin of the image's rotation, unused
 };
 
 @group(0) @binding(0) var<uniform> u: ApplyU;
@@ -26,6 +33,31 @@ struct ApplyU {
 @group(0) @binding(11) var b_emission: texture_2d<f32>;
 @group(0) @binding(12) var b_normal: texture_2d<f32>;
 @group(0) @binding(13) var b_spec: texture_2d<f32>;
+@group(0) @binding(14) var proj_tex: texture_2d<f32>;
+@group(0) @binding(15) var proj_samp: sampler;
+
+// The projected image where texel `c` lands on screen (sRGB-encoded rgb,
+// alpha), transparent off the image.
+fn projected(c: vec2<i32>) -> vec4<f32> {
+    var screen: vec2<f32>;
+    if (u.pv.z > 0.5) {
+        // 2D view: the screen is the texture.
+        let uv = (vec2<f32>(c) + 0.5) / vec2<f32>(textureDimensions(stroke));
+        screen = u.pv.xy * 0.5 + u.pv2.yz + (uv - 0.5) * u.pv2.x;
+    } else {
+        let clip = u.vp * vec4<f32>(textureLoad(pos_map, c, 0).xyz, 1.0);
+        if (clip.w <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        screen = (clip.xy / clip.w * vec2<f32>(0.5, -0.5) + 0.5) * u.pv.xy;
+    }
+    let d = screen - u.pr.xy;
+    let q = vec2<f32>(d.x * u.pa.x + d.y * u.pa.y, -d.x * u.pa.y + d.y * u.pa.x) / (2.0 * u.pr.zw) + 0.5;
+    if (any(q < vec2<f32>(0.0)) || any(q > vec2<f32>(1.0))) {
+        return vec4<f32>(0.0);
+    }
+    return textureSampleLevel(proj_tex, proj_samp, q, 0.0);
+}
 
 fn grain_at(q: vec2<f32>) -> f32 {
     return textureSampleLevel(grain_tex, grain_samp, q, 0.0).r;
@@ -93,11 +125,17 @@ fn over_rgb(b: vec4<f32>, v: vec3<f32>, m: f32, erase: bool) -> vec4<f32> {
 @fragment
 fn fs_paint(in: FsOut) -> PaintOut {
     let c = vec2<i32>(in.pos.xy);
-    let m = textureLoad(stroke, c, 0).r * u.p.x * grain(c);
+    var m = textureLoad(stroke, c, 0).r * u.p.x * grain(c);
     let erase = u.p.y > 0.5;
+    var color = u.color.rgb;
+    if (u.pv.w > 0.5 && !erase) {
+        let img = projected(c);
+        color = img.rgb;
+        m *= img.a;
+    }
     var out: PaintOut;
     if (u.ch.x > 0.5) {
-        out.color = over_rgb(textureLoad(b_color, c, 0), u.color.rgb, m, erase);
+        out.color = over_rgb(textureLoad(b_color, c, 0), color, m, erase);
     }
     if (u.e.w > 0.5) {
         out.emission = over_rgb(textureLoad(b_emission, c, 0), u.e.rgb, m, erase);
@@ -127,8 +165,14 @@ fn fs_paint(in: FsOut) -> PaintOut {
 @fragment
 fn fs_mask(in: FsOut) -> @location(0) vec4<f32> {
     let c = vec2<i32>(in.pos.xy);
-    let m = textureLoad(stroke, c, 0).r * u.p.x * grain(c);
+    var m = textureLoad(stroke, c, 0).r * u.p.x * grain(c);
     let base = textureLoad(b_color, c, 0).r;
-    let target_value = select(u.rmh.w, 0.0, u.p.y > 0.5);
+    var target_value = select(u.rmh.w, 0.0, u.p.y > 0.5);
+    if (u.pv.w > 0.5 && u.p.y < 0.5) {
+        // A projected image paints its brightness into the mask.
+        let img = projected(c);
+        target_value = dot(img.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        m *= img.a;
+    }
     return vec4<f32>(mix(base, target_value, m), 0.0, 0.0, 1.0);
 }

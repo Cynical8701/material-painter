@@ -661,6 +661,11 @@ fn ui_screenshots() {
         harness.run_steps(2);
         harness.render().expect("renders").save(dir.join(format!("hover_{i}.png"))).unwrap();
     }
+    // The projection tool with an image over the views.
+    harness.state_mut().test_projection();
+    harness.run_steps(4);
+    harness.render().expect("renders").save(dir.join("projection.png")).unwrap();
+    harness.state_mut().set_tool_paint();
     harness.get_by_label("File").click();
     harness.run_steps(3);
     harness.render().expect("renders").save(dir.join("menu_file.png")).unwrap();
@@ -2915,4 +2920,131 @@ fn spp_screenshot() {
     }
     harness.run_steps(1);
     harness.render().expect("renders").save(dir.join("shot_raytraced.png")).unwrap();
+}
+
+/// The projection tool: an image half red, half blue painted through the 2D
+/// view lands on the texture as placed, and through the 3D view covers what
+/// the camera sees with the image's colors instead of the brush material.
+/// Writes `target/bake_test/paint/projection.png`.
+#[test]
+#[ignore]
+fn projection_tool() {
+    use crate::app::{BrushProjection, resolve_stamps};
+    use crate::engine::{BrushPaint, ImageProjection, MatValues, StampUniform};
+    use crate::undo::{StrokeTarget, UndoStack};
+    use glam::Vec2;
+
+    let mesh = crate::mesh::Primitive::RoundedCube.build();
+    let bvh = crate::bvh::Bvh::from_mesh(&mesh);
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 512u32;
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = UndoStack::default();
+    engine.add_paint_layer(0, None, None, &mut undo);
+    let wait = |rs: &egui_wgpu::RenderState| {
+        rs.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    };
+    // 64 x 32: left half red, right half blue.
+    let (w, h) = (64u32, 32u32);
+    let rgba: Vec<u8> = (0..w * h).flat_map(|i| if i % w < w / 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }).collect();
+    engine.set_projection_image(1, &rgba, w, h);
+    // The brush material is green: none of it may show.
+    let paint = BrushPaint {
+        mat: MatValues { color: [0.0, 1.0, 0.0], ..Default::default() },
+        mask_value: 1.0,
+        opacity: 1.0,
+        erase: false,
+        grain: [0.0; 4],
+    };
+    let enabled = [true, false, false, false, false, false, false, false];
+
+    let mut views = ViewRenderer::new(&rs);
+    let env = crate::environment::EnvBaker::new(&rs.device)
+        .upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    let cam = OrbitCam { target: (mesh.bounds_min + mesh.bounds_max) * 0.5, ..Default::default() };
+    let size = [640u32, 480u32];
+    let settings = ViewSettings::default();
+    views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
+    wait(&rs);
+
+    // 2D view showing the texture at 1 px per texel, the image stretched over it.
+    let r = res as f32;
+    engine.set_projection(Some(ImageProjection {
+        view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        view: [r, r],
+        view2d: Some([r, 0.0, 0.0]),
+        center: [r * 0.5, r * 0.5],
+        half: [r * 0.5, r * 0.5],
+        angle: 0.0,
+    }));
+    let su = StampUniform {
+        view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        cam_pos: [0.0; 4],
+        view: [r, r, 1.0, 0.0],
+        view2d: [r, 0.0, 0.0, 0.0],
+        brush: [r, 0.99, 1.0, 0.0],
+        clip: [crate::viewport::NEAR, crate::viewport::FAR, 0.0, 0.0],
+        proj: [0.0, 0.0, -1.0, 0.0],
+    };
+    assert!(engine.begin_stroke(0, StrokeTarget::Content, enabled, false));
+    let stamps = resolve_stamps(&mesh, &bvh, &cam, Vec2::ONE, BrushProjection::Screen, 0, 0.0, &[([r * 0.5, r * 0.5, 1.0, 0.0], 1.0)]);
+    engine.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
+    engine.end_stroke();
+    engine.composite();
+    wait(&rs);
+    // Sample where the mesh has texels: the UV of a vertex left and right of center.
+    let side = |right: bool| {
+        mesh.vertices.iter().map(|v| Vec2::from_array(v.uv)).find(|uv| if right { uv.x > 0.6 } else { uv.x < 0.4 } && uv.x > 0.05 && uv.x < 0.95)
+    };
+    for (right, want) in [(false, [1.0, 0.0, 0.0]), (true, [0.0, 0.0, 1.0])] {
+        let uv = side(right).expect("the mesh has texels on that side");
+        let (got, _, _) = engine.sample_final(uv);
+        let err: f32 = got.iter().zip(want).map(|(g, w)| (g - w).abs()).sum();
+        assert!(err < 0.25, "2D projection at uv {uv:?}: got {got:?}, want {want:?}");
+    }
+
+    // 3D view: the image over the whole view, painted from the camera.
+    engine.add_paint_layer(1, None, None, &mut undo);
+    let fsize = Vec2::new(size[0] as f32, size[1] as f32);
+    let view_proj = cam.view_proj(fsize.x / fsize.y).to_cols_array_2d();
+    engine.set_projection(Some(ImageProjection {
+        view_proj,
+        view: fsize.to_array(),
+        view2d: None,
+        center: (fsize * 0.5).to_array(),
+        half: (fsize * 0.5).to_array(),
+        angle: 0.0,
+    }));
+    let su = StampUniform {
+        view_proj,
+        cam_pos: cam.eye().extend(1.0).to_array(),
+        view: [fsize.x, fsize.y, 0.0, 0.0],
+        view2d: [0.0; 4],
+        brush: [fsize.x, 0.99, 1.0, 0.0],
+        clip: [crate::viewport::NEAR, crate::viewport::FAR, 0.0, 0.0],
+        proj: [0.0, 0.0, 85f32.to_radians().cos(), 0.0],
+    };
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, enabled, false));
+    let raw = [((fsize * 0.5).extend(1.0).extend(0.0).to_array(), 1.0)];
+    let stamps = resolve_stamps(&mesh, &bvh, &cam, fsize, BrushProjection::Screen, 0, fsize.x, &raw);
+    engine.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
+    engine.end_stroke();
+    engine.composite();
+    views.render_3d(&rs, size, &[&engine], &env, &gpu_mesh, &cam, &settings, None);
+    wait(&rs);
+    let bytes = read_texture(&rs.device, &rs.queue, engine.final_tex(0));
+    let count = |f: &dyn Fn(&[u8]) -> bool| bytes.chunks(4).filter(|p| f(p)).count();
+    let red = count(&|p| p[0] > 200 && p[1] < 40 && p[2] < 40);
+    let blue = count(&|p| p[2] > 200 && p[0] < 40 && p[1] < 40);
+    let green = count(&|p| p[1] > 200 && p[0] < 40 && p[2] < 40);
+    println!("  3D projection: {red} red, {blue} blue, {green} green texels");
+    assert!(red > 1000 && blue > 1000, "both halves of the image reach the mesh");
+    assert_eq!(green, 0, "the brush material doesn't show through the projection");
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/paint");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = views.view3d.image();
+    let px = read_texture(&rs.device, &rs.queue, img);
+    image::save_buffer(dir.join("projection.png"), &px, img.width, img.height, image::ExtendedColorType::Rgba8).unwrap();
 }
